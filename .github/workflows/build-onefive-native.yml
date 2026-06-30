@@ -124,20 +124,16 @@ jobs:
 
   # ========== Job 3: 编译 ARM 后端 ==========
   build-backend-arm:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04-arm
     name: 编译后端 arm64
     steps:
       - name: 检出代码
         uses: actions/checkout@v4
 
-      - name: 编译 Python 后端 (Nuitka) - 使用 QEMU 模拟
+      - name: 编译 Python 后端 (Nuitka)
         run: |
-          # 安装 QEMU 用于交叉编译
-          sudo apt-get update
-          sudo apt-get install -y qemu-user-static binfmt-support
-          
           mkdir -p /tmp/nuitka-out
-          echo "在 x86 runner 上使用 QEMU 编译 ARM..."
+          echo "在 ARM 原生 runner 上编译..."
           docker run --rm --platform linux/arm64 \
             -v $PWD/backend:/build \
             -v /tmp/nuitka-out:/output \
