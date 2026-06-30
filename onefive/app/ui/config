@@ -1,0 +1,14 @@
+{
+  ".url": {
+    "onefive.APPLICATION": {
+      "title": "壹伍",
+      "icon": "images/icon_{0}.png",
+      "type": "iframe",
+      "protocol": "",
+      "gatewaySocket": "onefive.sock",
+      "gatewayPrefix": "/app/onefive",
+      "url": "/app/onefive",
+      "allUsers": true
+    }
+  }
+}

@@ -60,8 +60,11 @@ backend/dist/
 backend/src/onefive.egg-info/
 
 # 飞牛打包构建产物
-onefive/app/ui/
-onefive/app/server/
+onefive/app/ui/*
+!onefive/app/ui/config
+!onefive/app/ui/images/
+onefive/app/server/*
+!onefive/app/server/.gitkeep
 *.fpk
 
 # 日志文件
