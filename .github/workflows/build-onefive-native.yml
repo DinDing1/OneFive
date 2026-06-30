@@ -122,82 +122,82 @@ jobs:
           path: /tmp/nuitka-out/onefive-server
           retention-days: 1
 
-  # ========== Job 3: 编译 ARM 后端 ==========
-  build-backend-arm:
-    runs-on: ubuntu-24.04-arm
-    name: 编译后端 arm64
-    steps:
-      - name: 检出代码
-        uses: actions/checkout@v4
-
-      - name: 编译 Python 后端 (Nuitka)
-        run: |
-          mkdir -p /tmp/nuitka-out
-          echo "在 ARM 原生 runner 上编译..."
-          docker run --rm --platform linux/arm64 \
-            -v $PWD/backend:/build \
-            -v /tmp/nuitka-out:/output \
-            python:3.12-slim-bookworm \
-            bash -c "
-              apt-get update -qq && apt-get install -y -qq patchelf gcc > /dev/null &&
-              pip install 'nuitka[onefile]' ordered-set --quiet &&
-              pip install -r /build/requirements.txt --quiet &&
-              cd /build/src &&
-              python -m nuitka --standalone --onefile \
-                --lto=no \
-                --include-package=onefive \
-                --include-package=onefive.api \
-                --include-package=onefive.db \
-                --include-package=onefive.models \
-                --include-package=onefive.services \
-                --include-package=onefive.notification \
-                --include-package=onefive.notification.telegram \
-                --include-module=uvicorn \
-                --include-module=uvicorn.lifespan.on \
-                --include-module=uvicorn.lifespan.off \
-                --include-module=uvicorn.protocols.websockets.auto \
-                --include-module=uvicorn.protocols.websockets.wsproto_impl \
-                --include-module=uvicorn.protocols.websockets.websockets_impl \
-                --include-module=uvicorn.protocols.http.auto \
-                --include-module=uvicorn.protocols.http.h11_impl \
-                --include-module=uvicorn.protocols.http.httptools_impl \
-                --include-module=uvicorn.logging \
-                --include-module=uvicorn.loops \
-                --include-module=uvicorn.loops.auto \
-                --include-module=uvicorn.loops.asyncio \
-                --include-module=fastapi \
-                --include-module=starlette \
-                --include-module=starlette.middleware \
-                --include-module=starlette.middleware.cors \
-                --include-module=starlette.routing \
-                --include-module=starlette.requests \
-                --include-module=starlette.responses \
-                --include-module=multipart \
-                --include-module=p115client \
-                --include-module=p115nano302 \
-                --include-module=telethon \
-                --include-module=guessit \
-                --include-module=orjson \
-                --include-module=qrcode \
-                --include-module=PIL \
-                --output-filename=onefive-server \
-                --output-dir=/output \
-                onefive/main.py &&
-              echo '编译完成'
-            "
-          echo "ARM 编译完成"
-          ls -lh /tmp/nuitka-out/onefive-server
-
-      - name: 上传后端产物
-        uses: actions/upload-artifact@v4
-        with:
-          name: backend-arm64
-          path: /tmp/nuitka-out/onefive-server
-          retention-days: 1
+  # ========== Job 3: 编译 ARM 后端（需要 ARM runner，暂时禁用）==========
+  # build-backend-arm:
+  #   runs-on: ubuntu-24.04-arm
+  #   name: 编译后端 arm64
+  #   steps:
+  #     - name: 检出代码
+  #       uses: actions/checkout@v4
+  #
+  #     - name: 编译 Python 后端 (Nuitka)
+  #       run: |
+  #         mkdir -p /tmp/nuitka-out
+  #         echo "在 ARM 原生 runner 上编译..."
+  #         docker run --rm --platform linux/arm64 \
+  #           -v $PWD/backend:/build \
+  #           -v /tmp/nuitka-out:/output \
+  #           python:3.12-slim-bookworm \
+  #           bash -c "
+  #             apt-get update -qq && apt-get install -y -qq patchelf gcc > /dev/null &&
+  #             pip install 'nuitka[onefile]' ordered-set --quiet &&
+  #             pip install -r /build/requirements.txt --quiet &&
+  #             cd /build/src &&
+  #             python -m nuitka --standalone --onefile \
+  #               --lto=no \
+  #               --include-package=onefive \
+  #               --include-package=onefive.api \
+  #               --include-package=onefive.db \
+  #               --include-package=onefive.models \
+  #               --include-package=onefive.services \
+  #               --include-package=onefive.notification \
+  #               --include-package=onefive.notification.telegram \
+  #               --include-module=uvicorn \
+  #               --include-module=uvicorn.lifespan.on \
+  #               --include-module=uvicorn.lifespan.off \
+  #               --include-module=uvicorn.protocols.websockets.auto \
+  #               --include-module=uvicorn.protocols.websockets.wsproto_impl \
+  #               --include-module=uvicorn.protocols.websockets.websockets_impl \
+  #               --include-module=uvicorn.protocols.http.auto \
+  #               --include-module=uvicorn.protocols.http.h11_impl \
+  #               --include-module=uvicorn.protocols.http.httptools_impl \
+  #               --include-module=uvicorn.logging \
+  #               --include-module=uvicorn.loops \
+  #               --include-module=uvicorn.loops.auto \
+  #               --include-module=uvicorn.loops.asyncio \
+  #               --include-module=fastapi \
+  #               --include-module=starlette \
+  #               --include-module=starlette.middleware \
+  #               --include-module=starlette.middleware.cors \
+  #               --include-module=starlette.routing \
+  #               --include-module=starlette.requests \
+  #               --include-module=starlette.responses \
+  #               --include-module=multipart \
+  #               --include-module=p115client \
+  #               --include-module=p115nano302 \
+  #               --include-module=telethon \
+  #               --include-module=guessit \
+  #               --include-module=orjson \
+  #               --include-module=qrcode \
+  #               --include-module=PIL \
+  #               --output-filename=onefive-server \
+  #               --output-dir=/output \
+  #               onefive/main.py &&
+  #             echo '编译完成'
+  #           "
+  #         echo "ARM 编译完成"
+  #         ls -lh /tmp/nuitka-out/onefive-server
+  #
+  #     - name: 上传后端产物
+  #       uses: actions/upload-artifact@v4
+  #       with:
+  #         name: backend-arm64
+  #         path: /tmp/nuitka-out/onefive-server
+  #         retention-days: 1
 
   # ========== Job 4: 组装并打包 FPK ==========
   package:
-    needs: [build-frontend, build-backend-x86, build-backend-arm]
+    needs: [build-frontend, build-backend-x86]  # 暂时移除 build-backend-arm 依赖
     runs-on: ubuntu-latest
     name: 打包 ${{ matrix.arch }}
     strategy:
@@ -205,8 +205,9 @@ jobs:
         include:
           - arch: x86_64
             fnpack_platform: x86
-          - arch: arm64
-            fnpack_platform: arm
+          # 暂时注释 ARM 构建
+          # - arch: arm64
+          #   fnpack_platform: arm
     steps:
       - name: 检出代码
         uses: actions/checkout@v4
@@ -276,10 +277,29 @@ jobs:
         run: |
           curl -fsSL -o /tmp/fnpack https://static2.fnnas.com/fnpack/fnpack-1.2.1-linux-amd64
           chmod +x /tmp/fnpack
+          echo "=== fnpack 版本 ==="
+          /tmp/fnpack version || echo "无法获取版本"
+          echo "=== 检查 onefive 目录结构 ==="
+          ls -la onefive/
+          echo "=== 检查 manifest ==="
+          cat onefive/manifest
+          echo "=== 开始打包 ==="
           cd onefive
-          /tmp/fnpack build --directory .
-          FPKN=$(ls *.fpk) && mv "$FPKN" onefive-${{ matrix.arch == 'x86_64' && 'X86' || 'ARM' }}.fpk
-          echo "构建完成: $(ls -lh *.fpk)"
+          /tmp/fnpack build --directory . || {
+            echo "❌ fnpack 打包失败，退出码: $?"
+            echo "=== 查看当前目录文件 ==="
+            ls -laR
+            exit 1
+          }
+          echo "=== 打包成功，查找 .fpk 文件 ==="
+          ls -lh *.fpk || {
+            echo "❌ 未找到 .fpk 文件"
+            ls -la
+            exit 1
+          }
+          FPKN=$(ls *.fpk)
+          mv "$FPKN" onefive-${{ matrix.arch == 'x86_64' && 'X86' || 'ARM' }}.fpk
+          echo "✅ 构建完成: $(ls -lh onefive-*.fpk)"
 
       - name: 上传 FPK
         uses: actions/upload-artifact@v4
