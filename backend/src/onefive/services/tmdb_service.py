@@ -163,25 +163,40 @@ class TMDBService:
         return self._get(f"/tv/{tmdb_id}/season/{season}")
 
     def get_chinese_title(self, details: Dict) -> str:
-        """获取中文标题（优先级：zh-CN > zh-TW > zh-HK > 原标题）"""
-        # 先检查 translations
+        """获取中文标题（优先级：zh-CN > 原标题 > zh-TW > zh-HK）"""
+        # 先检查 translations - 只优先简体中文
         translations = details.get("translations", {}).get("translations", [])
-        for lang in ["zh-CN", "zh-TW", "zh-HK", "zh"]:
-            for t in translations:
-                if t.get("iso_639_1") == lang.split("-")[0] and t.get("iso_3166_1") == lang.split("-")[1] if "-" in lang else True:
-                    data = t.get("data", {})
-                    title = data.get("title") or data.get("name")
-                    if title:
-                        return title
+        for t in translations:
+            if t.get("iso_639_1") == "zh" and t.get("iso_3166_1") == "CN":
+                data = t.get("data", {})
+                title = data.get("title") or data.get("name")
+                if title:
+                    return title
 
-        # 检查 alternative_titles
+        # 检查 alternative_titles - 只优先简体中文
         alt_titles = details.get("alternative_titles", {}).get("titles", [])
-        for lang in ["CN", "TW", "HK"]:
-            for t in alt_titles:
-                if t.get("iso_3166_1") == lang and t.get("title"):
-                    return t["title"]
+        for t in alt_titles:
+            if t.get("iso_3166_1") == "CN" and t.get("title"):
+                return t["title"]
 
-        return details.get("title") or details.get("name") or ""
+        # 返回原标题（英文或其他语言）
+        original_title = details.get("title") or details.get("name")
+        if original_title:
+            return original_title
+
+        # 最后才考虑繁体中文（避免简体环境显示繁体）
+        for t in translations:
+            if t.get("iso_639_1") == "zh" and t.get("iso_3166_1") in ["TW", "HK"]:
+                data = t.get("data", {})
+                title = data.get("title") or data.get("name")
+                if title:
+                    return title
+
+        for t in alt_titles:
+            if t.get("iso_3166_1") in ["TW", "HK"] and t.get("title"):
+                return t["title"]
+
+        return ""
 
     def _get_result_year(self, result: Dict, media_type: str) -> str:
         """从搜索结果中提取年份"""
