@@ -18,6 +18,19 @@ start)
   export TRIM_PKGVAR="${TRIM_PKGVAR}"
   export ONEFIVE_SOCKET="${SOCKET_PATH}"
   
+  # 检查后端二进制是否存在
+  if [ ! -f "${TRIM_APPDEST}/app/server/onefive-server" ]; then
+    echo "错误：后端服务文件不存在: ${TRIM_APPDEST}/app/server/onefive-server" > "${TRIM_TEMP_LOGFILE}"
+    ls -la "${TRIM_APPDEST}/app/server/" >> "${TRIM_TEMP_LOGFILE}"
+    exit 1
+  fi
+  
+  # 检查文件权限
+  if [ ! -x "${TRIM_APPDEST}/app/server/onefive-server" ]; then
+    echo "错误：后端服务文件没有执行权限" > "${TRIM_TEMP_LOGFILE}"
+    chmod +x "${TRIM_APPDEST}/app/server/onefive-server"
+  fi
+  
   # 启动后端服务
   cd "${TRIM_APPDEST}/app/server"
   nohup ./onefive-server > "${TRIM_PKGVAR}/logs/onefive.log" 2>&1 &
