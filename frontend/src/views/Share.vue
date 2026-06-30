@@ -221,6 +221,26 @@
               </div>
             </div>
           </div>
+          
+          <!-- 分页器 -->
+          <div v-if="totalItems > pageSize" class="pagination">
+            <button class="page-btn" :disabled="currentPage <= 1" @click="currentPage--">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <polyline points="15 18 9 12 15 6" />
+              </svg>
+            </button>
+            <template v-for="p in visiblePages" :key="p">
+              <span v-if="p === -1" class="page-ellipsis">...</span>
+              <button v-else class="page-btn" :class="{ active: p === currentPage }" @click="currentPage = p">
+                {{ p }}
+              </button>
+            </template>
+            <button class="page-btn" :disabled="currentPage >= totalPages" @click="currentPage++">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <polyline points="9 18 15 12 9 6" />
+              </svg>
+            </button>
+          </div>
         </div>
 
         <!-- 行操作下拉菜单（独立于视图，不受 v-if 链影响） -->
@@ -310,6 +330,26 @@
                   </div>
                 </div>
               </div>
+            </div>
+            
+            <!-- 整理视图分页器 -->
+            <div v-if="organizedTotalItems > organizedPageSize" class="pagination">
+              <button class="page-btn" :disabled="organizedCurrentPage <= 1" @click="organizedCurrentPage--">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                  <polyline points="15 18 9 12 15 6" />
+                </svg>
+              </button>
+              <template v-for="p in organizedVisiblePages" :key="p">
+                <span v-if="p === -1" class="page-ellipsis">...</span>
+                <button v-else class="page-btn" :class="{ active: p === organizedCurrentPage }" @click="organizedCurrentPage = p">
+                  {{ p }}
+                </button>
+              </template>
+              <button class="page-btn" :disabled="organizedCurrentPage >= organizedTotalPages" @click="organizedCurrentPage++">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                  <polyline points="9 18 15 12 9 6" />
+                </svg>
+              </button>
             </div>
           </div>
         </div>
@@ -539,12 +579,63 @@ interface OrganizedEntry {
   totalSize?: number
   file?: ShareFile  // 叶子节点的文件数据
 }
-const organizedEntries = ref<OrganizedEntry[]>([])
+const allOrganizedEntries = ref<OrganizedEntry[]>([])
 const organizedBreadcrumbs = ref<{ path: string; name: string }[]>([{ path: '', name: '根目录' }])
 const organizedCurrentPath = ref('')
 const loadingOrganized = ref(false)
 // 存储所有已整理的文件，用于按路径筛选
 const allOrganizedFiles = ref<ShareFile[]>([])
+
+// 整理视图分页
+const organizedCurrentPage = ref(1)
+const organizedPageSize = ref(30)
+
+/** 整理视图当前页条目（分页后） */
+const organizedEntries = computed(() => {
+  const start = (organizedCurrentPage.value - 1) * organizedPageSize.value
+  const end = start + organizedPageSize.value
+  return allOrganizedEntries.value.slice(start, end)
+})
+
+/** 整理视图总条数 */
+const organizedTotalItems = computed(() => allOrganizedEntries.value.length)
+
+/** 整理视图总页数 */
+const organizedTotalPages = computed(() => {
+  const total = Math.ceil(organizedTotalItems.value / organizedPageSize.value)
+  return total > 0 ? total : 1
+})
+
+/** 整理视图可见页码 */
+const organizedVisiblePages = computed(() => {
+  const total = organizedTotalPages.value
+  const current = organizedCurrentPage.value
+  const pages: number[] = []
+  
+  if (total <= 7) {
+    for (let i = 1; i <= total; i++) {
+      pages.push(i)
+    }
+  } else {
+    if (current <= 4) {
+      for (let i = 1; i <= 5; i++) pages.push(i)
+      pages.push(-1)
+      pages.push(total)
+    } else if (current >= total - 3) {
+      pages.push(1)
+      pages.push(-1)
+      for (let i = total - 4; i <= total; i++) pages.push(i)
+    } else {
+      pages.push(1)
+      pages.push(-1)
+      for (let i = current - 1; i <= current + 1; i++) pages.push(i)
+      pages.push(-1)
+      pages.push(total)
+    }
+  }
+  
+  return pages
+})
 
 // 搜索
 const searchKeyword = ref('')
@@ -586,12 +677,68 @@ const manualOverride = ref(false)
 
 // ==================== 计算属性 ====================
 
-/** 筛选后的文件列表（仅原始视图生效） */
-const filteredFiles = computed(() => {
+// 分页相关
+const currentPage = ref(1)
+const pageSize = ref(30)
+
+/** 筛选后的所有文件列表（不分页） */
+const allFilteredFiles = computed(() => {
   if (viewMode.value !== 'original') return allFiles.value
   if (fileFilter.value === 'all') return allFiles.value
   if (fileFilter.value === 'organized') return allFiles.value.filter(f => f.organized)
   return allFiles.value.filter(f => !f.organized)
+})
+
+/** 总条数 */
+const totalItems = computed(() => allFilteredFiles.value.length)
+
+/** 总页数 */
+const totalPages = computed(() => {
+  const total = Math.ceil(totalItems.value / pageSize.value)
+  return total > 0 ? total : 1 // 至少1页
+})
+
+/** 可见页码列表 */
+const visiblePages = computed(() => {
+  const total = totalPages.value
+  const current = currentPage.value
+  const pages: number[] = []
+  
+  if (total <= 7) {
+    // 总页数少于7页，全部显示
+    for (let i = 1; i <= total; i++) {
+      pages.push(i)
+    }
+  } else {
+    // 总页数多于7页，显示部分页码
+    if (current <= 4) {
+      // 当前页靠前
+      for (let i = 1; i <= 5; i++) pages.push(i)
+      pages.push(-1) // 省略号占位
+      pages.push(total)
+    } else if (current >= total - 3) {
+      // 当前页靠后
+      pages.push(1)
+      pages.push(-1)
+      for (let i = total - 4; i <= total; i++) pages.push(i)
+    } else {
+      // 当前页在中间
+      pages.push(1)
+      pages.push(-1)
+      for (let i = current - 1; i <= current + 1; i++) pages.push(i)
+      pages.push(-1)
+      pages.push(total)
+    }
+  }
+  
+  return pages
+})
+
+/** 当前页的文件列表（分页后） */
+const filteredFiles = computed(() => {
+  const start = (currentPage.value - 1) * pageSize.value
+  const end = start + pageSize.value
+  return allFilteredFiles.value.slice(start, end)
 })
 
 /** 空状态描述文本 */
@@ -687,9 +834,19 @@ function toggleRowMenu(item: ShareFile, event: MouseEvent) {
   rowMenuTarget.value = item
   // 定位到点击位置
   const rect = (event.currentTarget as HTMLElement).getBoundingClientRect()
+  
+  // 菜单预估高度（根据实际菜单项数量计算）
+  const menuHeight = 100 // 预估菜单高度
+  const spaceBelow = window.innerHeight - rect.bottom
+  const spaceAbove = rect.top
+  
+  // 判断下方空间是否足够，不够则向上展开
+  const shouldOpenUpward = spaceBelow < menuHeight && spaceAbove > spaceBelow
+  
   rowMenuStyle.value = {
     position: 'fixed',
-    top: `${rect.bottom + 4}px`,
+    top: shouldOpenUpward ? 'auto' : `${rect.bottom + 4}px`,
+    bottom: shouldOpenUpward ? `${window.innerHeight - rect.top + 4}px` : 'auto',
     right: `${window.innerWidth - rect.right}px`,
   }
   rowMenuVisible.value = true
@@ -824,12 +981,12 @@ async function loadOrganized() {
       buildOrganizedEntries('')
     } else {
       allOrganizedFiles.value = []
-      organizedEntries.value = []
+      allOrganizedEntries.value = []
     }
   } catch (e) {
     console.error('加载整理视图失败:', e)
     allOrganizedFiles.value = []
-    organizedEntries.value = []
+    allOrganizedEntries.value = []
   } finally {
     loadingOrganized.value = false
   }
@@ -860,6 +1017,14 @@ function buildOrganizedEntries(currentPath: string) {
         existing.totalSize += file.size || 0
         dirs.set(dirName, existing)
       }
+    } else if (fullDir === currentPath) {
+      // 精确匹配当前路径的文件（同一目录下的文件）← 优先判断
+      files.push({
+        name: file.organized_name || file.name,
+        path: fullDir + '/' + (file.organized_name || file.name),
+        isDir: false,
+        file,
+      })
     } else if (fullDir.startsWith(currentPath + '/')) {
       // 子目录：取下一层
       const remaining = fullDir.slice(currentPath.length + 1)
@@ -872,23 +1037,7 @@ function buildOrganizedEntries(currentPath: string) {
         existing.fileCount++
         existing.totalSize += file.size || 0
         dirs.set(fullPath, existing)
-      } else {
-        // 当前路径下的文件
-        files.push({
-          name: file.organized_name || file.name,
-          path: fullDir + '/' + (file.organized_name || file.name),
-          isDir: false,
-          file,
-        })
       }
-    } else if (fullDir === currentPath) {
-      // 精确匹配当前路径的文件
-      files.push({
-        name: file.organized_name || file.name,
-        path: fullDir + '/' + (file.organized_name || file.name),
-        isDir: false,
-        file,
-      })
     }
   }
 
@@ -908,7 +1057,8 @@ function buildOrganizedEntries(currentPath: string) {
   // 目录排前面，文件排后面
   entries.sort((a, b) => a.name.localeCompare(b.name))
   files.sort((a, b) => a.name.localeCompare(b.name))
-  organizedEntries.value = [...entries, ...files]
+  allOrganizedEntries.value = [...entries, ...files]
+  organizedCurrentPage.value = 1 // 重置到第一页
 }
 
 /** 进入子目录 */
@@ -1205,6 +1355,7 @@ function formatTime(ts: string | number): string {
   gap: 12px;
   height: 100%;
   font-family: var(--font-sans);
+  overflow: hidden; /* 不允许整个页面滚动 */
 }
 
 /* ==================== 文件视图区域 ==================== */
@@ -1212,9 +1363,9 @@ function formatTime(ts: string | number): string {
   flex: 1;
   display: flex;
   flex-direction: column;
-  gap: 12px;
-  overflow: hidden;
-  min-height: 0;
+  gap: 8px;
+  overflow: hidden; /* 不允许内容溢出，子元素内部滚动 */
+  min-height: 0; /* 防止flex子元素溢出 */
 }
 
 /* 无分享时的空态提示 */
@@ -1490,9 +1641,10 @@ function formatTime(ts: string | number): string {
 .file-list-container {
   flex: 1;
   border-radius: var(--radius-lg);
-  overflow: hidden;
+  overflow: hidden; /* 外层不滚动 */
   display: flex;
   flex-direction: column;
+  min-height: 0; /* 防止 flex 子元素溢出 */
 }
 
 /* ==================== 加载 / 空状态 ==================== */
@@ -1547,12 +1699,15 @@ function formatTime(ts: string | number): string {
   color: var(--text-tertiary);
 }
 
-/* ==================== 原始视图：表格布局 ==================== */
+/* ==================== 文件表格 ==================== */
 .file-table {
+  flex: 1;
   display: flex;
   flex-direction: column;
-  flex: 1;
-  overflow: hidden;
+  overflow-y: auto; /* 滚动在表格内 */
+  overflow-x: hidden;
+  border-radius: var(--radius-lg);
+  min-height: 0; /* 关键：允许flex子元素正确计算高度 */
 }
 
 /* 目录导航面包屑 */
@@ -1618,8 +1773,9 @@ function formatTime(ts: string | number): string {
 
 .table-body {
   flex: 1;
-  overflow-y: auto;
-  scrollbar-gutter: stable;
+  /* 不需要滚动，由父容器 .file-list-container 控制 */
+  overflow: visible;
+  min-height: 0; /* 允许内容正确计算高度 */
 }
 
 /* 文件行 */
@@ -1926,11 +2082,73 @@ function formatTime(ts: string | number): string {
   height: 14px;
 }
 
+/* ==================== 分页器（新拟态按钮） ==================== */
+.pagination {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  padding: 12px 0; /* 左右padding改为0，与glass-card边缘对齐 */
+  margin: 0 16px; /* 用margin控制左右间距，让border-top延伸到边缘 */
+  border-top: none; /* 移除border-top，避免与最后一行的border-bottom重复 */
+  flex-shrink: 0;
+  background: var(--bg-primary); /* 固定背景，不透明 */
+}
+
+.page-btn {
+  min-width: 32px;
+  height: 32px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0 8px;
+  background: transparent;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--text-secondary);
+  cursor: pointer;
+  box-shadow: var(--shadow-sm);
+  transition: all var(--transition-base);
+}
+
+.page-btn:hover:not(:disabled):not(.active) {
+  background: var(--bg-hover);
+  color: var(--text-primary);
+  box-shadow: var(--shadow-md);
+}
+
+.page-btn.active {
+  background: var(--accent);
+  color: var(--text-inverse);
+  border-color: var(--accent);
+}
+
+.page-btn:disabled {
+  opacity: 0.3;
+  cursor: not-allowed;
+}
+
+.page-btn svg {
+  width: 16px;
+  height: 16px;
+}
+
+.page-ellipsis {
+  width: 32px;
+  text-align: center;
+  font-size: 13px;
+  color: var(--text-tertiary);
+}
+
 /* ==================== 整理视图：文件管理器风格 ==================== */
 .organized-view {
   display: flex;
   flex-direction: column;
   gap: 8px;
+  height: 100%; /* 确保占满高度 */
+  overflow: hidden; /* 不允许整个视图溢出 */
 }
 
 /* 面包屑导航栏 */
