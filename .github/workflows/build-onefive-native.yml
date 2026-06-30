@@ -243,20 +243,20 @@ jobs:
 
       - name: 组装应用文件
         run: |
-          # 前端构建产物 -> onefive/app/ui/（保留 config 文件）
-          rm -rf onefive/app/ui/assets onefive/app/ui/*.html onefive/app/ui/*.js onefive/app/ui/*.css onefive/app/ui/*.svg onefive/app/ui/*.png
-          mkdir -p onefive/app/ui
-          cp -r frontend/dist/* onefive/app/ui/
+          # 前端构建产物 -> onefive/ui/（保留 config 文件）
+          rm -rf onefive/ui/assets onefive/ui/*.html onefive/ui/*.js onefive/ui/*.css onefive/ui/*.svg onefive/ui/*.png
+          mkdir -p onefive/ui
+          cp -r frontend/dist/* onefive/ui/
 
-          # 后端二进制 -> onefive/app/server/
-          mkdir -p onefive/app/server
-          rm -rf onefive/app/server/__pycache__
-          cp /tmp/nuitka-out/onefive-server onefive/app/server/onefive-server
-          chmod +x onefive/app/server/onefive-server
+          # 后端二进制 -> onefive/server/
+          mkdir -p onefive/server
+          rm -rf onefive/server/__pycache__
+          cp /tmp/nuitka-out/onefive-server onefive/server/onefive-server
+          chmod +x onefive/server/onefive-server
 
           echo "应用文件组装完成"
-          ls -la onefive/app/server/
-          ls -la onefive/app/ui/
+          ls -la onefive/server/
+          ls -la onefive/ui/
 
       - name: 更新 manifest
         run: |
