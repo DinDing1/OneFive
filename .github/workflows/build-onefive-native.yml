@@ -109,7 +109,7 @@ jobs:
                 --include-module=PIL \
                 --output-filename=onefive-server \
                 --output-dir=/output \
-                -m onefive.main &&
+                onefive/main.py &&
               echo '编译完成'
             "
           echo "x86 编译完成"
@@ -182,7 +182,7 @@ jobs:
                 --include-module=PIL \
                 --output-filename=onefive-server \
                 --output-dir=/output \
-                -m onefive.main &&
+                onefive/main.py &&
               echo '编译完成'
             "
           echo "ARM 编译完成"
