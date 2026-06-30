@@ -130,7 +130,8 @@ async def global_exception_handler(request, exc):
     )
 
 
-if __name__ == "__main__":
+def start_server():
+    """启动服务器"""
     import uvicorn
 
     # 获取配置
@@ -153,3 +154,7 @@ if __name__ == "__main__":
             port=SERVICE_PORT,
             reload=True
         )
+
+
+if __name__ == "__main__":
+    start_server()

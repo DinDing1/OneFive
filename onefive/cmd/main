@@ -11,6 +11,9 @@ start)
   # 清理旧的 socket 文件
   rm -f "${SOCKET_PATH}"
   
+  # 创建日志目录
+  mkdir -p "${TRIM_PKGVAR}/logs"
+  
   # 设置环境变量
   export TRIM_PKGVAR="${TRIM_PKGVAR}"
   export ONEFIVE_SOCKET="${SOCKET_PATH}"
@@ -19,15 +22,19 @@ start)
   cd "${TRIM_APPDEST}/app/server"
   nohup ./onefive-server > "${TRIM_PKGVAR}/logs/onefive.log" 2>&1 &
   
-  # 等待服务启动
-  sleep 2
+  # 等待服务启动（增加等待时间）
+  sleep 5
   
   # 检查服务是否启动成功
   if [ -S "${SOCKET_PATH}" ]; then
     echo "壹伍服务启动成功"
     exit 0
   else
-    echo "壹伍服务启动失败：Unix Socket 未创建" > "${TRIM_TEMP_LOGFILE}"
+    echo "壹伍服务启动失败，查看日志: ${TRIM_PKGVAR}/logs/onefive.log" > "${TRIM_TEMP_LOGFILE}"
+    # 输出最后几行日志帮助调试
+    if [ -f "${TRIM_PKGVAR}/logs/onefive.log" ]; then
+      tail -20 "${TRIM_PKGVAR}/logs/onefive.log" >> "${TRIM_TEMP_LOGFILE}"
+    fi
     exit 1
   fi
   ;;
