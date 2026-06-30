@@ -1,76 +1,128 @@
 #!/bin/bash
 
-# 壹伍（OneFive）主启动脚本
-# 飞牛OS会调用此脚本管理应用运行状态
+LOG_FILE="${TRIM_PKGVAR}/info.log"
+PID_FILE="${TRIM_PKGVAR}/app.pid"
+SOCKET_PATH="${TRIM_APPDEST}/onefive.sock"
+
+log_msg() {
+    echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" >> ${LOG_FILE}
+}
+
+# 等待 Unix Socket 文件就绪并可连接
+# fnOS 网关在 cmd/main 返回后立即尝试连接 socket，
+# 如果 socket 尚未就绪，网关会返回 502 Bad Gateway。
+# 此函数轮询检查 socket 是否存在且可连接，最多等待 30 秒。
+wait_socket_ready() {
+    local max_wait=30
+    local count=0
+    while [ $count -lt $max_wait ]; do
+        if [ -S "${SOCKET_PATH}" ]; then
+            # socket 文件存在且是 socket 类型，尝试连接验证
+            if nc -U -z "${SOCKET_PATH}" 2>/dev/null; then
+                log_msg "Socket 就绪: ${SOCKET_PATH} (nc 验证通过)"
+                return 0
+            fi
+            # nc 不可用时，仅检查文件存在也视为就绪
+            # （uvicorn 绑定 socket 后文件即存在，通常可立即连接）
+            log_msg "Socket 就绪: ${SOCKET_PATH} (文件已存在)"
+            return 0
+        fi
+        sleep 1
+        count=$((count + 1))
+    done
+    echo "等待 Socket 就绪超时（${max_wait}秒），应用可能启动失败" > "${TRIM_TEMP_LOGFILE}"
+    log_msg "等待 Socket 就绪超时"
+    return 1
+}
+
+start_process() {
+    if status; then
+        return 0
+    fi
+
+    # 清理残留 socket 文件（上次异常退出可能遗留，不清理会导致新进程绑定失败）
+    rm -f "${SOCKET_PATH}"
+
+    log_msg "Starting OneFive ..."
+
+    # 设置数据目录、Socket 路径和 UI 目录
+    export TRIM_PKGVAR="${TRIM_PKGVAR}"
+    export ONEFIVE_SOCKET="${SOCKET_PATH}"
+
+    # 运行 Nuitka 编译的二进制文件
+    SERVER_BIN="${TRIM_APPDEST}/app/server/onefive-server"
+    if [ ! -f "${SERVER_BIN}" ]; then
+        echo "错误: 找不到服务端程序 ${SERVER_BIN}" > ${TRIM_TEMP_LOGFILE}
+        log_msg "错误: 找不到服务端程序 ${SERVER_BIN}"
+        exit 1
+    fi
+
+    chmod +x "${SERVER_BIN}" 2>/dev/null
+
+    "${SERVER_BIN}" >> ${LOG_FILE} 2>&1 &
+    printf "%s" "$!" > ${PID_FILE}
+    log_msg "OneFive started with PID $!"
+
+    # 等待 socket 就绪，确保 fnOS 网关能立即连接
+    if ! wait_socket_ready; then
+        return 1
+    fi
+
+    return 0
+}
+
+stop_process() {
+    log_msg "Stopping OneFive ..."
+
+    if [ -r "${PID_FILE}" ]; then
+        pid=$(head -n 1 "${PID_FILE}" | tr -d '[:space:]')
+        if ! check_process "${pid}"; then
+            rm -f "${PID_FILE}"
+            return
+        fi
+
+        log_msg "Sending TERM to PID:${pid}"
+        kill -TERM ${pid} >> ${LOG_FILE} 2>&1
+
+        local count=0
+        while check_process "${pid}" && [ $count -lt 10 ]; do
+            sleep 1
+            count=$((count + 1))
+        done
+
+        if check_process "${pid}"; then
+            kill -KILL "${pid}"
+            sleep 1
+        fi
+
+        rm -f "${PID_FILE}"
+    fi
+
+    rm -f "${SOCKET_PATH}"
+    return 0
+}
+
+check_process() {
+    kill -0 "$1" 2>/dev/null
+}
+
+status() {
+    if [ -f "${PID_FILE}" ]; then
+        pid=$(head -n 1 "${PID_FILE}" | tr -d '[:space:]')
+        if check_process "${pid}"; then
+            return 0
+        else
+            rm -f "${PID_FILE}"
+        fi
+    fi
+    return 1
+}
 
 case $1 in
-start)
-  # Socket 文件放在 target 目录（应用安装目录）
-  SOCKET_PATH="${TRIM_APPDEST}/onefive.sock"
-  
-  # 清理旧的 socket 文件
-  rm -f "${SOCKET_PATH}"
-  
-  # 创建日志目录
-  mkdir -p "${TRIM_PKGVAR}/logs"
-  
-  # 设置环境变量
-  export TRIM_PKGVAR="${TRIM_PKGVAR}"
-  export ONEFIVE_SOCKET="${SOCKET_PATH}"
-  
-  # 检查后端二进制是否存在
-  if [ ! -f "${TRIM_APPDEST}/app/server/onefive-server" ]; then
-    echo "错误：后端服务文件不存在: ${TRIM_APPDEST}/app/server/onefive-server" > "${TRIM_TEMP_LOGFILE}"
-    ls -la "${TRIM_APPDEST}/app/server/" >> "${TRIM_TEMP_LOGFILE}"
-    exit 1
-  fi
-  
-  # 检查文件权限
-  if [ ! -x "${TRIM_APPDEST}/app/server/onefive-server" ]; then
-    echo "错误：后端服务文件没有执行权限" > "${TRIM_TEMP_LOGFILE}"
-    chmod +x "${TRIM_APPDEST}/app/server/onefive-server"
-  fi
-  
-  # 启动后端服务
-  cd "${TRIM_APPDEST}/app/server"
-  nohup ./onefive-server > "${TRIM_PKGVAR}/logs/onefive.log" 2>&1 &
-  
-  # 等待服务启动（增加等待时间）
-  sleep 5
-  
-  # 检查服务是否启动成功
-  if [ -S "${SOCKET_PATH}" ]; then
-    echo "壹伍服务启动成功"
-    exit 0
-  else
-    echo "壹伍服务启动失败，查看日志: ${TRIM_PKGVAR}/logs/onefive.log" > "${TRIM_TEMP_LOGFILE}"
-    # 输出最后几行日志帮助调试
-    if [ -f "${TRIM_PKGVAR}/logs/onefive.log" ]; then
-      tail -20 "${TRIM_PKGVAR}/logs/onefive.log" >> "${TRIM_TEMP_LOGFILE}"
-    fi
-    exit 1
-  fi
-  ;;
-stop)
-  # 停止应用
-  pkill -f "onefive-server"
-  
-  # 清理 socket 文件
-  SOCKET_PATH="${TRIM_APPDEST}/onefive.sock"
-  rm -f "${SOCKET_PATH}"
-  
-  echo "壹伍服务已停止"
-  exit 0
-  ;;
+start) start_process ;;
+stop)  stop_process ;;
 status)
-  # 检查应用是否在运行
-  if pgrep -f "onefive-server" > /dev/null; then
-    exit 0
-  else
-    exit 3
-  fi
-  ;;
-*)
-  exit 1
-  ;;
+    if status; then exit 0; else exit 3; fi
+    ;;
+*) exit 1 ;;
 esac
