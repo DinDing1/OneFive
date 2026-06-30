@@ -243,7 +243,7 @@ jobs:
 
       - name: 组装应用文件
         run: |
-          # 前端构建产物 -> onefive/app/ui/
+          # 前端构建产物 -> onefive/app/ui/（保留 config 文件）
           rm -rf onefive/app/ui/assets onefive/app/ui/*.html onefive/app/ui/*.js onefive/app/ui/*.css onefive/app/ui/*.svg onefive/app/ui/*.png
           mkdir -p onefive/app/ui
           cp -r frontend/dist/* onefive/app/ui/
