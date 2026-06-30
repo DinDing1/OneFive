@@ -1,0 +1,15 @@
+#!/bin/bash
+
+# 壹伍（OneFive）卸载初始化脚本
+# 在用户点击卸载时执行
+
+echo "壹伍（OneFive）卸载初始化..."
+
+# 从向导获取用户选择
+if [ "$wizard_delete_data" = "true" ]; then
+  echo "用户选择删除数据"
+else
+  echo "用户选择保留数据"
+fi
+
+exit 0

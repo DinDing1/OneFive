@@ -1,0 +1,7 @@
+#!/bin/bash
+
+# 壹伍（OneFive）安装完成回调脚本
+# 在安装完成后执行
+
+echo "壹伍（OneFive）安装完成"
+exit 0

@@ -1,0 +1,57 @@
+/**
+ * 液态玻璃（Glassmorphism）Utility 类
+ *
+ * 使用 backdrop-filter + 半透明背景 + 高光边
+ * 适用于：侧边栏、顶栏、弹窗遮罩、卡片
+ */
+
+.glass-panel {
+  background: var(--bg-elevated);
+  backdrop-filter: var(--glass-blur);
+  -webkit-backdrop-filter: var(--glass-blur);
+  border: 1px solid var(--glass-border);
+  box-shadow: var(--glass-shadow);
+}
+
+.glass-card {
+  background: var(--bg-elevated);
+  backdrop-filter: var(--glass-blur);
+  -webkit-backdrop-filter: var(--glass-blur);
+  border: 1px solid var(--border);
+  box-shadow: var(--shadow-md);
+}
+
+.glass-solid {
+  background: var(--bg-solid);
+  backdrop-filter: var(--glass-blur);
+  -webkit-backdrop-filter: var(--glass-blur);
+  border: 1px solid var(--border);
+  box-shadow: var(--glass-shadow);
+}
+
+/* 弹窗遮罩 */
+.glass-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.3);
+  backdrop-filter: blur(8px);
+  -webkit-backdrop-filter: blur(8px);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 20px;
+  z-index: 1000;
+}
+
+/* 顶栏毛玻璃（粘性吸顶） */
+.glass-header {
+  background: var(--bg-elevated);
+  backdrop-filter: var(--glass-blur);
+  -webkit-backdrop-filter: var(--glass-blur);
+  border-bottom: 1px solid var(--border);
+}
+
+/* 暗色模式下遮罩更深 */
+:root[data-theme='dark'] .glass-overlay {
+  background: rgba(0, 0, 0, 0.5);
+}

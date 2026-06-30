@@ -1,0 +1,14 @@
+appname               = onefive
+version               = 1.0.0
+display_name          = 壹伍
+desc                  = 壹伍（OneFive） 是一款115云盘管理工具。
+platform              = all
+source                = thirdparty
+os_min_version        = 1.1.3100
+maintainer            = cliii_one
+maintainer_url        = https://github.com/cliii-one
+distributor           = cliii_one
+distributor_url       = https://github.com/cliii-one    
+desktop_uidir         = ui
+desktop_applaunchname = onefive.APPLICATION
+changelog             = 1. 初始版本

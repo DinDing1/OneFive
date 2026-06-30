@@ -1,0 +1,23 @@
+# OneFive - Python Dependencies
+
+# Core dependencies
+p115client>=0.0.8
+p115nano302>=0.0.6
+fastapi>=0.110.0
+uvicorn>=0.27.0
+python-multipart>=0.0.9
+orjson>=3.9.0
+guessit>=3.8.0
+requests>=2.31.0
+
+# Telegram notification dependencies
+telethon>=1.36.0
+python-socks[asyncio]>=2.0.0
+
+# QR code login dependencies
+qrcode>=7.4
+Pillow>=10.0.0
+
+# Development dependencies
+pytest>=8.0.0
+httpx>=0.27.0

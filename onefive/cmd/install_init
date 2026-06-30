@@ -1,0 +1,17 @@
+#!/bin/bash
+
+# 壹伍（OneFive）安装初始化脚本
+# 在用户点击安装时执行
+
+echo "壹伍（OneFive）安装初始化..."
+
+# 创建数据目录
+mkdir -p "${TRIM_PKGVAR}/db"
+mkdir -p "${TRIM_PKGVAR}/logs"
+
+# 设置权限
+chown -R ${TRIM_USERNAME}:${TRIM_USERNAME} "${TRIM_PKGVAR}"
+chmod -R 755 "${TRIM_PKGVAR}"
+
+echo "数据目录创建完成: ${TRIM_PKGVAR}"
+exit 0

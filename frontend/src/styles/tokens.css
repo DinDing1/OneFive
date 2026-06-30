@@ -1,0 +1,144 @@
+/**
+ * OneFive 设计 Token
+ *
+ * 明/暗双主题 CSS 变量定义
+ * 通过 <html data-theme="light|dark"> 切换
+ */
+
+/* ==================== 亮色主题（默认） ==================== */
+:root,
+:root[data-theme='light'] {
+  /* 背景层 */
+  --bg-base: #f5f5f7;            /* 页面底色 */
+  --bg-elevated: rgba(255, 255, 255, 0.72);  /* 玻璃容器（半透明） */
+  --bg-solid: #ffffff;           /* 不透明卡片/弹窗 */
+  --bg-hover: rgba(0, 0, 0, 0.04);          /* hover 态 */
+  --bg-selected: rgba(0, 113, 227, 0.08);  /* 选中态 */
+  --bg-input: rgba(0, 0, 0, 0.03);          /* 输入框凹陷底 */
+
+  /* 文字层 */
+  --text-primary: #1d1d1f;
+  --text-secondary: #6e6e73;
+  --text-tertiary: #aeaeb2;
+  --text-inverse: #ffffff;
+
+  /* 语义色 */
+  --accent: #0071e3;
+  --accent-hover: #0077ed;
+  --accent-bg: rgba(0, 113, 227, 0.08);
+  --success: #34c759;
+  --success-bg: rgba(52, 199, 89, 0.12);
+  --warning: #ff9500;
+  --warning-bg: rgba(255, 149, 0, 0.12);
+  --danger: #ff3b30;
+  --danger-bg: rgba(255, 59, 48, 0.08);
+  --purple: #af52de;
+  --purple-bg: rgba(175, 82, 222, 0.10);
+  --folder: #f5a623;
+
+  /* 边框 */
+  --border: rgba(0, 0, 0, 0.08);
+  --border-strong: rgba(0, 0, 0, 0.12);
+  --glass-border: rgba(255, 255, 255, 0.5);  /* 玻璃高光边 */
+
+  /* 阴影 */
+  --shadow-sm: 0 1px 3px rgba(0, 0, 0, 0.06);
+  --shadow-md: 0 4px 16px rgba(0, 0, 0, 0.08);
+  --shadow-lg: 0 12px 40px rgba(0, 0, 0, 0.12);
+  --glass-shadow: 0 8px 32px rgba(0, 0, 0, 0.12);
+
+  /* 新拟态阴影（亮色：白底+柔和暗影） */
+  --neu-raised:
+    -6px -6px 12px rgba(255, 255, 255, 0.9),
+    6px 6px 12px rgba(0, 0, 0, 0.06);
+  --neu-raised-strong:
+    -8px -8px 16px rgba(255, 255, 255, 0.95),
+    8px 8px 16px rgba(0, 0, 0, 0.08);
+  --neu-inset:
+    inset -3px -3px 6px rgba(255, 255, 255, 0.9),
+    inset 3px 3px 6px rgba(0, 0, 0, 0.06);
+
+  /* 液态玻璃模糊 */
+  --glass-blur: blur(20px) saturate(180%);
+
+  /* 圆角 */
+  --radius-sm: 8px;
+  --radius-md: 12px;
+  --radius-lg: 16px;
+  --radius-xl: 20px;
+  --radius-full: 9999px;
+
+  /* 过渡 */
+  --transition-fast: 0.1s ease;
+  --transition-base: 0.2s ease;
+  --transition-slow: 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+
+  /* 间距（辅助） */
+  --space-xs: 4px;
+  --space-sm: 8px;
+  --space-md: 12px;
+  --space-lg: 16px;
+  --space-xl: 24px;
+
+  /* 字体 */
+  --font-sans: -apple-system, BlinkMacSystemFont, 'SF Pro Display', 'SF Pro Text',
+    'Helvetica Neue', 'PingFang SC', 'Hiragino Sans GB', 'Microsoft YaHei',
+    sans-serif;
+  --font-mono: 'SF Mono', 'Menlo', 'Consolas', 'Courier New', monospace;
+}
+
+/* ==================== 暗色主题 ==================== */
+:root[data-theme='dark'] {
+  /* 背景层 */
+  --bg-base: #1a1a1c;
+  --bg-elevated: rgba(44, 44, 46, 0.72);
+  --bg-solid: #2c2c2e;
+  --bg-hover: rgba(255, 255, 255, 0.06);
+  --bg-selected: rgba(10, 132, 255, 0.16);
+  --bg-input: rgba(0, 0, 0, 0.2);
+
+  /* 文字层 */
+  --text-primary: #f5f5f7;
+  --text-secondary: #aeaeb2;
+  --text-tertiary: #6e6e73;
+  --text-inverse: #1d1d1f;
+
+  /* 语义色 */
+  --accent: #0a84ff;
+  --accent-hover: #409cff;
+  --accent-bg: rgba(10, 132, 255, 0.16);
+  --success: #30d158;
+  --success-bg: rgba(48, 209, 88, 0.16);
+  --warning: #ff9f0a;
+  --warning-bg: rgba(255, 159, 10, 0.16);
+  --danger: #ff453a;
+  --danger-bg: rgba(255, 69, 58, 0.16);
+  --purple: #bf5af2;
+  --purple-bg: rgba(191, 90, 242, 0.16);
+  --folder: #ffb340;
+
+  /* 边框 */
+  --border: rgba(255, 255, 255, 0.1);
+  --border-strong: rgba(255, 255, 255, 0.16);
+  --glass-border: rgba(255, 255, 255, 0.12);
+
+  /* 阴影 */
+  --shadow-sm: 0 1px 3px rgba(0, 0, 0, 0.4);
+  --shadow-md: 0 4px 16px rgba(0, 0, 0, 0.4);
+  --shadow-lg: 0 12px 40px rgba(0, 0, 0, 0.5);
+  --glass-shadow: 0 8px 32px rgba(0, 0, 0, 0.5);
+
+  /* 新拟态阴影（暗色：深底+柔和亮影） */
+  --neu-raised:
+    -6px -6px 12px rgba(60, 60, 64, 0.12),
+    6px 6px 12px rgba(0, 0, 0, 0.5);
+  --neu-raised-strong:
+    -8px -8px 16px rgba(60, 60, 64, 0.18),
+    8px 8px 16px rgba(0, 0, 0, 0.6);
+  --neu-inset:
+    inset -3px -3px 6px rgba(60, 60, 64, 0.12),
+    inset 3px 3px 6px rgba(0, 0, 0, 0.5);
+
+  /* 液态玻璃模糊（暗色饱和度提升更高） */
+  --glass-blur: blur(20px) saturate(180%);
+}

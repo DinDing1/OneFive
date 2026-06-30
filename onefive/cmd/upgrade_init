@@ -1,0 +1,7 @@
+#!/bin/bash
+
+# 壹伍（OneFive）升级初始化脚本
+# 在用户点击升级时执行
+
+echo "壹伍（OneFive）升级初始化..."
+exit 0

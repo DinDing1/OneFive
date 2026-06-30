@@ -1,0 +1,18 @@
+#!/bin/bash
+
+# 壹伍（OneFive）卸载完成回调脚本
+# 在卸载完成后执行
+
+echo "壹伍（OneFive）卸载完成"
+
+# 如果用户选择删除数据，清理数据目录
+if [ "$wizard_delete_data" = "true" ]; then
+  echo "清理数据目录..."
+  rm -rf "${TRIM_PKGVAR}"
+  echo "数据目录已删除"
+else
+  echo "数据已保留在: ${TRIM_PKGVAR}"
+  echo "如需手动删除，请执行: rm -rf ${TRIM_PKGVAR}"
+fi
+
+exit 0

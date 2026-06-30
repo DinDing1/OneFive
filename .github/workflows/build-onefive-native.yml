@@ -1,0 +1,354 @@
+name: 构建壹伍 OneFive
+
+on:
+  push:
+    branches: ['main', 'master']
+    tags: ['onefive-v*']
+  workflow_dispatch:
+    inputs:
+      version:
+        description: '版本号（留空则读取 VERSION 文件）'
+        required: false
+        default: ''
+      create_release:
+        description: '创建 GitHub Release'
+        required: false
+        default: 'true'
+        type: choice
+        options: ['true', 'false']
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  # ========== Job 1: 构建前端（只需一次，不依赖架构） ==========
+  build-frontend:
+    runs-on: ubuntu-latest
+    name: 构建前端
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 配置 Node.js 环境
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      - name: 构建前端
+        run: |
+          cd frontend
+          rm -rf node_modules package-lock.json
+          npm install
+          npm run build
+          echo "前端构建完成"
+
+      - name: 上传前端产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: frontend-dist
+          path: frontend/dist/
+          retention-days: 1
+
+  # ========== Job 2: 编译 x86 后端 ==========
+  build-backend-x86:
+    runs-on: ubuntu-latest
+    name: 编译后端 x86_64
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 编译 Python 后端 (Nuitka)
+        run: |
+          mkdir -p /tmp/nuitka-out
+          echo "在 x86 runner 上编译..."
+          docker run --rm --platform linux/amd64 \
+            -v $PWD/backend:/build \
+            -v /tmp/nuitka-out:/output \
+            python:3.12-slim-bookworm \
+            bash -c "
+              apt-get update -qq && apt-get install -y -qq patchelf gcc > /dev/null &&
+              pip install 'nuitka[onefile]' ordered-set --quiet &&
+              pip install -r /build/requirements.txt --quiet &&
+              cd /build/src &&
+              python -m nuitka --standalone --onefile \
+                --lto=no \
+                --include-package=onefive \
+                --include-package=onefive.api \
+                --include-package=onefive.db \
+                --include-package=onefive.models \
+                --include-package=onefive.services \
+                --include-package=onefive.notification \
+                --include-package=onefive.notification.telegram \
+                --include-module=uvicorn \
+                --include-module=uvicorn.lifespan.on \
+                --include-module=uvicorn.lifespan.off \
+                --include-module=uvicorn.protocols.websockets.auto \
+                --include-module=uvicorn.protocols.websockets.wsproto_impl \
+                --include-module=uvicorn.protocols.websockets.websockets_impl \
+                --include-module=uvicorn.protocols.http.auto \
+                --include-module=uvicorn.protocols.http.h11_impl \
+                --include-module=uvicorn.protocols.http.httptools_impl \
+                --include-module=uvicorn.logging \
+                --include-module=uvicorn.loops \
+                --include-module=uvicorn.loops.auto \
+                --include-module=uvicorn.loops.asyncio \
+                --include-module=fastapi \
+                --include-module=starlette \
+                --include-module=starlette.middleware \
+                --include-module=starlette.middleware.cors \
+                --include-module=starlette.routing \
+                --include-module=starlette.requests \
+                --include-module=starlette.responses \
+                --include-module=multipart \
+                --include-module=p115client \
+                --include-module=p115nano302 \
+                --include-module=telethon \
+                --include-module=guessit \
+                --include-module=orjson \
+                --include-module=qrcode \
+                --include-module=PIL \
+                --output-filename=onefive-server \
+                --output-dir=/output \
+                -m onefive.main &&
+              echo '编译完成'
+            "
+          echo "x86 编译完成"
+          ls -lh /tmp/nuitka-out/onefive-server
+
+      - name: 上传后端产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: backend-x86_64
+          path: /tmp/nuitka-out/onefive-server
+          retention-days: 1
+
+  # ========== Job 3: 编译 ARM 后端 ==========
+  build-backend-arm:
+    runs-on: ubuntu-24.04-arm
+    name: 编译后端 arm64
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 编译 Python 后端 (Nuitka)
+        run: |
+          mkdir -p /tmp/nuitka-out
+          echo "在 ARM 原生 runner 上编译..."
+          docker run --rm --platform linux/arm64 \
+            -v $PWD/backend:/build \
+            -v /tmp/nuitka-out:/output \
+            python:3.12-slim-bookworm \
+            bash -c "
+              apt-get update -qq && apt-get install -y -qq patchelf gcc > /dev/null &&
+              pip install 'nuitka[onefile]' ordered-set --quiet &&
+              pip install -r /build/requirements.txt --quiet &&
+              cd /build/src &&
+              python -m nuitka --standalone --onefile \
+                --lto=no \
+                --include-package=onefive \
+                --include-package=onefive.api \
+                --include-package=onefive.db \
+                --include-package=onefive.models \
+                --include-package=onefive.services \
+                --include-package=onefive.notification \
+                --include-package=onefive.notification.telegram \
+                --include-module=uvicorn \
+                --include-module=uvicorn.lifespan.on \
+                --include-module=uvicorn.lifespan.off \
+                --include-module=uvicorn.protocols.websockets.auto \
+                --include-module=uvicorn.protocols.websockets.wsproto_impl \
+                --include-module=uvicorn.protocols.websockets.websockets_impl \
+                --include-module=uvicorn.protocols.http.auto \
+                --include-module=uvicorn.protocols.http.h11_impl \
+                --include-module=uvicorn.protocols.http.httptools_impl \
+                --include-module=uvicorn.logging \
+                --include-module=uvicorn.loops \
+                --include-module=uvicorn.loops.auto \
+                --include-module=uvicorn.loops.asyncio \
+                --include-module=fastapi \
+                --include-module=starlette \
+                --include-module=starlette.middleware \
+                --include-module=starlette.middleware.cors \
+                --include-module=starlette.routing \
+                --include-module=starlette.requests \
+                --include-module=starlette.responses \
+                --include-module=multipart \
+                --include-module=p115client \
+                --include-module=p115nano302 \
+                --include-module=telethon \
+                --include-module=guessit \
+                --include-module=orjson \
+                --include-module=qrcode \
+                --include-module=PIL \
+                --output-filename=onefive-server \
+                --output-dir=/output \
+                -m onefive.main &&
+              echo '编译完成'
+            "
+          echo "ARM 编译完成"
+          ls -lh /tmp/nuitka-out/onefive-server
+
+      - name: 上传后端产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: backend-arm64
+          path: /tmp/nuitka-out/onefive-server
+          retention-days: 1
+
+  # ========== Job 4: 组装并打包 FPK ==========
+  package:
+    needs: [build-frontend, build-backend-x86, build-backend-arm]
+    runs-on: ubuntu-latest
+    name: 打包 ${{ matrix.arch }}
+    strategy:
+      matrix:
+        include:
+          - arch: x86_64
+            fnpack_platform: x86
+          - arch: arm64
+            fnpack_platform: arm
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 确定版本号
+        id: version
+        run: |
+          VERSION_FILE="VERSION"
+          MANIFEST_VER=$(grep '^version' onefive/manifest | awk -F'=' '{print $2}' | tr -d ' ')
+          if [ -n "${{ github.event.inputs.version }}" ]; then
+            VERSION="${{ github.event.inputs.version }}"
+          elif [[ "${{ github.ref }}" == refs/tags/onefive-v* ]]; then
+            VERSION="${{ github.ref_name }}"
+            VERSION="${VERSION#onefive-v}"
+          elif [ -f "$VERSION_FILE" ]; then
+            VERSION=$(cat "$VERSION_FILE" | tr -d '[:space:]')
+          else
+            VERSION="${MANIFEST_VER}"
+          fi
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "版本号: $VERSION"
+
+      - name: 下载前端产物
+        uses: actions/download-artifact@v4
+        with:
+          name: frontend-dist
+          path: frontend/dist/
+
+      - name: 下载后端产物
+        uses: actions/download-artifact@v4
+        with:
+          name: backend-${{ matrix.arch }}
+          path: /tmp/nuitka-out/
+
+      - name: 组装应用文件
+        run: |
+          # 前端构建产物 -> onefive/app/ui/
+          rm -rf onefive/app/ui/assets onefive/app/ui/*.html onefive/app/ui/*.js onefive/app/ui/*.css onefive/app/ui/*.svg onefive/app/ui/*.png
+          mkdir -p onefive/app/ui
+          cp -r frontend/dist/* onefive/app/ui/
+
+          # 后端二进制 -> onefive/app/server/
+          mkdir -p onefive/app/server
+          rm -rf onefive/app/server/__pycache__
+          cp /tmp/nuitka-out/onefive-server onefive/app/server/onefive-server
+          chmod +x onefive/app/server/onefive-server
+
+          echo "应用文件组装完成"
+          ls -la onefive/app/server/
+          ls -la onefive/app/ui/
+
+      - name: 更新 manifest
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          PLATFORM="${{ matrix.fnpack_platform }}"
+          sed -i "s/^version.*/version=${VERSION}/" onefive/manifest
+          sed -i "s/^platform.*/platform=${PLATFORM}/" onefive/manifest
+
+      - name: 修复脚本权限
+        run: |
+          cd onefive
+          for f in cmd/main cmd/install_init cmd/install_callback cmd/uninstall_init cmd/uninstall_callback cmd/upgrade_init cmd/upgrade_callback cmd/config_init cmd/config_callback; do
+            [ -f "$f" ] && sed -i 's/\r$//' "$f" && chmod +x "$f"
+          done
+
+      - name: 下载 fnpack 并打包
+        run: |
+          curl -fsSL -o /tmp/fnpack https://static2.fnnas.com/fnpack/fnpack-1.2.1-linux-amd64
+          chmod +x /tmp/fnpack
+          cd onefive
+          /tmp/fnpack build --directory .
+          FPKN=$(ls *.fpk) && mv "$FPKN" onefive-${{ matrix.arch == 'x86_64' && 'X86' || 'ARM' }}.fpk
+          echo "构建完成: $(ls -lh *.fpk)"
+
+      - name: 上传 FPK
+        uses: actions/upload-artifact@v4
+        with:
+          name: onefive-${{ matrix.arch }}
+          path: onefive/onefive-*.fpk
+          retention-days: 30
+
+  # ========== Job 5: 创建 Release ==========
+  release:
+    needs: package
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/onefive-v') || github.event.inputs.create_release == 'true'
+    permissions:
+      contents: write
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 下载所有 FPK
+        uses: actions/download-artifact@v4
+        with:
+          path: ./artifacts/
+
+      - name: 删除旧版本 Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          RELEASES=$(gh release list --limit 100 --json tagName --jq '.[].tagName' 2>/dev/null || echo "")
+          echo "$RELEASES" | while read -r tag; do
+            case "$tag" in onefive-*) gh release delete "${tag}" --yes --cleanup-tag 2>/dev/null || true;; esac
+          done
+
+      - name: 确定构建信息
+        id: info
+        run: |
+          VERSION_FILE="VERSION"
+          MANIFEST_VER=$(grep '^version' onefive/manifest | awk -F'=' '{print $2}' | tr -d ' ')
+          if [[ "${{ github.ref }}" == refs/tags/onefive-v* ]]; then
+            TAG="${{ github.ref_name }}" && VERSION="${TAG#onefive-v}"
+          elif [ -n "${{ github.event.inputs.version }}" ]; then
+            TAG="onefive-v${{ github.event.inputs.version }}" && VERSION="${{ github.event.inputs.version }}"
+          elif [ -f "$VERSION_FILE" ]; then
+            VERSION=$(cat "$VERSION_FILE" | tr -d '[:space:]')
+            TAG="onefive-v${VERSION}"
+          else
+            TAG="onefive-v${MANIFEST_VER}" && VERSION="${MANIFEST_VER}"
+          fi
+          echo "tag=$TAG" >> $GITHUB_OUTPUT
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "build_time=$(TZ=Asia/Shanghai date '+%Y-%m-%d %H:%M CST')" >> $GITHUB_OUTPUT
+
+      - name: 创建 Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.info.outputs.tag }}
+          name: "壹伍 v${{ steps.info.outputs.version }}"
+          files: ./artifacts/**/*.fpk
+          generate_release_notes: false
+          body: |
+            ## 壹伍 v${{ steps.info.outputs.version }}
+
+            飞牛OS上的115云盘管理应用，支持文件管理、分享整理、媒体识别、Telegram通知等功能。
+
+            ### 下载
+            | 文件 | 架构 | 适用设备 |
+            |------|------|----------|
+            | `onefive-X86.fpk` | x86_64 | Intel/AMD NAS |
+            | `onefive-ARM.fpk` | arm64 | ARM NAS |
+
+            ---
+            构建时间：${{ steps.info.outputs.build_time }}

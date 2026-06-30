@@ -1,0 +1,7 @@
+#!/bin/bash
+
+# 壹伍（OneFive）升级完成回调脚本
+# 在升级完成后执行
+
+echo "壹伍（OneFive）升级完成"
+exit 0

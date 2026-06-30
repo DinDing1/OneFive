@@ -1,0 +1,73 @@
+/**
+ * 新拟态（Neumorphism）Utility 类
+ *
+ * 双向柔和阴影制造凸起/凹陷感
+ * 适用于：导航项、按钮、开关、输入框、分页器
+ */
+
+/* 凸起（默认） */
+.neu-raised {
+  background: var(--bg-base);
+  box-shadow: var(--neu-raised);
+  border: none;
+  transition: box-shadow var(--transition-base), transform var(--transition-base);
+}
+
+.neu-raised:hover {
+  box-shadow: var(--neu-raised-strong);
+  transform: translateY(-1px);
+}
+
+.neu-raised:active {
+  box-shadow: var(--neu-inset);
+  transform: translateY(0);
+}
+
+/* 凹陷（输入框、选中态） */
+.neu-inset {
+  background: var(--bg-input);
+  box-shadow: var(--neu-inset);
+  border: 1px solid var(--border);
+}
+
+.neu-inset:focus {
+  outline: none;
+  box-shadow: var(--neu-inset), 0 0 0 3px var(--accent-bg);
+  border-color: var(--accent);
+}
+
+/* 平面（轻阴影，默认按钮） */
+.neu-flat {
+  background: transparent;
+  box-shadow: var(--shadow-sm);
+  border: 1px solid var(--border);
+  transition: all var(--transition-base);
+}
+
+.neu-flat:hover {
+  box-shadow: var(--shadow-md);
+  background: var(--bg-hover);
+}
+
+.neu-flat:active {
+  box-shadow: var(--neu-inset);
+}
+
+/* 圆形凸起按钮（图标按钮） */
+.neu-circle {
+  background: var(--bg-base);
+  box-shadow: var(--neu-raised);
+  border: none;
+  border-radius: var(--radius-full);
+  transition: all var(--transition-base);
+}
+
+.neu-circle:hover {
+  box-shadow: var(--neu-raised-strong);
+  transform: translateY(-1px);
+}
+
+.neu-circle:active {
+  box-shadow: var(--neu-inset);
+  transform: translateY(0);
+}

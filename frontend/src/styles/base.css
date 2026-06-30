@@ -1,0 +1,111 @@
+/**
+ * 全局基础样式
+ *
+ * 包含 reset、body、滚动条、Element Plus 覆盖
+ */
+
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+html,
+body,
+#app {
+  height: 100%;
+  overflow: hidden;
+}
+
+body {
+  font-family: var(--font-sans);
+  background: var(--bg-base);
+  color: var(--text-primary);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  font-feature-settings: 'ss01';
+  transition: background var(--transition-slow), color var(--transition-slow);
+}
+
+a {
+  color: inherit;
+  text-decoration: none;
+}
+
+button {
+  font-family: inherit;
+}
+
+input,
+select,
+textarea {
+  font-family: inherit;
+}
+
+/* ==================== 滚动条 ==================== */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: var(--border-strong);
+  border-radius: 3px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: var(--text-tertiary);
+}
+
+/* ==================== Element Plus 全局覆盖 ==================== */
+.el-button--primary {
+  --el-button-bg-color: var(--accent);
+  --el-button-border-color: var(--accent);
+  --el-button-hover-bg-color: var(--accent-hover);
+  --el-button-hover-border-color: var(--accent-hover);
+  border-radius: var(--radius-sm);
+}
+
+.el-card {
+  background: var(--bg-solid);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  box-shadow: var(--shadow-sm);
+  color: var(--text-primary);
+}
+
+.el-dialog {
+  border-radius: var(--radius-lg);
+  background: var(--bg-solid);
+  box-shadow: var(--shadow-lg);
+}
+
+.el-input__wrapper {
+  background: var(--bg-solid);
+  box-shadow: 0 0 0 1px var(--border) inset;
+  border-radius: var(--radius-sm);
+}
+
+.el-input__wrapper:hover {
+  box-shadow: 0 0 0 1px var(--border-strong) inset;
+}
+
+.el-input__wrapper.is-focus {
+  box-shadow: 0 0 0 1px var(--accent) inset, 0 0 0 3px var(--accent-bg);
+}
+
+.el-select .el-input__wrapper {
+  background: var(--bg-solid);
+}
+
+/* ==================== 主题过渡 ==================== */
+*:not(.no-theme-transition) {
+  transition-property: background-color, border-color, color, box-shadow;
+  transition-duration: var(--transition-base);
+}
+
+/* 不影响 transform/opacity 等动画属性 */
