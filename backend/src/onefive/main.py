@@ -31,6 +31,7 @@ from .api.organize import router as organize_router
 from .api.notification import router as notification_router
 from .api.direct_link import router as direct_link_router
 from .api.share import router as share_router
+from .api.strm import router as strm_router
 from .db.database import close_db
 
 # 初始化日志
@@ -99,6 +100,7 @@ app.include_router(organize_router)
 app.include_router(notification_router)
 app.include_router(direct_link_router)
 app.include_router(share_router)
+app.include_router(strm_router)
 
 
 @app.get("/api/gateway/user", tags=["网关"])

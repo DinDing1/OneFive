@@ -434,6 +434,67 @@
       </div>
     </section>
 
+    <!-- STRM 文件 -->
+    <section class="card glass-card">
+      <div class="card-head" @click="toggle('strm')">
+        <div class="card-head-left">
+          <div class="card-icon strm-icon">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="12" y1="18" x2="12" y2="12"/><polyline points="9 15 12 12 15 15"/></svg>
+          </div>
+          <div class="card-title">
+            <h3>STRM 文件</h3>
+            <p>直链播放</p>
+          </div>
+        </div>
+        <svg class="chevron" :class="{ open: expanded.strm }" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg>
+      </div>
+      <div class="card-body" v-show="expanded.strm">
+        <!-- 直链基地址 -->
+        <div class="field">
+          <label>直链服务基地址</label>
+          <input type="text" v-model="strmBaseUrl" placeholder="http://127.0.0.1:11581" />
+        </div>
+
+        <!-- STRM 输出路径（来自飞牛授权目录） -->
+        <div class="field">
+          <label>分享 STRM 存储路径</label>
+          <select v-model="strmOutputPath" :disabled="strmAccessiblePaths.length === 0">
+            <option value="">请选择授权目录</option>
+            <option v-for="p in strmAccessiblePaths" :key="p" :value="p">{{ p }}</option>
+          </select>
+          <p v-if="strmAccessiblePaths.length === 0" class="strm-hint">
+            请先在飞牛应用设置中给壹伍授权一个媒体库目录，保存后点击下方"刷新授权目录"。
+          </p>
+        </div>
+
+        <!-- 生成结果 -->
+        <div class="strm-result" v-if="strmResult">
+          <div class="strm-result-summary">
+            <span class="tag">总数 {{ strmResult.total }}</span>
+            <span class="tag" style="background: var(--success-bg); color: var(--success);">成功 {{ strmResult.created }}</span>
+            <span class="tag" v-if="strmResult.failed > 0" style="background: var(--danger-bg); color: var(--danger);">失败 {{ strmResult.failed }}</span>
+          </div>
+          <div class="strm-error-list" v-if="strmResult.errors && strmResult.errors.length > 0">
+            <div v-for="(err, i) in strmResult.errors.slice(0, 10)" :key="i" class="strm-error-item">
+              <span class="strm-error-name">{{ err.name }}</span>
+              <span class="strm-error-msg">{{ err.error }}</span>
+            </div>
+            <p v-if="strmResult.errors.length > 10" class="strm-hint">仅展示前 10 条错误</p>
+          </div>
+        </div>
+
+        <div class="card-actions">
+          <button class="btn-ghost-sm" @click.stop="loadStrmAccessiblePaths">刷新授权目录</button>
+          <button class="btn-ghost-sm" @click.stop="saveStrmSettings" :disabled="strmSaving">
+            {{ strmSaving ? '...' : '保存' }}
+          </button>
+          <button class="btn-save" @click.stop="generateStrmFiles" :disabled="strmGenerating || !strmOutputPath">
+            {{ strmGenerating ? '生成中...' : '生成 STRM' }}
+          </button>
+        </div>
+      </div>
+    </section>
+
     <!-- 目录选择器弹窗 -->
     <div v-if="showPathPicker" class="glass-overlay" @click.self="showPathPicker = false">
       <div class="modal glass-solid">
@@ -474,10 +535,11 @@ import { filesApi } from '@/api/files'
 import { organizeApi } from '@/api/organize'
 import { notificationApi } from '@/api/notification'
 import { directLinkApi } from '@/api/directLink'
+import { strmApi } from '@/api/strm'
 import type { FileItem } from '@/api/files'
 
 // 折叠状态
-const expanded = reactive<Record<string, boolean>>({ tmdb: false, api: false, media: false, notify: false, directLink: false })
+const expanded = reactive<Record<string, boolean>>({ tmdb: false, api: false, media: false, notify: false, directLink: false, strm: false })
 function toggle(key: string) { expanded[key] = !expanded[key] }
 
 const openApiEnabled = ref(false)
@@ -541,6 +603,14 @@ const dlPort = ref(11581)
 const dlRunning = ref(false)
 const dlSaving = ref(false)
 
+// STRM 配置
+const strmBaseUrl = ref('http://127.0.0.1:11581')
+const strmOutputPath = ref('')
+const strmAccessiblePaths = ref<string[]>([])
+const strmSaving = ref(false)
+const strmGenerating = ref(false)
+const strmResult = ref<any>(null)
+
 const showPathPicker = ref(false)
 const pickerLoading = ref(false)
 const pickerDirs = ref<FileItem[]>([])
@@ -572,6 +642,9 @@ onMounted(() => {
       dlRunning.value = res.data.running
     }
   }).catch(() => {})
+  // 加载 STRM 设置、授权路径
+  loadStrmSettings()
+  loadStrmAccessiblePaths()
 })
 
 async function loadOpenApiSettings() {
@@ -867,6 +940,78 @@ async function stopDirectLink() {
     console.error('停止直链服务失败:', e)
   }
 }
+
+// ==================== STRM 文件 ====================
+
+// 加载 STRM 配置
+async function loadStrmSettings() {
+  try {
+    const res = await strmApi.getSettings()
+    if (res.code === 0 && res.data) {
+      strmBaseUrl.value = res.data.direct_link_base_url || 'http://127.0.0.1:11581'
+      strmOutputPath.value = res.data.output_path || ''
+    }
+  } catch (e) {
+    console.error('加载 STRM 配置失败:', e)
+  }
+}
+
+// 加载飞牛授权目录列表
+async function loadStrmAccessiblePaths() {
+  try {
+    const res = await strmApi.getAccessiblePaths()
+    if (res.code === 0 && res.data) {
+      strmAccessiblePaths.value = res.data.paths || []
+    }
+  } catch (e) {
+    console.error('加载授权目录失败:', e)
+    strmAccessiblePaths.value = []
+  }
+}
+
+// 保存 STRM 配置
+async function saveStrmSettings() {
+  if (strmSaving.value) return
+  strmSaving.value = true
+  try {
+    const res = await strmApi.saveSettings({
+      direct_link_base_url: strmBaseUrl.value,
+      output_path: strmOutputPath.value,
+    })
+    if (res.code === 0) {
+      strmResult.value = null
+    } else {
+      alert(res.message || '保存失败')
+    }
+  } catch (e: any) {
+    alert(e.message || '保存失败')
+  } finally {
+    strmSaving.value = false
+  }
+}
+
+// 生成 STRM 文件
+async function generateStrmFiles() {
+  if (strmGenerating.value) return
+  // 二次确认，避免误操作
+  if (!confirm(`确认为所有已整理分享文件生成 STRM 到指定目录？\n\n输出目录：${strmOutputPath.value || '(未配置)'}`)) {
+    return
+  }
+  strmGenerating.value = true
+  strmResult.value = null
+  try {
+    const res = await strmApi.generate()
+    if (res.code === 0 && res.data) {
+      strmResult.value = res.data
+    } else {
+      alert(res.message || '生成失败')
+    }
+  } catch (e: any) {
+    alert(e.message || '生成失败')
+  } finally {
+    strmGenerating.value = false
+  }
+}
 </script>
 
 <style scoped>
@@ -891,6 +1036,59 @@ async function stopDirectLink() {
 .media-icon { background: var(--purple-bg); color: var(--purple); }
 .notify-icon { background: var(--warning-bg); color: var(--warning); }
 .directlink-icon { background: var(--accent-bg); color: var(--accent); }
+.strm-icon { background: var(--purple-bg); color: var(--purple); }
+
+/* ==================== STRM 卡片专属样式 ==================== */
+.strm-hint {
+  margin-top: 6px;
+  font-size: 11px;
+  color: var(--text-tertiary);
+  line-height: 1.5;
+}
+
+.strm-result {
+  margin-top: 12px;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--bg-elevated);
+}
+
+.strm-result-summary {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-bottom: 8px;
+}
+
+.strm-error-list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  max-height: 160px;
+  overflow-y: auto;
+  padding-top: 8px;
+  border-top: 1px solid var(--border);
+}
+
+.strm-error-item {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  font-size: 11px;
+}
+
+.strm-error-name {
+  color: var(--text-primary);
+  font-family: var(--font-mono);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.strm-error-msg {
+  color: var(--danger);
+}
 
 /* 状态指示 */
 .dl-status {

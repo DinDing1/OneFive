@@ -1,0 +1,9 @@
+#!/bin/bash
+
+# 壹伍（OneFive）应用配置变更初始化脚本
+# 飞牛 fnOS 在用户修改应用配置时调用，仅记录日志，不做复杂逻辑
+
+LOG_FILE="${TRIM_PKGVAR}/info.log"
+
+echo "$(date '+%Y-%m-%d %H:%M:%S') - config_init: 应用配置开始变更" >> "${LOG_FILE}" 2>/dev/null || true
+exit 0
