@@ -74,6 +74,26 @@ export const shareApi = {
     return api.delete(`/share/${sourceId}`)
   },
 
+  /** 批量删除分享 */
+  deleteSharesBatch(sourceIds: number[]): Promise<any> {
+    return api.post('/share/delete-batch', { source_ids: sourceIds })
+  },
+
+  /** 获取文件属性（分享信息 + 文件信息 + 可选分类） */
+  getFileProperties(sourceId: number, fileId: string): Promise<any> {
+    return api.get(`/share/${sourceId}/properties`, { params: { file_id: fileId } })
+  },
+
+  /** 更新分享属性（名称、分享码、提取码） */
+  updateShareProperties(sourceId: number, data: { share_name?: string; share_code?: string; receive_code?: string }): Promise<any> {
+    return api.put(`/share/${sourceId}/properties`, data)
+  },
+
+  /** 更新文件分类 */
+  updateFileCategory(sourceId: number, fileId: string, category: string): Promise<any> {
+    return api.put(`/share/${sourceId}/files/${fileId}/category`, { category })
+  },
+
   /** 获取所有分享的根目录文件 */
   getAllFiles(organizedOnly: boolean = false, unorganizedOnly: boolean = false): Promise<any> {
     return api.get('/share/all-files', { params: { organized_only: organizedOnly, unorganized_only: unorganizedOnly } })

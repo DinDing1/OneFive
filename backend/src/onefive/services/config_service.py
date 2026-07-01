@@ -85,7 +85,7 @@ class ConfigService:
         if existing:
             # 更新现有配置
             self.db.execute(
-                "UPDATE setting SET value = ?, description = COALESCE(?, description), updated_at = CURRENT_TIMESTAMP WHERE name = ?",
+                "UPDATE setting SET value = ?, description = COALESCE(?, description), updated_at = datetime('now', 'localtime') WHERE name = ?",
                 (value, description, name)
             )
         else:

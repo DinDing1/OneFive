@@ -209,13 +209,97 @@ class ShareService:
         self.db.commit()
         return True
 
+    def delete_shares_batch(self, source_ids: List[int]) -> Dict:
+        """批量删除分享来源及其所有文件
+
+        Returns:
+            {"total": int, "success": int, "failed": int}
+        """
+        total = len(source_ids)
+        success = 0
+        for sid in source_ids:
+            try:
+                self.db.execute("DELETE FROM share_file WHERE source_id = ?", (sid,))
+                self.db.execute("DELETE FROM share_source WHERE id = ?", (sid,))
+                success += 1
+            except Exception:
+                pass
+        self.db.commit()
+        return {"total": total, "success": success, "failed": total - success}
+
+    def update_share_source(self, source_id: int, share_name: str = None,
+                            share_code: str = None, receive_code: str = None) -> bool:
+        """更新分享来源信息，并同步 share_file 表中的冗余字段
+
+        Args:
+            source_id: 分享来源 ID
+            share_name: 分享名称（None 表示不修改）
+            share_code: 分享码（None 表示不修改）
+            receive_code: 提取码（None 表示不修改）
+        """
+        # 构建 share_source 的 SET 子句
+        sets = []
+        params = []
+        if share_name is not None:
+            sets.append("share_name = ?")
+            params.append(share_name)
+        if share_code is not None:
+            sets.append("share_code = ?")
+            params.append(share_code)
+        if receive_code is not None:
+            sets.append("receive_code = ?")
+            params.append(receive_code)
+        if not sets:
+            return False
+        sets.append("updated_at = datetime('now', 'localtime')")
+        params.append(source_id)
+        self.db.execute(
+            f"UPDATE share_source SET {', '.join(sets)} WHERE id = ?",
+            params
+        )
+        # 同步 share_file 表中的 share_code / receive_code 冗余字段
+        file_sets = []
+        file_params = []
+        if share_code is not None:
+            file_sets.append("share_code = ?")
+            file_params.append(share_code)
+        if receive_code is not None:
+            file_sets.append("receive_code = ?")
+            file_params.append(receive_code)
+        if file_sets:
+            file_sets.append("updated_at = datetime('now', 'localtime')")
+            file_params.append(source_id)
+            self.db.execute(
+                f"UPDATE share_file SET {', '.join(file_sets)} WHERE source_id = ?",
+                file_params
+            )
+        self.db.commit()
+        return True
+
+    def update_file_category(self, source_id: int, file_id: str, category: str) -> bool:
+        """更新单个文件的分类路径
+
+        Args:
+            source_id: 分享来源 ID
+            file_id: 文件 ID
+            category: 新的分类路径（如 电影/国产电影）
+        """
+        self.db.execute(
+            """UPDATE share_file SET
+               category = ?, updated_at = datetime('now', 'localtime')
+               WHERE source_id = ? AND file_id = ? AND is_dir = 0""",
+            (category, source_id, file_id)
+        )
+        self.db.commit()
+        return True
+
     def reset_file_organize(self, source_id: int, file_id: str) -> bool:
         """重置单个文件的整理信息（仅针对文件，不处理目录）"""
         self.db.execute(
             """UPDATE share_file SET
                media_type = '', title = '', year = '', tmdb_id = 0, category = '',
                organized_dir = '', organized_name = '', organized = 0,
-               updated_at = CURRENT_TIMESTAMP
+               updated_at = datetime('now', 'localtime')
                WHERE source_id = ? AND file_id = ? AND is_dir = 0""",
             (source_id, file_id)
         )
@@ -372,7 +456,7 @@ class ShareService:
             """UPDATE share_file SET
                media_type = ?, title = ?, year = ?, tmdb_id = ?, category = ?,
                organized_dir = ?, organized_name = ?,
-               organized = 1, updated_at = CURRENT_TIMESTAMP
+               organized = 1, updated_at = datetime('now', 'localtime')
                WHERE source_id = ? AND file_id = ? AND is_dir = 0""",
             (
                 data.get("media_type", ""),

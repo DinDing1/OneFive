@@ -109,6 +109,8 @@ jobs:
                 --include-module=PIL \
                 --include-package=urllib3 \
                 --include-module=urllib3.contrib.resolver.system \
+                --include-package=urllib3_future \
+                --include-module=urllib3_future.contrib.resolver.system \
                 --output-filename=onefive-server \
                 --output-dir=/output \
                 run.py &&
@@ -184,6 +186,8 @@ jobs:
                 --include-module=PIL \
                 --include-package=urllib3 \
                 --include-module=urllib3.contrib.resolver.system \
+                --include-package=urllib3_future \
+                --include-module=urllib3_future.contrib.resolver.system \
                 --output-filename=onefive-server \
                 --output-dir=/output \
                 run.py &&

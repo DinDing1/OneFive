@@ -9,8 +9,9 @@
 - organize_file: 识别并写入 share_file 表（不执行实际移动/复制）
 - 整理完成后发送通知到 Bot 和用户机器人
 """
+import re
 import asyncio
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, List
 
 from .share_service import get_share_service
 from .file_info_service import extract_key_info, extract_tech_info
@@ -57,7 +58,7 @@ class ShareOrganizeService:
     def _recognize_directory(self, source_id: int, dir_file_id: str,
                             share_service, tmdb_cache: Dict) -> Dict[str, Any]:
         """递归识别目录内的所有文件
-        
+
         对于目录，使用目录名+内部第一个视频文件提取信息（参考 organize_service 逻辑）
         """
         # 获取目录信息，并提前提取目录名中的 TMDB ID
@@ -65,7 +66,13 @@ class ShareOrganizeService:
         dir_name = dir_info.get("name", "") if dir_info else ""
         dir_key_info = extract_key_info(dir_name)
         folder_tmdb_id = dir_key_info.get("tmdbId", 0) or 0
-        
+
+        # 目录带 tmdbid 时，扫描目录内容推断媒体类型，避免 TMDB 同 ID
+        # 在电影/电视剧两个空间都存在时默认按电影查询导致误判
+        folder_media_type = ""
+        if folder_tmdb_id:
+            folder_media_type = self._infer_media_type_from_dir(source_id, dir_file_id, share_service)
+
         # 获取目录内所有文件
         files = share_service.db.fetchall(
             "SELECT file_id, name, is_dir FROM share_file WHERE source_id = ? AND parent_id = ?",
@@ -78,16 +85,20 @@ class ShareOrganizeService:
             if not f["is_dir"] and self._is_video_file(f["name"]):
                 video_file = f
                 break
-        
+
         # 如果有视频文件，用视频文件名提取季集/技术信息，用目录 TMDB ID 锁定媒体信息
         if video_file:
-            result = self._do_recognize(video_file["name"], tmdb_cache, forced_tmdb_id=folder_tmdb_id)
+            result = self._do_recognize(video_file["name"], tmdb_cache,
+                                        forced_tmdb_id=folder_tmdb_id,
+                                        forced_media_type=folder_media_type)
             data = self._build_recognize_result(dir_file_id, dir_name, result, True)
             data["total_files"] = len(files)
             return data
         else:
             # 没有视频文件，用目录名识别
-            result = self._do_recognize(dir_name, tmdb_cache, forced_tmdb_id=folder_tmdb_id)
+            result = self._do_recognize(dir_name, tmdb_cache,
+                                        forced_tmdb_id=folder_tmdb_id,
+                                        forced_media_type=folder_media_type)
             data = self._build_recognize_result(dir_file_id, dir_name, result, True)
             data["total_files"] = len(files)
             return data
@@ -96,6 +107,80 @@ class ShareOrganizeService:
         """判断是否为视频文件"""
         video_exts = {'.mkv', '.mp4', '.avi', '.mov', '.wmv', '.flv', '.webm', '.m4v', '.ts'}
         return any(filename.lower().endswith(ext) for ext in video_exts)
+
+    # 季集标记正则：S01E01、第x集、EP01、E01 等（模块级常量，避免重复编译）
+    _SEASON_EPISODE_PATTERNS = [
+        re.compile(r'[Ss]\d{1,2}[Ee]\d{1,3}'),       # S01E01 / s1e1
+        re.compile(r'第\s*\d+\s*集'),                   # 第1集 / 第 01 集
+        re.compile(r'[Ee][Pp]?\.?\s*\d{1,3}'),        # EP01 / E01 / ep.1
+    ]
+
+    def _has_season_episode_marker(self, filename: str) -> bool:
+        """判断文件名是否包含季集标记（用于区分电视剧/电影）"""
+        return any(p.search(filename) for p in self._SEASON_EPISODE_PATTERNS)
+
+    def _collect_video_names(self, source_id: int, dir_file_id: str,
+                             share_service, limit: int = 50) -> List[str]:
+        """递归收集目录下的视频文件名（广度优先，带数量上限提前终止）
+
+        Args:
+            limit: 最多收集的视频文件数，达到后立即停止扫描
+        """
+        result: List[str] = []
+        queue = [dir_file_id]
+        visited = set()
+
+        while queue and len(result) < limit:
+            current_id = queue.pop(0)
+            if current_id in visited:
+                continue
+            visited.add(current_id)
+
+            rows = share_service.db.fetchall(
+                "SELECT file_id, name, is_dir FROM share_file WHERE source_id = ? AND parent_id = ?",
+                (source_id, current_id)
+            )
+            for r in rows:
+                if r["is_dir"]:
+                    queue.append(r["file_id"])
+                elif self._is_video_file(r["name"]):
+                    result.append(r["name"])
+                    if len(result) >= limit:
+                        break
+
+        return result
+
+    def _infer_media_type_from_dir(self, source_id: int, dir_file_id: str,
+                                   share_service) -> str:
+        """扫描目录内容推断媒体类型（电影/电视剧）
+
+        推断规则（按优先级）：
+        1. 任一视频文件名含季集标记（S01E01、第x集、EP01 等）→ tv
+        2. 视频文件数量 > 1 → tv（多集剧集）
+        3. 否则 → movie（单个视频文件，无季集标记）
+
+        用于目录带 tmdbid 时，避免 TMDB 同一数字 ID 在电影/电视剧两个空间都存在
+        导致默认按电影查询命中错误结果。
+
+        安全性：即使推断错误，_search_tmdb 会先查推断类型，查不到再回退查另一类，
+        不会导致查询失败。
+        """
+        video_names = self._collect_video_names(source_id, dir_file_id, share_service)
+
+        if not video_names:
+            return ""  # 无视频文件，无法推断，返回空让上层用默认逻辑
+
+        # 规则1：任一文件名含季集标记 → tv
+        for fname in video_names:
+            if self._has_season_episode_marker(fname):
+                return "tv"
+
+        # 规则2：多个视频文件 → tv（多集剧集）
+        if len(video_names) > 1:
+            return "tv"
+
+        # 规则3：单个视频文件，无季集标记 → movie
+        return "movie"
 
     def organize_file(self, source_id: int, file_id: str) -> Dict[str, Any]:
         """整理单个分享文件（识别并写入数据库）
@@ -163,16 +248,24 @@ class ShareOrganizeService:
     def _organize_directory(self, source_id: int, dir_file_id: str,
                            share_service, tmdb_cache: Dict,
                            inherited_tmdb_id: int = 0,
-                           inherited_media_type: str = "") -> Dict[str, Any]:
+                           inherited_media_type: str = "",
+                           send_notify: bool = True) -> Dict[str, Any]:
         """递归整理目录内的所有文件，并标记目录为已整理
 
-        整理完成后发送一条汇总通知（包含集数范围）。
+        仅在最顶层目录整理完成后发送一条汇总通知（包含集数范围）。
+        子目录递归时 send_notify=False，避免嵌套目录发送多条通知。
         """
         dir_info = share_service.get_file(source_id, dir_file_id)
         dir_name = dir_info.get("name", "") if dir_info else ""
         dir_key_info = extract_key_info(dir_name)
         folder_tmdb_id = dir_key_info.get("tmdbId", 0) or inherited_tmdb_id or 0
         folder_media_type = inherited_media_type or ""
+
+        # 目录带 tmdbid（自身或继承）且无继承的 media_type 时，
+        # 扫描目录内容推断媒体类型，避免 TMDB 同 ID 在电影/电视剧两个空间
+        # 都存在时默认按电影查询导致电视剧被误判为电影
+        if not folder_media_type and folder_tmdb_id:
+            folder_media_type = self._infer_media_type_from_dir(source_id, dir_file_id, share_service)
 
         files = share_service.db.fetchall(
             "SELECT file_id, name, is_dir, size FROM share_file WHERE source_id = ? AND parent_id = ?",
@@ -189,7 +282,8 @@ class ShareOrganizeService:
                 sub = self._organize_directory(
                     source_id, fid, share_service, tmdb_cache,
                     inherited_tmdb_id=folder_tmdb_id,
-                    inherited_media_type=folder_media_type
+                    inherited_media_type=folder_media_type,
+                    send_notify=False
                 )
                 results.append(sub)
                 # 目录整理成功时，按 1 个直接子项计入，避免“成功0、失败1”这种误导统计。
@@ -207,13 +301,14 @@ class ShareOrganizeService:
 
         # 标记当前目录为已整理
         share_service.db.execute(
-            "UPDATE share_file SET organized = 1, updated_at = CURRENT_TIMESTAMP WHERE source_id = ? AND file_id = ?",
+            "UPDATE share_file SET organized = 1, updated_at = datetime('now', 'localtime') WHERE source_id = ? AND file_id = ?",
             (source_id, dir_file_id)
         )
         share_service.db.commit()
 
-        # 汇总信息，发送一条通知
-        self._send_directory_notify(dir_name, results, success_count)
+        # 仅在顶层目录发送一条汇总通知，子目录递归时不发通知
+        if send_notify:
+            self._send_directory_notify(dir_name, results, success_count)
 
         total = len(files)
         return {
@@ -225,11 +320,26 @@ class ShareOrganizeService:
             "results": results,
         }
 
+    def _flatten_results(self, results: list) -> list:
+        """将嵌套的子目录结果展平为扁平的文件结果列表
+
+        子目录整理结果格式为 {"is_directory": True, "results": [...]}，
+        展平后只保留文件级结果，便于顶层通知汇总所有文件的集数/大小等信息。
+        """
+        flat = []
+        for r in results:
+            if r.get("is_directory"):
+                flat.extend(self._flatten_results(r.get("results", [])))
+            else:
+                flat.append(r)
+        return flat
+
     def _send_directory_notify(self, dir_name: str, results: list, success_count: int):
         """汇总目录整理结果，发送一条通知"""
         try:
-            # 收集所有成功的整理结果
-            success_results = [r for r in results if r.get("success")]
+            # 展平子目录嵌套结果，收集所有文件级成功结果
+            flat_results = self._flatten_results(results)
+            success_results = [r for r in flat_results if r.get("success")]
 
             if not success_results:
                 # 全部失败
@@ -301,7 +411,7 @@ class ShareOrganizeService:
                             "tmdb_poster": poster or None,
                             "tmdb_backdrop": backdrop or None,
                             "_episode_range": episode_range,
-                            "_file_count": success_count,
+                            "_file_count": len(success_results),
                             "_file_size": file_size_str,
                         }
                     ))

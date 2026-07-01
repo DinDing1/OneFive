@@ -15,6 +15,16 @@
 - 应用通过 Unix Socket 接收网关转发的请求
 """
 import os
+import time
+
+# ==================== 设置时区为北京时间 ====================
+# 本地开发时也统一时区，确保数据库时间戳与北京时间一致
+os.environ['TZ'] = 'Asia/Shanghai'
+try:
+    time.tzset()
+except AttributeError:
+    pass  # Windows 不支持 time.tzset()
+
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware

@@ -3,11 +3,12 @@
 """
 from fastapi import APIRouter
 from pydantic import BaseModel
-from typing import List
+from typing import List, Optional
 
 from ..models.schemas import ApiResponse
 from ..services.share_service import get_share_service
 from ..services.share_organize_service import get_share_organize_service
+from ..services.classify_service import DEFAULT_STRATEGY, _get_custom_strategy
 from ..logger import get_logger
 
 logger = get_logger(__name__)
@@ -37,6 +38,23 @@ class OrganizeBatchRequest(BaseModel):
     """批量整理请求"""
     source_id: int
     file_ids: List[str]
+
+
+class DeleteBatchRequest(BaseModel):
+    """批量删除分享请求"""
+    source_ids: List[int]
+
+
+class UpdateSharePropertiesRequest(BaseModel):
+    """更新分享属性请求"""
+    share_name: Optional[str] = None
+    share_code: Optional[str] = None
+    receive_code: Optional[str] = None
+
+
+class UpdateFileCategoryRequest(BaseModel):
+    """更新文件分类请求"""
+    category: str
 
 
 @router.post("/add", summary="添加分享链接")
@@ -75,6 +93,22 @@ async def delete_share(source_id: int):
         return ApiResponse(code=0, message="分享已删除")
     except Exception as e:
         logger.error(f"删除分享失败: {e}")
+        return ApiResponse(code=-1, message=str(e))
+
+
+@router.post("/delete-batch", summary="批量删除分享")
+async def delete_shares_batch(req: DeleteBatchRequest):
+    """批量删除分享来源及关联的所有文件"""
+    try:
+        service = get_share_service()
+        result = service.delete_shares_batch(req.source_ids)
+        return ApiResponse(
+            code=0,
+            message=f"已删除 {result['success']}/{result['total']} 个分享",
+            data=result
+        )
+    except Exception as e:
+        logger.error(f"批量删除分享失败: {e}")
         return ApiResponse(code=-1, message=str(e))
 
 
@@ -257,4 +291,73 @@ async def get_share_info(source_id: int):
             return ApiResponse(code=-1, message="分享不存在")
     except Exception as e:
         logger.error(f"获取分享详情失败: {e}")
+        return ApiResponse(code=-1, message=str(e))
+
+
+@router.get("/{source_id}/properties", summary="获取文件属性")
+async def get_file_properties(source_id: int, file_id: str):
+    """获取分享来源信息 + 文件信息 + 可选分类列表"""
+    try:
+        service = get_share_service()
+        # 分享来源信息
+        share_info = service.get_share_info(source_id)
+        if not share_info:
+            return ApiResponse(code=-1, message="分享不存在")
+        # 文件信息
+        file_info = service.get_file(source_id, file_id)
+        if not file_info:
+            return ApiResponse(code=-1, message="文件不存在")
+        # 获取可选分类列表（根据 media_type 过滤）
+        media_type = file_info.get("media_type", "")
+        custom_strategy = _get_custom_strategy()
+        strategy = custom_strategy if custom_strategy else DEFAULT_STRATEGY
+        categories = []
+        if media_type in strategy:
+            categories = [r["category"] for r in strategy[media_type]]
+        return ApiResponse(code=0, message="success", data={
+            "share": share_info,
+            "file": file_info,
+            "categories": categories,
+        })
+    except Exception as e:
+        logger.error(f"获取文件属性失败: {e}")
+        return ApiResponse(code=-1, message=str(e))
+
+
+@router.put("/{source_id}/properties", summary="更新分享属性")
+async def update_share_properties(source_id: int, req: UpdateSharePropertiesRequest):
+    """更新分享来源属性（名称、分享码、提取码），同步到 share_file 表"""
+    try:
+        service = get_share_service()
+        # 校验分享码唯一性（如果修改了 share_code）
+        if req.share_code is not None:
+            existing = service.db.fetchone(
+                "SELECT id FROM share_source WHERE share_code = ? AND id != ?",
+                (req.share_code, source_id)
+            )
+            if existing:
+                return ApiResponse(code=-1, message="分享码已存在")
+        service.update_share_source(
+            source_id,
+            share_name=req.share_name,
+            share_code=req.share_code,
+            receive_code=req.receive_code
+        )
+        logger.info(f"更新分享属性: source_id={source_id}")
+        return ApiResponse(code=0, message="属性已更新")
+    except Exception as e:
+        logger.error(f"更新分享属性失败: {e}")
+        return ApiResponse(code=-1, message=str(e))
+
+
+@router.put("/{source_id}/files/{file_id}/category", summary="更新文件分类")
+async def update_file_category(source_id: int, file_id: str, req: UpdateFileCategoryRequest):
+    """更新单个文件的分类路径"""
+    try:
+        service = get_share_service()
+        service.update_file_category(source_id, file_id, req.category)
+        logger.info(f"更新文件分类: source_id={source_id}, file_id={file_id}, category={req.category}")
+        return ApiResponse(code=0, message="分类已更新")
+    except Exception as e:
+        logger.error(f"更新文件分类失败: {e}")
         return ApiResponse(code=-1, message=str(e))

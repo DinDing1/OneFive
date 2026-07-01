@@ -59,17 +59,17 @@
                 class="filter-btn"
                 :class="{ active: fileFilter === 'all' }"
                 @click="fileFilter = 'all'"
-              >全部</button>
+              >全部<span class="filter-count">{{ allCount }}</span></button>
               <button
                 class="filter-btn"
                 :class="{ active: fileFilter === 'organized' }"
                 @click="fileFilter = 'organized'"
-              >已整理</button>
+              >已整理<span class="filter-count">{{ organizedCount }}</span></button>
               <button
                 class="filter-btn"
                 :class="{ active: fileFilter === 'unorganized' }"
                 @click="fileFilter = 'unorganized'"
-              >未整理</button>
+              >未整理<span class="filter-count">{{ unorganizedCount }}</span></button>
             </div>
 
             <div class="toolbar-spacer"></div>
@@ -93,15 +93,6 @@
                 </svg>
               </button>
             </div>
-
-            <!-- 管理分享按钮 -->
-            <button class="toolbar-btn danger" @click="showManageShares = true" title="管理分享">
-              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                <polyline points="3 6 5 6 21 6" />
-                <path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6" />
-              </svg>
-              <span>管理分享</span>
-            </button>
           </template>
 
           <!-- 选中文件后的批量操作 -->
@@ -111,12 +102,12 @@
               <span class="selected-label">已选</span>
             </div>
             <div class="toolbar-divider"></div>
-            <button class="toolbar-btn" @click="handleBatchRecognize">
+            <button class="toolbar-btn danger" @click="handleBatchDelete">
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                <circle cx="11" cy="11" r="8" />
-                <line x1="21" y1="21" x2="16.65" y2="16.65" />
+                <polyline points="3 6 5 6 21 6" />
+                <path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6" />
               </svg>
-              <span>识别</span>
+              <span>删除分享</span>
             </button>
             <button class="toolbar-btn ghost" @click="clearSelection">
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
@@ -250,6 +241,10 @@
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8" /><line x1="21" y1="21" x2="16.65" y2="16.65" /></svg>
               识别
             </button>
+            <button class="row-menu-item" @click="rowMenuProperties">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 20h9" /><path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z" /></svg>
+              属性
+            </button>
             <div class="row-menu-divider"></div>
             <button class="row-menu-item row-menu-danger" @click="rowMenuDelete">
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 6 5 6 21 6" /><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6" /><path d="M10 11v6" /><path d="M14 11v6" /><path d="M9 6V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2" /></svg>
@@ -354,36 +349,6 @@
           </div>
         </div>
       </template>
-    </div>
-
-    <!-- 管理分享弹窗 -->
-    <div v-if="showManageShares" class="glass-overlay" @click.self="showManageShares = false">
-      <div class="modal-card glass-solid">
-        <div class="modal-header">
-          <h3>管理分享</h3>
-          <button class="btn-close neu-circle" @click="showManageShares = false">
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-              <line x1="18" y1="6" x2="6" y2="18" />
-              <line x1="6" y1="6" x2="18" y2="18" />
-            </svg>
-          </button>
-        </div>
-        <div class="modal-body share-list-body">
-          <div v-if="sources.length === 0" class="share-empty">暂无分享</div>
-          <div v-for="src in sources" :key="src.id" class="share-list-item">
-            <div class="share-item-info">
-              <span class="share-item-name">{{ src.share_name || '未命名分享' }}</span>
-              <span class="share-item-meta">{{ src.file_count }} 个文件 · {{ src.share_code }}</span>
-            </div>
-            <button class="btn-share-delete" @click="handleDeleteShare(src.id)" title="删除此分享">
-              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                <polyline points="3 6 5 6 21 6" />
-                <path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6" />
-              </svg>
-            </button>
-          </div>
-        </div>
-      </div>
     </div>
 
     <!-- 删除确认弹窗 -->
@@ -535,6 +500,112 @@
         </div>
       </div>
     </div>
+
+    <!-- 属性信息弹窗 -->
+    <div v-if="showPropertiesModal" class="glass-overlay" @click.self="closePropertiesModal">
+      <div class="props-modal">
+        <!-- 标题栏 -->
+        <div class="props-header">
+          <h3 class="props-title">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2" /><line x1="9" y1="3" x2="9" y2="21" /><line x1="3" y1="9" x2="21" y2="9" /></svg>
+            属性信息
+          </h3>
+          <button class="props-close" @click="closePropertiesModal">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="18" y1="6" x2="6" y2="18" /><line x1="6" y1="6" x2="18" y2="18" /></svg>
+          </button>
+        </div>
+
+        <!-- 内容区 -->
+        <div class="props-content">
+          <!-- 加载中 -->
+          <div v-if="propertiesLoading" class="props-loading">
+            <div class="loading-spinner"></div>
+            <p>加载中...</p>
+          </div>
+
+          <template v-else-if="propShare">
+            <!-- 分享信息区块 -->
+            <div class="props-section">
+              <div class="props-section-title">分享信息</div>
+              <div class="props-grid">
+                <div class="props-field">
+                  <label class="props-label">名称</label>
+                  <input v-model="propShare.share_name" class="props-input" placeholder="分享名称" />
+                </div>
+                <div class="props-field">
+                  <label class="props-label">分享码</label>
+                  <input v-model="propShare.share_code" class="props-input" placeholder="分享码" />
+                </div>
+                <div class="props-field">
+                  <label class="props-label">提取码</label>
+                  <input v-model="propShare.receive_code" class="props-input" placeholder="提取码" />
+                </div>
+                <div class="props-field props-field-readonly">
+                  <label class="props-label">文件数量</label>
+                  <div class="props-value">{{ propShare.file_count }}</div>
+                </div>
+                <div class="props-field props-field-readonly">
+                  <label class="props-label">文件大小</label>
+                  <div class="props-value">{{ formatSize(propShare.total_size) }}</div>
+                </div>
+                <div class="props-field props-field-readonly">
+                  <label class="props-label">添加时间</label>
+                  <div class="props-value">{{ propShare.created_at || '—' }}</div>
+                </div>
+              </div>
+            </div>
+
+            <!-- 媒体信息区块 -->
+            <div class="props-section" v-if="propFile">
+              <div class="props-section-title">媒体信息</div>
+              <div class="props-grid">
+                <div class="props-field props-field-readonly">
+                  <label class="props-label">媒体名称</label>
+                  <div class="props-value">{{ propFile.title || '—' }}</div>
+                </div>
+                <div class="props-field props-field-readonly">
+                  <label class="props-label">年份</label>
+                  <div class="props-value">{{ propFile.year || '—' }}</div>
+                </div>
+                <div class="props-field props-field-readonly">
+                  <label class="props-label">TMDB ID</label>
+                  <div class="props-value">{{ propFile.tmdb_id || '—' }}</div>
+                </div>
+                <div class="props-field props-field-readonly">
+                  <label class="props-label">媒体类型</label>
+                  <div class="props-value">
+                    <span v-if="propFile.media_type === 'movie'" class="props-tag props-tag-movie">电影</span>
+                    <span v-else-if="propFile.media_type === 'tv'" class="props-tag props-tag-tv">电视剧</span>
+                    <span v-else>—</span>
+                  </div>
+                </div>
+                <!-- 分类：仅在已识别 media_type 时允许编辑 -->
+                <div class="props-field">
+                  <label class="props-label">分类</label>
+                  <select
+                    v-if="propFile.media_type && propCategories.length > 0"
+                    v-model="propEditingCategory"
+                    class="props-select"
+                  >
+                    <option v-for="cat in propCategories" :key="cat" :value="cat">{{ cat }}</option>
+                  </select>
+                  <div v-else class="props-value">{{ propFile.category || '—（请先识别）' }}</div>
+                </div>
+              </div>
+            </div>
+          </template>
+        </div>
+
+        <!-- 底部操作栏 -->
+        <div v-if="!propertiesLoading && propShare" class="props-footer">
+          <button class="props-btn props-btn-cancel" @click="closePropertiesModal">取消</button>
+          <button class="props-btn props-btn-save" :disabled="propertiesSaving" @click="saveProperties">
+            <div v-if="propertiesSaving" class="props-btn-spinner"></div>
+            {{ propertiesSaving ? '保存中...' : '保存' }}
+          </button>
+        </div>
+      </div>
+    </div>
   </div>
 </template>
 
@@ -648,15 +719,37 @@ const fileFilter = ref<FileFilter>('all')
 const selectedIds = ref<Set<string>>(new Set())
 
 // 删除分享
-const showManageShares = ref(false)
 const showDeleteConfirm = ref(false)
 const deletingShareId = ref<number | null>(null)
 const deletingShareName = ref('')
+const deletingBatchIds = ref<number[]>([])
 
 // 行操作下拉菜单
 const rowMenuVisible = ref(false)
 const rowMenuTarget = ref<ShareFile | null>(null)
 const rowMenuStyle = ref<Record<string, string>>({})
+
+// 属性弹窗状态
+const showPropertiesModal = ref(false)
+const propertiesLoading = ref(false)
+const propertiesSaving = ref(false)
+// 属性数据：分享来源信息（可编辑字段）
+const propShare = ref<{
+  share_name: string
+  share_code: string
+  receive_code: string
+  file_count: number
+  total_size: number
+  created_at: string
+} | null>(null)
+// 属性数据：文件信息（媒体信息只读 + 分类可编辑）
+const propFile = ref<ShareFile | null>(null)
+// 可选分类列表（按 media_type 过滤后的分类策略）
+const propCategories = ref<string[]>([])
+// 编辑中的分类（独立保存，避免直接修改原对象）
+const propEditingCategory = ref('')
+// 当前操作的 source_id / file_id
+const propTargetIds = ref<{ sourceId: number; fileId: string }>({ sourceId: 0, fileId: '' })
 
 // 识别弹窗状态
 const showRecognizeModal = ref(false)
@@ -688,6 +781,11 @@ const allFilteredFiles = computed(() => {
   if (fileFilter.value === 'organized') return allFiles.value.filter(f => f.organized)
   return allFiles.value.filter(f => !f.organized)
 })
+
+/** Tab 计数：全部 / 已整理 / 未整理 */
+const allCount = computed(() => allFiles.value.length)
+const organizedCount = computed(() => allFiles.value.filter(f => f.organized).length)
+const unorganizedCount = computed(() => allFiles.value.filter(f => !f.organized).length)
 
 /** 总条数 */
 const totalItems = computed(() => allFilteredFiles.value.length)
@@ -799,19 +897,35 @@ async function loadShares() {
 function handleDeleteShare(sourceId: number) {
   const src = sources.value.find(s => s.id === sourceId)
   deletingShareId.value = sourceId
+  deletingBatchIds.value = []
   deletingShareName.value = src?.share_name || '未命名分享'
   showDeleteConfirm.value = true
 }
 
-/** 确认删除分享 */
+/** 确认删除分享（支持单条和批量） */
 async function confirmDeleteShare() {
-  if (!deletingShareId.value) return
   try {
+    // 批量删除
+    if (deletingBatchIds.value.length > 0) {
+      const res = await shareApi.deleteSharesBatch(deletingBatchIds.value)
+      if (res.code === 0) {
+        showToast(`已删除 ${res.data?.success || 0} 个分享`, 'success')
+        showDeleteConfirm.value = false
+        deletingBatchIds.value = []
+        clearSelection()
+        await loadShares()
+        await loadFiles()
+      } else {
+        showToast(res.message || '删除失败', 'error')
+      }
+      return
+    }
+    // 单条删除
+    if (!deletingShareId.value) return
     const res = await shareApi.deleteShare(deletingShareId.value)
     if (res.code === 0) {
       showToast('分享已删除', 'success')
       showDeleteConfirm.value = false
-      showManageShares.value = false
       deletingShareId.value = null
       await loadShares()
       await loadFiles()
@@ -835,8 +949,8 @@ function toggleRowMenu(item: ShareFile, event: MouseEvent) {
   // 定位到点击位置
   const rect = (event.currentTarget as HTMLElement).getBoundingClientRect()
   
-  // 菜单预估高度（根据实际菜单项数量计算）
-  const menuHeight = 100 // 预估菜单高度
+  // 菜单预估高度（根据实际菜单项数量计算：识别+属性+分隔线+删除）
+  const menuHeight = 140 // 预估菜单高度
   const spaceBelow = window.innerHeight - rect.bottom
   const spaceAbove = rect.top
   
@@ -869,6 +983,113 @@ function rowMenuDelete() {
   const item = rowMenuTarget.value
   closeRowMenu()
   if (item) handleDeleteShare(item.source_id)
+}
+
+/** 菜单：属性 - 打开属性面板并加载数据 */
+function rowMenuProperties() {
+  const item = rowMenuTarget.value
+  closeRowMenu()
+  if (!item) return
+  propTargetIds.value = { sourceId: item.source_id, fileId: item.file_id }
+  showPropertiesModal.value = true
+  loadProperties()
+}
+
+/** 加载属性数据（分享信息 + 文件信息 + 可选分类） */
+async function loadProperties() {
+  propertiesLoading.value = true
+  // 重置旧数据
+  propShare.value = null
+  propFile.value = null
+  propCategories.value = []
+  propEditingCategory.value = ''
+  try {
+    const { sourceId, fileId } = propTargetIds.value
+    const res = await shareApi.getFileProperties(sourceId, fileId)
+    if (res.code === 0 && res.data) {
+      const share = res.data.share || {}
+      const file = res.data.file || {}
+      propShare.value = {
+        share_name: share.share_name || '',
+        share_code: share.share_code || '',
+        receive_code: share.receive_code || '',
+        file_count: share.file_count || 0,
+        total_size: share.total_size || 0,
+        created_at: share.created_at || '',
+      }
+      propFile.value = file
+      propCategories.value = res.data.categories || []
+      propEditingCategory.value = file.category || ''
+    } else {
+      showToast(res.message || '加载属性失败', 'error')
+    }
+  } catch (e: any) {
+    showToast(e.message || '加载属性失败', 'error')
+  } finally {
+    propertiesLoading.value = false
+  }
+}
+
+/** 保存属性：先保存分享属性，再保存分类（如有变更） */
+async function saveProperties() {
+  if (!propShare.value) return
+  propertiesSaving.value = true
+  try {
+    const { sourceId, fileId } = propTargetIds.value
+    // 第一步：保存分享属性（名称/分享码/提取码）
+    const shareRes = await shareApi.updateShareProperties(sourceId, {
+      share_name: propShare.value.share_name,
+      share_code: propShare.value.share_code,
+      receive_code: propShare.value.receive_code,
+    })
+    if (shareRes.code !== 0) {
+      showToast(shareRes.message || '保存分享属性失败', 'error')
+      return
+    }
+    // 第二步：保存分类（仅在分类有变化且 media_type 存在时）
+    if (propFile.value && propFile.value.media_type) {
+      const oldCategory = propFile.value.category || ''
+      if (propEditingCategory.value !== oldCategory) {
+        const catRes = await shareApi.updateFileCategory(sourceId, fileId, propEditingCategory.value)
+        if (catRes.code !== 0) {
+          showToast(catRes.message || '保存分类失败', 'error')
+          return
+        }
+        // 同步更新本地文件对象的分类
+        propFile.value.category = propEditingCategory.value
+      }
+    }
+    showToast('属性已保存', 'success')
+    // 刷新当前视图（根据面包屑判断是根目录还是子目录）
+    await refreshCurrentView()
+    showPropertiesModal.value = false
+  } catch (e: any) {
+    showToast(e.message || '保存失败', 'error')
+  } finally {
+    propertiesSaving.value = false
+  }
+}
+
+/** 关闭属性弹窗 */
+function closePropertiesModal() {
+  showPropertiesModal.value = false
+}
+
+/** 刷新当前视图（保留面包屑导航位置） */
+async function refreshCurrentView() {
+  // 整理视图：重新加载整理数据
+  if (viewMode.value === 'organized') {
+    await loadOrganized()
+    return
+  }
+  // 原始视图：根据面包屑判断是根目录还是子目录
+  const crumbs = currentDirBreadcrumbs.value
+  if (crumbs.length <= 1) {
+    await loadFiles()
+  } else {
+    const last = crumbs[crumbs.length - 1]
+    await loadSubDirFiles(last.sourceId, last.parentId)
+  }
 }
 
 // ==================== 视图切换 ====================
@@ -1163,26 +1384,24 @@ async function handleOrganize(item: ShareFile) {
   await callRecognize(item.source_id, item.file_id)
 }
 
-/** 批量识别：点击工具栏"识别"按钮 → 识别第一个文件并打开弹窗 */
-async function handleBatchRecognize() {
+/** 批量删除分享：收集选中文件对应的分享来源（去重），弹出确认 */
+function handleBatchDelete() {
   if (selectedIds.value.size === 0) return
-
-  // 收集所有选中的文件
-  const items: Array<{ sourceId: number; fileId: string }> = []
+  // 收集选中文件对应的 source_id（去重）
+  const sourceIdSet = new Set<number>()
   for (const file of filteredFiles.value) {
     if (selectedIds.value.has(file.file_id)) {
-      items.push({ sourceId: file.source_id, fileId: file.file_id })
+      sourceIdSet.add(file.source_id)
     }
   }
-  pendingOrganizeIds.value = items
-
-  // 识别第一个文件
-  const firstFile = filteredFiles.value.find(f => selectedIds.value.has(f.file_id))
-  if (firstFile) {
-    recognizeItem.value = firstFile
-    showRecognizeModal.value = true
-    await callRecognize(firstFile.source_id, firstFile.file_id)
-  }
+  if (sourceIdSet.size === 0) return
+  // 复用单条删除确认弹窗（多条时显示数量）
+  deletingShareId.value = null
+  deletingBatchIds.value = Array.from(sourceIdSet)
+  deletingShareName.value = sourceIdSet.size === 1
+    ? (sources.value.find(s => s.id === sourceIdSet.values().next().value)?.share_name || '未命名分享')
+    : `选中的 ${sourceIdSet.size} 个分享`
+  showDeleteConfirm.value = true
 }
 
 /** 调用后端识别 API（只识别不写入数据库） */
@@ -1487,6 +1706,26 @@ function formatTime(ts: string | number): string {
   background: var(--bg-solid);
   color: var(--text-primary);
   box-shadow: var(--shadow-sm);
+}
+
+/* Tab 计数徽章 */
+.filter-count {
+  display: inline-block;
+  margin-left: 4px;
+  padding: 0 5px;
+  min-width: 16px;
+  font-size: 10px;
+  font-weight: 600;
+  line-height: 14px;
+  text-align: center;
+  color: var(--text-tertiary);
+  background: var(--bg-hover);
+  border-radius: 8px;
+}
+
+.filter-btn.active .filter-count {
+  color: var(--accent);
+  background: var(--accent-bg);
 }
 
 .toolbar-spacer {
@@ -2258,86 +2497,6 @@ function formatTime(ts: string | number): string {
   font-size: 10px;
 }
 
-/* ==================== 管理分享弹窗 ==================== */
-.share-list-body {
-  max-height: 400px;
-  overflow-y: auto;
-  padding: 12px 16px !important;
-}
-
-.share-empty {
-  text-align: center;
-  padding: 24px;
-  color: var(--text-tertiary);
-  font-size: 13px;
-}
-
-.share-list-item {
-  display: flex;
-  align-items: center;
-  gap: 12px;
-  padding: 10px 12px;
-  border: 1px solid var(--border);
-  border-radius: var(--radius-sm);
-  margin-bottom: 8px;
-  transition: background var(--transition-fast);
-}
-
-.share-list-item:last-child {
-  margin-bottom: 0;
-}
-
-.share-list-item:hover {
-  background: var(--bg-hover);
-}
-
-.share-item-info {
-  flex: 1;
-  min-width: 0;
-  display: flex;
-  flex-direction: column;
-  gap: 2px;
-}
-
-.share-item-name {
-  font-size: 13px;
-  font-weight: 500;
-  color: var(--text-primary);
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-
-.share-item-meta {
-  font-size: 11px;
-  color: var(--text-tertiary);
-}
-
-.btn-share-delete {
-  width: 32px;
-  height: 32px;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  cursor: pointer;
-  color: var(--text-tertiary);
-  background: none;
-  border: none;
-  border-radius: var(--radius-sm);
-  flex-shrink: 0;
-  transition: all var(--transition-base);
-}
-
-.btn-share-delete:hover {
-  color: var(--danger);
-  background: var(--danger-bg);
-}
-
-.btn-share-delete svg {
-  width: 14px;
-  height: 14px;
-}
-
 /* ==================== 删除确认弹窗 ==================== */
 .modal-card {
   border-radius: var(--radius-lg);
@@ -2971,5 +3130,262 @@ function formatTime(ts: string | number): string {
   border-top-color: var(--text-inverse);
   border-radius: 50%;
   animation: spin 0.6s linear infinite;
+}
+
+/* ==================== 属性信息弹窗样式（props- 前缀，独立不冲突） ==================== */
+
+/* 弹窗容器：三段式布局（标题 / 内容 / 底部） */
+.props-modal {
+  position: relative;
+  width: 100%;
+  max-width: 560px;
+  max-height: 85vh;
+  border-radius: var(--radius-lg);
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+  background: var(--bg-solid);
+}
+
+/* 标题栏 */
+.props-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 16px 20px;
+  border-bottom: 1px solid var(--border);
+}
+
+.props-title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 0;
+  font-size: 16px;
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
+.props-title svg {
+  width: 18px;
+  height: 18px;
+  color: var(--accent);
+}
+
+.props-close {
+  width: 30px;
+  height: 30px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: none;
+  border: none;
+  border-radius: 50%;
+  color: var(--text-tertiary);
+  cursor: pointer;
+  transition: background var(--transition-fast), color var(--transition-fast);
+}
+
+.props-close:hover {
+  background: var(--bg-hover);
+  color: var(--text-primary);
+}
+
+.props-close svg {
+  width: 16px;
+  height: 16px;
+}
+
+/* 内容区：可滚动 */
+.props-content {
+  flex: 1;
+  overflow-y: auto;
+  padding: 20px;
+}
+
+/* 加载状态 */
+.props-loading {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 12px;
+  padding: 48px 0;
+  color: var(--text-tertiary);
+}
+
+/* 分区 */
+.props-section {
+  margin-bottom: 24px;
+}
+
+.props-section:last-child {
+  margin-bottom: 0;
+}
+
+.props-section-title {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-tertiary);
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  margin-bottom: 12px;
+}
+
+/* 字段网格：两列布局 */
+.props-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 14px 16px;
+}
+
+/* 单个字段 */
+.props-field {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.props-label {
+  font-size: 12px;
+  color: var(--text-tertiary);
+}
+
+/* 可编辑输入框 */
+.props-input {
+  height: 34px;
+  padding: 0 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--bg-input);
+  color: var(--text-primary);
+  font-size: 13px;
+  transition: border-color var(--transition-fast);
+}
+
+.props-input:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+
+/* 下拉框 */
+.props-select {
+  height: 34px;
+  padding: 0 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--bg-input);
+  color: var(--text-primary);
+  font-size: 13px;
+  cursor: pointer;
+  transition: border-color var(--transition-fast);
+}
+
+.props-select:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+
+/* 只读字段值 */
+.props-field-readonly .props-value {
+  height: 34px;
+  display: flex;
+  align-items: center;
+  padding: 0 10px;
+  border-radius: var(--radius-sm);
+  background: var(--bg-hover);
+  color: var(--text-primary);
+  font-size: 13px;
+}
+
+/* 媒体类型标签 */
+.props-tag {
+  display: inline-flex;
+  align-items: center;
+  padding: 2px 8px;
+  border-radius: 4px;
+  font-size: 12px;
+  font-weight: 500;
+}
+
+.props-tag-movie {
+  background: rgba(0, 113, 227, 0.12);
+  color: var(--accent);
+}
+
+.props-tag-tv {
+  background: rgba(52, 199, 89, 0.12);
+  color: #34c759;
+}
+
+/* 底部操作栏 */
+.props-footer {
+  display: flex;
+  justify-content: flex-end;
+  gap: 10px;
+  padding: 14px 20px;
+  border-top: 1px solid var(--border);
+}
+
+.props-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  min-width: 72px;
+  height: 34px;
+  padding: 0 16px;
+  border: none;
+  border-radius: var(--radius-sm);
+  font-size: 13px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: background var(--transition-fast), opacity var(--transition-fast);
+}
+
+.props-btn:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+.props-btn-cancel {
+  background: var(--bg-hover);
+  color: var(--text-primary);
+}
+
+.props-btn-cancel:hover:not(:disabled) {
+  background: var(--border);
+}
+
+.props-btn-save {
+  background: var(--accent);
+  color: #fff;
+}
+
+.props-btn-save:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--accent) 88%, black);
+}
+
+/* 保存按钮加载小圆圈 */
+.props-btn-spinner {
+  width: 14px;
+  height: 14px;
+  border: 2px solid rgba(255, 255, 255, 0.4);
+  border-top-color: #fff;
+  border-radius: 50%;
+  animation: spin 0.6s linear infinite;
+}
+
+/* 小屏适配：单列布局 */
+@media (max-width: 540px) {
+  .props-modal {
+    max-width: 100%;
+    max-height: 100vh;
+    border-radius: 0;
+  }
+
+  .props-grid {
+    grid-template-columns: 1fr;
+  }
 }
 </style>

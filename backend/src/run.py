@@ -16,6 +16,15 @@
 5. start_server() 根据 ONEFIVE_SOCKET 环境变量选择 Unix Socket 或 HTTP 模式
 """
 import os
+import time
+
+# ==================== 设置时区为北京时间 ====================
+# 必须在任何 import 之前执行，确保 datetime.now() 和 SQLite 的 localtime 都使用北京时区
+os.environ['TZ'] = 'Asia/Shanghai'
+try:
+    time.tzset()
+except AttributeError:
+    pass  # Windows 不支持 time.tzset()，依赖系统时区设置
 
 # ==================== 修复 HOME 环境变量 ====================
 # 飞牛 fnOS 下，onefive 用户可能没有 /home/onefive 目录，
