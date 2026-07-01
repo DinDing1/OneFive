@@ -303,8 +303,8 @@ async def get_file_properties(source_id: int, file_id: str):
         share_info = service.get_share_info(source_id)
         if not share_info:
             return ApiResponse(code=-1, message="分享不存在")
-        # 文件信息
-        file_info = service.get_file(source_id, file_id)
+        # 文件信息（目录自动从子文件补充媒体信息）
+        file_info = service.get_file_with_media_info(source_id, file_id)
         if not file_info:
             return ApiResponse(code=-1, message="文件不存在")
         # 获取可选分类列表（根据 media_type 过滤）

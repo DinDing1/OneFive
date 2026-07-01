@@ -98,8 +98,8 @@ class Database:
                 name TEXT PRIMARY KEY,
                 value TEXT,
                 description TEXT,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                created_at TIMESTAMP DEFAULT (datetime('now', 'localtime')),
+                updated_at TIMESTAMP DEFAULT (datetime('now', 'localtime'))
             )
         """)
         self._conn.execute("""
@@ -108,7 +108,7 @@ class Database:
                 file_id TEXT NOT NULL,
                 url TEXT NOT NULL,
                 expires_at TIMESTAMP NOT NULL,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                created_at TIMESTAMP DEFAULT (datetime('now', 'localtime'))
             )
         """)
         self._conn.execute("""
@@ -129,8 +129,8 @@ class Database:
                 status       TEXT DEFAULT 'pending',
                 link_valid   INTEGER DEFAULT 1,              -- 分享链接是否有效：1=有效 0=无效
                 error_msg    TEXT DEFAULT '',
-                created_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                updated_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                created_at   TIMESTAMP DEFAULT (datetime('now', 'localtime')),
+                updated_at   TIMESTAMP DEFAULT (datetime('now', 'localtime'))
             )
         """)
         # 分享文件表（存储目录和文件，目录用于展示层级，文件用于整理）
@@ -154,8 +154,8 @@ class Database:
                 organized_dir  TEXT DEFAULT '',               -- 整理后的目录路径
                 organized_name TEXT DEFAULT '',               -- 整理后的文件名
                 organized      INTEGER DEFAULT 0,             -- 是否已整理：0=未整理 1=已整理
-                created_at     TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                updated_at     TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                created_at     TIMESTAMP DEFAULT (datetime('now', 'localtime')),
+                updated_at     TIMESTAMP DEFAULT (datetime('now', 'localtime')),
                 UNIQUE(source_id, file_id)
             )
         """)

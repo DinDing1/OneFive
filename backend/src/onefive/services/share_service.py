@@ -450,6 +450,43 @@ class ShareService:
         )
         return dict(row) if row else None
 
+    def get_file_with_media_info(self, source_id: int, file_id: str) -> Optional[Dict]:
+        """获取文件详情，目录自动从子文件补充媒体信息
+
+        整理时媒体信息（title/year/tmdb_id/media_type/category）存储在文件记录上，
+        不是目录记录上。对于目录，需要递归查找子文件来补充这些字段。
+        """
+        file_info = self.get_file(source_id, file_id)
+        if not file_info:
+            return None
+
+        # 目录：从子文件补充媒体信息（递归查找，兼容 Season 子目录结构）
+        if file_info.get("is_dir"):
+            child = self.db.fetchone(
+                """WITH RECURSIVE children(file_id) AS (
+                    SELECT file_id FROM share_file
+                    WHERE source_id = ? AND parent_id = ?
+                    UNION ALL
+                    SELECT f.file_id FROM share_file f
+                    JOIN children c ON f.parent_id = c.file_id
+                    WHERE f.source_id = ?
+                )
+                SELECT media_type, title, year, tmdb_id, category
+                FROM share_file
+                WHERE source_id = ? AND file_id IN (SELECT file_id FROM children)
+                  AND organized = 1 AND title != '' AND is_dir = 0
+                LIMIT 1""",
+                (source_id, file_id, source_id, source_id)
+            )
+            if child:
+                file_info["media_type"] = child["media_type"] or ""
+                file_info["title"] = child["title"] or ""
+                file_info["year"] = child["year"] or ""
+                file_info["tmdb_id"] = child["tmdb_id"] or 0
+                file_info["category"] = child["category"] or ""
+
+        return file_info
+
     def update_file_organize(self, source_id: int, file_id: str, data: Dict):
         """更新文件整理信息"""
         self.db.execute(
