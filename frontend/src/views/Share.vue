@@ -58,17 +58,17 @@
               <button
                 class="filter-btn"
                 :class="{ active: fileFilter === 'all' }"
-                @click="fileFilter = 'all'"
+                @click="setFileFilter('all')"
               >全部<span class="filter-count">{{ allCount }}</span></button>
               <button
                 class="filter-btn"
                 :class="{ active: fileFilter === 'organized' }"
-                @click="fileFilter = 'organized'"
+                @click="setFileFilter('organized')"
               >已整理<span class="filter-count">{{ organizedCount }}</span></button>
               <button
                 class="filter-btn"
                 :class="{ active: fileFilter === 'unorganized' }"
-                @click="fileFilter = 'unorganized'"
+                @click="setFileFilter('unorganized')"
               >未整理<span class="filter-count">{{ unorganizedCount }}</span></button>
             </div>
 
@@ -715,6 +715,12 @@ const isSearching = ref(false)
 // 筛选（全部 / 已整理 / 未整理）
 const fileFilter = ref<FileFilter>('all')
 
+/** 切换筛选标签时重置分页到第 1 页 */
+function setFileFilter(filter: FileFilter) {
+  fileFilter.value = filter
+  currentPage.value = 1
+}
+
 // 多选
 const selectedIds = ref<Set<string>>(new Set())
 
@@ -1112,6 +1118,8 @@ async function loadFiles() {
   selectedIds.value = new Set()
   isSearching.value = false
   searchKeyword.value = ''
+  fileFilter.value = 'all'
+  currentPage.value = 1
   currentDirBreadcrumbs.value = [{ sourceId: 0, parentId: '0', name: '全部' }]
   try {
     const res = await shareApi.getAllFiles()
@@ -1132,6 +1140,8 @@ async function loadFiles() {
 async function loadSubDirFiles(sourceId: number, parentId: string) {
   loadingFiles.value = true
   selectedIds.value = new Set()
+  fileFilter.value = 'all'
+  currentPage.value = 1
   try {
     const res = await shareApi.listFiles(sourceId, parentId)
     if (res.code === 0 && res.data) {

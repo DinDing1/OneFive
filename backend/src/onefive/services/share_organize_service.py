@@ -14,7 +14,7 @@ import asyncio
 from typing import Dict, Any, Optional, List
 
 from .share_service import get_share_service
-from .file_info_service import extract_key_info, extract_tech_info
+from .file_info_service import extract_key_info, extract_tech_info, VIDEO_EXTENSIONS
 from .classify_service import classify_media
 from .tmdb_service import get_tmdb_service
 from .rename_service import generate_movie_path, generate_tv_path
@@ -104,15 +104,15 @@ class ShareOrganizeService:
             return data
 
     def _is_video_file(self, filename: str) -> bool:
-        """判断是否为视频文件"""
-        video_exts = {'.mkv', '.mp4', '.avi', '.mov', '.wmv', '.flv', '.webm', '.m4v', '.ts'}
-        return any(filename.lower().endswith(ext) for ext in video_exts)
+        """判断是否为视频文件（复用 file_info_service 的扩展名集合，保持一致）"""
+        return any(filename.lower().endswith(ext) for ext in VIDEO_EXTENSIONS)
 
     # 季集标记正则：S01E01、第x集、EP01、E01 等（模块级常量，避免重复编译）
+    # 第3条正则加前导边界，避免 MOVIE01、SAMPLE01、FILE01 等被误判为剧集标记
     _SEASON_EPISODE_PATTERNS = [
         re.compile(r'[Ss]\d{1,2}[Ee]\d{1,3}'),       # S01E01 / s1e1
         re.compile(r'第\s*\d+\s*集'),                   # 第1集 / 第 01 集
-        re.compile(r'[Ee][Pp]?\.?\s*\d{1,3}'),        # EP01 / E01 / ep.1
+        re.compile(r'(?:^|[\s._\-])[Ee][Pp]?\.?\s*\d{1,3}'),  # EP01 / E01 / ep.1（需前导边界）
     ]
 
     def _has_season_episode_marker(self, filename: str) -> bool:
@@ -441,6 +441,11 @@ class ShareOrganizeService:
         media_type 由 TMDB 返回结果判定（比文件名解析更准确）。
         forced_tmdb_id 用于目录整理：目录名已有明确 TMDB ID 时，强制用该 ID 查媒体，避免子文件名搜索错片。
         """
+        # 0. 归一化 forced_media_type，防止上游传入 "Movie"/"tv " 等异常值
+        forced_media_type = (forced_media_type or "").strip().lower()
+        if forced_media_type not in ("movie", "tv"):
+            forced_media_type = ""
+
         # 1. 从文件名提取基础信息
         key_info = extract_key_info(name)
         tech_info = extract_tech_info(name)
@@ -456,15 +461,21 @@ class ShareOrganizeService:
             tmdb_id = forced_tmdb_id
 
         # 2. TMDB 搜索（带缓存）
+        # forced_media_type 非空时启用严格模式：按推断类型查询，不回退到另一类型，
+        # 避免 movie 端查不到时回退命中 tv 端同 ID 导致电影被误判为电视剧
+        strict_media_type = bool(forced_media_type)
         tmdb_service = get_tmdb_service()
-        cache_key = ("tmdb", tmdb_id, search_media_type) if tmdb_id else (title, year, search_media_type)
+        cache_key = ("tmdb", tmdb_id, search_media_type, strict_media_type) if tmdb_id else (title, year, search_media_type)
         if cache_key in tmdb_cache:
             tmdb_details = tmdb_cache[cache_key]
         else:
-            tmdb_details = self._search_tmdb(tmdb_id, title, search_media_type, year)
+            tmdb_details = self._search_tmdb(tmdb_id, title, search_media_type, year,
+                                             strict_media_type=strict_media_type)
             tmdb_cache[cache_key] = tmdb_details
 
         # 3. 从 TMDB 结果提取信息，并以 TMDB 为准判定 media_type
+        #    TMDB 的 /movie/{id} 和 /tv/{id} 端点不返回 media_type 字段，
+        #    通过 release_date（电影）/ first_air_date（电视剧）判定类型
         poster = ""
         backdrop = ""
         rating = 0
@@ -472,9 +483,6 @@ class ShareOrganizeService:
         media_type = ""
         if tmdb_details:
             tmdb_id = tmdb_details.get("id", tmdb_id)
-            result_media_type = tmdb_details.get("media_type")
-            if result_media_type in ("movie", "tv"):
-                media_type = result_media_type
             tmdb_title = tmdb_service.get_chinese_title(tmdb_details) or tmdb_details.get("title") or tmdb_details.get("name")
             if tmdb_title:
                 title = tmdb_title
@@ -488,11 +496,10 @@ class ShareOrganizeService:
             rating = tmdb_details.get("vote_average", 0)
             overview = tmdb_details.get("overview", "")
             # 用 TMDB 结果判定 media_type：有 first_air_date 为 tv，有 release_date 为 movie
-            if not media_type:
-                if tmdb_details.get("first_air_date"):
-                    media_type = "tv"
-                elif tmdb_details.get("release_date"):
-                    media_type = "movie"
+            if tmdb_details.get("first_air_date"):
+                media_type = "tv"
+            elif tmdb_details.get("release_date"):
+                media_type = "movie"
 
         # 4. 分类
         category = ""
@@ -506,8 +513,7 @@ class ShareOrganizeService:
             season_year = ""
             if media_type == "tv" and season and tmdb_id:
                 try:
-                    tmdb_svc = get_tmdb_service()
-                    season_info = tmdb_svc.get_tv_season(int(tmdb_id), int(season))
+                    season_info = tmdb_service.get_tv_season(int(tmdb_id), int(season))
                     if season_info:
                         air_date = season_info.get("air_date", "")
                         if air_date:
@@ -701,25 +707,108 @@ class ShareOrganizeService:
             logger.error(f"分享文件整理失败 ({name}): {e}")
             return {"success": False, "error": str(e), "size": file_size}
 
+    def _get_details_by_type(self, tmdb_service, tmdb_id: int,
+                             media_type: str) -> Optional[Dict]:
+        """按指定媒体类型查询 TMDB 详情（movie 或 tv）"""
+        if media_type == "movie":
+            return tmdb_service.get_movie_details(tmdb_id)
+        return tmdb_service.get_tv_details(tmdb_id)
+
+    def _matches_year(self, details: Optional[Dict], year: str) -> bool:
+        """校验 TMDB 详情的年份是否与给定年份一致
+
+        movie 取 release_date，tv 取 first_air_date，格式 YYYY-MM-DD。
+        无年份输入或详情无日期字段时返回 False（无法验证）。
+        """
+        if not details or not year:
+            return False
+        release_date = details.get("release_date") or details.get("first_air_date") or ""
+        return bool(release_date) and release_date[:4] == str(year)
+
+    def _matches_title(self, details: Optional[Dict], title: str) -> bool:
+        """校验 TMDB 详情的标题是否与给定标题匹配（考虑别名/译名）
+
+        委托 tmdb_service.matches_title，匹配候选包括：
+        原标题、原始标题、中文译名、alternative_titles、translations。
+        """
+        if not details or not title:
+            return False
+        tmdb_service = get_tmdb_service()
+        return tmdb_service.matches_title(details, title)
+
+    def _matches_details(self, details: Optional[Dict],
+                         title: str, year: str) -> bool:
+        """综合验证详情是否匹配标题和年份
+
+        - 有年份时必须年份匹配
+        - 有标题时必须标题匹配（考虑别名）
+        - 都没有时视为匹配（无法验证）
+        - 任一不匹配返回 False（tmdbid 可能写错，不采用该结果）
+        """
+        if not details:
+            return False
+        if year and not self._matches_year(details, year):
+            return False
+        if title and not self._matches_title(details, title):
+            return False
+        return True
+
     def _search_tmdb(self, tmdb_id: int, title: str,
-                     media_type: str, year: str) -> Optional[Dict]:
+                     media_type: str, year: str,
+                     strict_media_type: bool = False) -> Optional[Dict]:
         """TMDB 搜索，返回详情字典或 None
 
-        优先通过 tmdb_id 查询，否则通过标题搜索
+        优先通过 tmdb_id 查询，否则通过标题搜索。
+
+        名称+年份综合验证 + 智能回退策略：
+        1. 主类型查到 + (名称和年份都匹配 或 无可验证) → 直接采用
+        2. 主类型查到但验证不匹配 → 尝试另一类型（tmdbid 类型可能写错），
+           另一类型验证通过则采用；否则回退标题+年份搜索；都失败返回 None
+        3. 主类型查不到：严格模式不回退另一类型；非严格模式尝试另一类型；都允许同类型标题搜索兜底
+
+        Args:
+            strict_media_type: True 时主类型查不到不回退到另一类型（避免电影误判为电视剧）
         """
         tmdb_service = get_tmdb_service()
 
         if tmdb_id:
-            # 通过 ID 查询
-            if media_type == "movie":
-                details = tmdb_service.get_movie_details(tmdb_id)
-                if not details:
-                    details = tmdb_service.get_tv_details(tmdb_id)
-            else:
-                details = tmdb_service.get_tv_details(tmdb_id)
-                if not details:
-                    details = tmdb_service.get_movie_details(tmdb_id)
-            return details
+            # 1. 按指定类型查询主类型
+            primary_details = self._get_details_by_type(tmdb_service, tmdb_id, media_type)
+
+            # 2. 主类型查到 + 综合验证通过（名称和年份都匹配，或无可验证）→ 直接采用
+            if self._matches_details(primary_details, title, year):
+                return primary_details
+
+            # 3. 主类型查到但验证不匹配：tmdbid 类型可能写错，尝试另一类型
+            if primary_details:
+                fallback_type = "tv" if media_type == "movie" else "movie"
+                fallback_details = self._get_details_by_type(tmdb_service, tmdb_id, fallback_type)
+                if self._matches_details(fallback_details, title, year):
+                    return fallback_details
+                # 另一类型也不匹配：tmdbid 可能是错的，回退到标题+年份搜索
+                if title:
+                    search_result = tmdb_service.search_and_pick(title, media_type, year)
+                    if search_result:
+                        return search_result
+                # 搜索也失败：不采用名称/年份不符的 tmdbid 结果
+                return None
+
+            # 4. 主类型查不到：严格模式不回退到另一类型，非严格模式先尝试另一类型
+            if not strict_media_type:
+                fallback_type = "tv" if media_type == "movie" else "movie"
+                fallback_details = self._get_details_by_type(tmdb_service, tmdb_id, fallback_type)
+                if self._matches_details(fallback_details, title, year):
+                    return fallback_details
+
+            # 5. 严格模式主类型查不到，或非严格模式另一类型也失败：尝试同类型标题搜索兜底
+            #    （严格模式不允许跨类型，但允许同类型标题搜索）
+            if title:
+                search_result = tmdb_service.search_and_pick(title, media_type, year)
+                if search_result:
+                    return search_result
+
+            # 6. 所有回退都失败：返回 None（不采用名称/年份不符的结果）
+            return None
 
         if title:
             # 通过标题搜索

@@ -274,6 +274,22 @@ class TMDBService:
                 best = max(best, SequenceMatcher(None, q, t).ratio() * 60)
         return best
 
+    def matches_title(self, details: Dict, query: str,
+                      threshold: float = 45.0) -> bool:
+        """检查详情的标题（含别名/译名）是否与给定标题匹配
+
+        复用 _alias_score 的匹配逻辑，分数达到阈值即视为匹配。
+        匹配候选包括：标题、原始标题、中文译名、alternative_titles、translations。
+
+        Args:
+            details: TMDB 详情（需含 alternative_titles/translations 字段）
+            query: 待匹配的标题（可能是中文译名、别名等）
+            threshold: 匹配阈值，默认 45（与 _pick_best_result 一致）
+        """
+        if not details or not query:
+            return False
+        return self._alias_score(details, query) >= threshold
+
     def _pick_best_result(self, results: List[Dict], query: str,
                           media_type: str, year: Optional[str] = None) -> Optional[Dict]:
         """按标题相似度和年份选择最佳结果，不再盲目取第一个"""
