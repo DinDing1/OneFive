@@ -50,7 +50,7 @@ start_process() {
     export ONEFIVE_SOCKET="${SOCKET_PATH}"
 
     # 运行 Nuitka 编译的二进制文件
-    SERVER_BIN="${TRIM_APPDEST}/server/onefive-server"
+    SERVER_BIN="${TRIM_APPDEST}/app/server/onefive-server"
     if [ ! -f "${SERVER_BIN}" ]; then
         echo "错误: 找不到服务端程序 ${SERVER_BIN}" > ${TRIM_TEMP_LOGFILE}
         log_msg "错误: 找不到服务端程序 ${SERVER_BIN}"
