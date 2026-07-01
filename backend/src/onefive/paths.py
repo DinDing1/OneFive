@@ -96,4 +96,18 @@ def split_accessible_paths(raw: str) -> List[str]:
 
 
 # ==================== 服务端口 ====================
-SERVICE_PORT = int(os.environ.get("TRIM_SERVICE_PORT", os.environ.get("ONEFIVE_PORT", "11580")))
+def _get_service_port(default: int = 11580) -> int:
+    """获取主服务端口
+
+    飞牛统一网关模式实际走 Unix Socket，不依赖这个端口。
+    但飞牛环境里 TRIM_SERVICE_PORT 可能存在但值为空字符串，不能直接 int('')。
+    因此这里做安全解析：空值或非法值都回退到默认端口，避免应用导入阶段崩溃。
+    """
+    raw = os.environ.get("TRIM_SERVICE_PORT") or os.environ.get("ONEFIVE_PORT") or str(default)
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return default
+
+
+SERVICE_PORT = _get_service_port()
