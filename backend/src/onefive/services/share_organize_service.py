@@ -272,6 +272,12 @@ class ShareOrganizeService:
             (source_id, dir_file_id)
         )
 
+        logger.info(
+            f"[目录整理开始] dir_file_id={dir_file_id}, dir_name={dir_name}, "
+            f"direct_children={len(files)}, folder_tmdb_id={folder_tmdb_id}, "
+            f"folder_media_type={folder_media_type!r}, send_notify={send_notify}"
+        )
+
         results = []
         success_count = 0
         for f in files:
@@ -289,6 +295,11 @@ class ShareOrganizeService:
                 # 目录整理成功时，按 1 个直接子项计入，避免“成功0、失败1”这种误导统计。
                 if sub.get("success"):
                     success_count += 1
+                logger.info(
+                    f"[子目录结果] name={fname}, success={sub.get('success')}, "
+                    f"total={sub.get('total')}, organized_count={sub.get('organized_count')}, "
+                    f"failed_count={sub.get('failed_count')}"
+                )
             else:
                 result = self._organize_single_file(
                     source_id, fid, fname, share_service, tmdb_cache, f.get("size", 0),
@@ -298,6 +309,10 @@ class ShareOrganizeService:
                 results.append(result)
                 if result.get("success"):
                     success_count += 1
+                else:
+                    logger.warning(
+                        f"[子文件失败] name={fname}, file_id={fid}, error={result.get('error')}"
+                    )
 
         # 标记当前目录为已整理
         share_service.db.execute(
@@ -306,11 +321,16 @@ class ShareOrganizeService:
         )
         share_service.db.commit()
 
+        total = len(files)
+        logger.info(
+            f"[目录整理完成] dir_name={dir_name}, total={total}, "
+            f"success_count={success_count}, failed_count={max(0, total - success_count)}"
+        )
+
         # 仅在顶层目录发送一条汇总通知，子目录递归时不发通知
         if send_notify:
             self._send_directory_notify(dir_name, results, success_count)
 
-        total = len(files)
         return {
             "success": True, "is_directory": True,
             "total": total,
@@ -340,6 +360,19 @@ class ShareOrganizeService:
             # 展平子目录嵌套结果，收集所有文件级成功结果
             flat_results = self._flatten_results(results)
             success_results = [r for r in flat_results if r.get("success")]
+            failed_results = [r for r in flat_results if not r.get("success")]
+
+            # 详细记录展平后的统计，便于定位"0成功1失败"类问题
+            logger.info(
+                f"[通知统计] dir_name={dir_name}, 上层success_count={success_count}, "
+                f"展平后: total={len(flat_results)}, success={len(success_results)}, failed={len(failed_results)}"
+            )
+            if failed_results:
+                for r in failed_results:
+                    logger.warning(
+                        f"[通知失败项] name={r.get('name')}, file_id={r.get('file_id')}, "
+                        f"error={r.get('error')}, media_type={r.get('media_type')!r}"
+                    )
 
             if not success_results:
                 # 全部失败
@@ -530,6 +563,14 @@ class ShareOrganizeService:
             organized_dir = path_info.get("dir", "")
             organized_name = path_info.get("filename", "")
 
+        # 识别结果详细日志，便于定位 organized_dir 为空等识别失败场景
+        logger.info(
+            f"[识别结果] name={name}, media_type={media_type!r}, title={title!r}, "
+            f"year={year!r}, tmdb_id={tmdb_id}, season={season}, episode={episode}, "
+            f"category={category!r}, organized_dir={organized_dir!r}, organized_name={organized_name!r}, "
+            f"tech_info_empty={not tech_info}, tmdb_details_found={bool(tmdb_details)}"
+        )
+
         return {
             "media_type": media_type,
             "title": title,
@@ -666,7 +707,15 @@ class ShareOrganizeService:
 
             # 校验：识别失败（media_type 或 organized_dir 为空）不标记为已整理
             if not r.get("media_type") or not r.get("organized_dir"):
-                logger.warning(f"分享文件识别失败，跳过整理: {name}（media_type={r.get('media_type')}, organized_dir={r.get('organized_dir')}）")
+                # 详细记录各关键字段，便于定位识别失败的根本原因
+                logger.warning(
+                    f"[整理失败] file_id={file_id}, name={name}, "
+                    f"forced_tmdb_id={forced_tmdb_id}, forced_media_type={forced_media_type}, "
+                    f"识别结果: media_type={r.get('media_type')!r}, title={r.get('title')!r}, "
+                    f"year={r.get('year')!r}, tmdb_id={r.get('tmdb_id')}, "
+                    f"tech_info={r.get('tech_info')}, organized_dir={r.get('organized_dir')!r}, "
+                    f"organized_name={r.get('organized_name')!r}, category={r.get('category')!r}"
+                )
                 return {
                     "success": False, "file_id": file_id, "name": name,
                     "error": "识别失败：未找到 TMDB 信息",
@@ -691,7 +740,12 @@ class ShareOrganizeService:
                 "organized_name": r["organized_name"],
             })
 
-
+            logger.info(
+                f"[整理成功] file_id={file_id}, name={name}, "
+                f"media_type={r['media_type']}, title={r['title']}, "
+                f"tmdb_id={r['tmdb_id']}, organized_dir={r['organized_dir']}, "
+                f"organized_name={r['organized_name']}"
+            )
 
             return {
                 "success": True, "file_id": file_id, "name": name,
@@ -704,8 +758,8 @@ class ShareOrganizeService:
                 "size": file_size,
             }
         except Exception as e:
-            logger.error(f"分享文件整理失败 ({name}): {e}")
-            return {"success": False, "error": str(e), "size": file_size}
+            logger.error(f"[整理异常] file_id={file_id}, name={name}, error={e}", exc_info=True)
+            return {"success": False, "error": str(e), "size": file_size, "name": name, "file_id": file_id}
 
     def _get_details_by_type(self, tmdb_service, tmdb_id: int,
                              media_type: str) -> Optional[Dict]:
