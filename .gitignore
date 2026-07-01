@@ -59,6 +59,15 @@ backend/build/
 backend/dist/
 backend/src/onefive.egg-info/
 
+# 飞牛打包构建产物
+onefive/app/server/*
+!onefive/app/server/.gitkeep
+onefive/app/ui/*
+!onefive/app/ui/config
+!onefive/app/ui/images/
+!onefive/app/ui/images/icon_64.png
+!onefive/app/ui/images/icon_256.png
+
 # 日志文件
 *.log
 

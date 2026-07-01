@@ -243,20 +243,35 @@ jobs:
 
       - name: 组装应用文件
         run: |
-          # 前端构建产物 -> onefive/ui/（保留 config 文件）
-          rm -rf onefive/ui/assets onefive/ui/*.html onefive/ui/*.js onefive/ui/*.css onefive/ui/*.svg onefive/ui/*.png
-          mkdir -p onefive/ui
-          cp -r frontend/dist/* onefive/ui/
+          # 前端构建产物 -> onefive/app/ui/
+          # 飞牛 fnpack 会把 app/ 下的内容安装到 TRIM_APPDEST（即 /vol*/@appcenter/onefive/）
+          mkdir -p onefive/app/ui
 
-          # 后端二进制 -> onefive/server/
-          mkdir -p onefive/server
-          rm -rf onefive/server/__pycache__
-          cp /tmp/nuitka-out/onefive-server onefive/server/onefive-server
-          chmod +x onefive/server/onefive-server
+          # 备份飞牛应用入口配置和图标，避免被前端构建产物覆盖
+          cp onefive/app/ui/config /tmp/onefive-ui-config
+          cp -r onefive/app/ui/images /tmp/onefive-ui-images
+
+          # 清理上次构建残留的前端产物
+          rm -rf onefive/app/ui/assets onefive/app/ui/*.html onefive/app/ui/*.js onefive/app/ui/*.css onefive/app/ui/*.svg onefive/app/ui/*.png
+
+          # 拷贝前端构建产物
+          cp -r frontend/dist/* onefive/app/ui/
+
+          # 恢复飞牛应用入口配置和图标
+          cp /tmp/onefive-ui-config onefive/app/ui/config
+          rm -rf onefive/app/ui/images
+          cp -r /tmp/onefive-ui-images onefive/app/ui/images
+
+          # 后端二进制 -> onefive/app/server/
+          # 安装后路径会变成 ${TRIM_APPDEST}/server/onefive-server
+          mkdir -p onefive/app/server
+          rm -rf onefive/app/server/__pycache__
+          cp /tmp/nuitka-out/onefive-server onefive/app/server/onefive-server
+          chmod +x onefive/app/server/onefive-server
 
           echo "应用文件组装完成"
-          ls -la onefive/server/
-          ls -la onefive/ui/
+          ls -la onefive/app/server/
+          ls -la onefive/app/ui/
 
       - name: 更新 manifest
         run: |
