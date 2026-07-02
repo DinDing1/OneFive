@@ -44,27 +44,54 @@ def _parse_countries(countries_str: str) -> List[str]:
     return [c.strip().upper() for c in countries_str.split(',') if c.strip()]
 
 
+def _normalize_to_list(value, parser=None):
+    """将值归一化为列表，支持字符串（逗号分隔）和列表两种格式
+
+    TMDB API 返回 origin_country/genres 是列表格式，
+    但数据库存储或缓存中可能序列化为逗号分隔字符串。
+    """
+    if value is None:
+        return []
+    if isinstance(value, str):
+        items = [x.strip() for x in value.split(',') if x.strip()]
+        return parser(items) if parser else items
+    if isinstance(value, (list, tuple)):
+        if parser:
+            return parser(value)
+        return list(value)
+    return [value]
+
+
 def _match_rule(details: Dict, rule: Dict) -> bool:
     """检查媒体信息是否匹配分类规则
 
-    匹配逻辑：
-    1. 如果规则指定了类型ID，媒体必须包含至少一个指定类型
-    2. 如果规则指定了原产国，媒体必须包含至少一个指定国家
-    3. 所有指定的条件都必须满足
+    匹配逻辑（任一匹配 = 命中）：
+    1. genreIds：媒体的 genres 中包含规则要求的任一类型ID
+    2. originCountry：媒体的原产国中包含规则要求的任一国家代码
+    3. 所有指定的条件都必须满足（AND 逻辑）
     """
     conditions = rule.get("conditions", {})
 
     # 检查类型ID
     if conditions.get("genreIds"):
         required_ids = _parse_genre_ids(conditions["genreIds"])
-        media_genres = [g.get("id") for g in details.get("genres", [])]
+        # details["genres"] 可能是列表 [{id:16, name:"Animation"}, ...] 或数字列表 [16, 18]
+        raw_genres = details.get("genres") or []
+        if raw_genres and isinstance(raw_genres[0], dict):
+            media_genres = [g.get("id") for g in raw_genres]
+        elif isinstance(raw_genres, str):
+            media_genres = _parse_genre_ids(raw_genres)
+        else:
+            media_genres = list(raw_genres)
         if not any(gid in media_genres for gid in required_ids):
             return False
 
     # 检查原产国
     if conditions.get("originCountry"):
         required_countries = _parse_countries(conditions["originCountry"])
-        media_countries = [c.upper() for c in (details.get("origin_country") or details.get("originCountry") or [])]
+        # TMDB 返回列表 ["CN","TW"]，但数据库/缓存可能是字符串 "CN,TW"
+        raw_countries = details.get("origin_country") or details.get("originCountry") or []
+        media_countries = _normalize_to_list(raw_countries, lambda items: [c.upper() for c in items])
         if not any(c in media_countries for c in required_countries):
             return False
 
