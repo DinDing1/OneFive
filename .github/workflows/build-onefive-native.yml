@@ -105,6 +105,7 @@ jobs:
                 --include-module=telethon \
                 --include-module=guessit \
                 --include-package=babelfish \
+                --include-package-data=babelfish \
                 --include-package-data=guessit \
                 --include-package-data=rebulk \
                 --include-module=orjson \
@@ -185,6 +186,7 @@ jobs:
                 --include-module=telethon \
                 --include-module=guessit \
                 --include-package=babelfish \
+                --include-package-data=babelfish \
                 --include-package-data=guessit \
                 --include-package-data=rebulk \
                 --include-module=orjson \
