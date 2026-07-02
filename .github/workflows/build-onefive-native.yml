@@ -108,6 +108,7 @@ jobs:
                 --include-package-data=babelfish \
                 --include-package-data=guessit \
                 --include-package-data=rebulk \
+                --include-package=blacksheep \
                 --include-module=orjson \
                 --include-module=qrcode \
                 --include-module=PIL \
@@ -189,6 +190,7 @@ jobs:
                 --include-package-data=babelfish \
                 --include-package-data=guessit \
                 --include-package-data=rebulk \
+                --include-package=blacksheep \
                 --include-module=orjson \
                 --include-module=qrcode \
                 --include-module=PIL \
