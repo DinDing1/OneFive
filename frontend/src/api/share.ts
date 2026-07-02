@@ -119,4 +119,18 @@ export const shareApi = {
     return api.post('/share/organize-batch', { source_id: sourceId, file_ids: fileIds })
   },
 
+  /**
+   * 流式批量整理（SSE 实时进度）
+   * 返回 EventSource 实例，监听 message 事件获取进度
+   * 事件数据格式：
+   *   {type: "progress", index, total, name, success, title, category, error}
+   *   {type: "done", total, success, failed}
+   *   {type: "error", message}
+   */
+  organizeStream(sourceId: number, fileIds: string[]): EventSource {
+    const fileIdsParam = fileIds.join(',')
+    const url = `/api/share/organize-stream?source_id=${sourceId}&file_ids=${encodeURIComponent(fileIdsParam)}`
+    return new EventSource(url)
+  },
+
 }

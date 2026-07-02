@@ -1,7 +1,9 @@
 """
 分享管理 API 路由 - 管理分享链接的添加、浏览、整理、删除
 """
-from fastapi import APIRouter
+import json
+from fastapi import APIRouter, Query
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from typing import List, Optional
 
@@ -277,6 +279,47 @@ async def organize_batch(req: OrganizeBatchRequest):
     except Exception as e:
         logger.error(f"批量整理失败: {e}")
         return ApiResponse(code=-1, message=str(e))
+
+
+@router.get("/organize-stream", summary="流式批量整理（SSE 实时进度）")
+async def organize_stream(
+    source_id: int = Query(..., description="分享来源 ID"),
+    file_ids: str = Query(..., description="文件 ID 列表，逗号分隔"),
+):
+    """SSE 流式批量整理：每完成一个文件推送一次进度，绕过前端 axios 超时限制
+
+    事件格式：
+      data: {"type": "progress", "index": 1, "total": 5, "name": "...", "success": true, ...}
+      data: {"type": "done", "total": 5, "success": 4, "failed": 1}
+    """
+    # 解析 file_ids（逗号分隔 → 列表）
+    id_list = [fid.strip() for fid in file_ids.split(",") if fid.strip()]
+    if not id_list:
+        async def err_gen():
+            yield f"data: {json.dumps({'type': 'error', 'message': 'file_ids 不能为空'}, ensure_ascii=False)}\n\n"
+        return StreamingResponse(err_gen(), media_type="text/event-stream")
+
+    logger.info(f"[SSE 整理] 开始: source_id={source_id}, 文件数={len(id_list)}")
+
+    async def event_generator():
+        service = get_share_organize_service()
+        try:
+            async for evt in service.organize_batch_stream(source_id, id_list):
+                yield f"data: {json.dumps(evt, ensure_ascii=False)}\n\n"
+        except Exception as e:
+            logger.error(f"[SSE 整理] 异常: {e}")
+            err_payload = {"type": "error", "message": str(e)}
+            yield f"data: {json.dumps(err_payload, ensure_ascii=False)}\n\n"
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 @router.get("/{source_id}/info", summary="获取分享详情")

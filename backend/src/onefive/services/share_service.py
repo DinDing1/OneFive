@@ -368,7 +368,8 @@ class ShareService:
     def get_all_root_files(self, organized_only: bool = False, unorganized_only: bool = False) -> List[Dict]:
         """获取所有分享来源的根目录文件（目录排前面）
 
-        对于目录，从子文件中提取整理信息（title/year/tmdb_id）。
+        对于目录，递归查找后代文件中第一个已整理的，提取其 title/year/tmdb_id。
+        这样即使目录结构含季子目录（如 剧名/Season 01/第一集.mp4）也能正确显示整理名称。
         """
         condition = "f.parent_id = '0'"
         if organized_only:
@@ -378,10 +379,7 @@ class ShareService:
 
         rows = self.db.fetchall(
             f"""SELECT f.*, s.share_name,
-                (SELECT COUNT(*) FROM share_file WHERE source_id = s.id AND is_dir = 0) as file_count,
-                (SELECT title FROM share_file WHERE source_id = f.source_id AND parent_id = f.file_id AND organized = 1 AND title != '' LIMIT 1) as child_title,
-                (SELECT year FROM share_file WHERE source_id = f.source_id AND parent_id = f.file_id AND organized = 1 AND title != '' LIMIT 1) as child_year,
-                (SELECT tmdb_id FROM share_file WHERE source_id = f.source_id AND parent_id = f.file_id AND organized = 1 AND title != '' LIMIT 1) as child_tmdb_id
+                (SELECT COUNT(*) FROM share_file WHERE source_id = s.id AND is_dir = 0) as file_count
                 FROM share_file f
                 JOIN share_source s ON f.source_id = s.id
                 WHERE {condition}
@@ -391,13 +389,38 @@ class ShareService:
         result = []
         for r in rows:
             d = dict(r)
-            # 目录：用子文件的整理信息补充
+            # 目录：递归查找后代中第一个已整理文件，补充整理信息
             if d.get("is_dir") and d.get("organized") and not d.get("title"):
-                d["title"] = d.get("child_title") or ""
-                d["year"] = d.get("child_year") or ""
-                d["tmdb_id"] = d.get("child_tmdb_id") or 0
+                child = self._get_first_organized_descendant(d["source_id"], d["file_id"])
+                if child:
+                    d["title"] = child.get("title", "") or ""
+                    d["year"] = child.get("year", "") or ""
+                    d["tmdb_id"] = child.get("tmdb_id", 0) or 0
             result.append(d)
         return result
+
+    def _get_first_organized_descendant(self, source_id: int, dir_file_id: str) -> Optional[Dict]:
+        """递归查找目录下第一个已整理且有 title 的后代文件（不限层级）
+
+        用于目录整理名称显示：当目录含季子目录时，直接子项是目录无 title，
+        需要深入到叶子文件层才能取到整理信息。
+        """
+        rows = self.db.fetchall(
+            "SELECT file_id, is_dir, title, year, tmdb_id, organized "
+            "FROM share_file WHERE source_id = ? AND parent_id = ?",
+            (source_id, dir_file_id)
+        )
+        for r in rows:
+            f = dict(r)
+            # 优先返回已整理且有 title 的文件
+            if f.get("organized") and f.get("title"):
+                return f
+            # 子目录：递归查找
+            if f.get("is_dir"):
+                sub = self._get_first_organized_descendant(source_id, f["file_id"])
+                if sub:
+                    return sub
+        return None
 
     def get_all_organized_files(self) -> Dict:
         """获取所有分享来源的已整理文件，用于构建统一的虚拟目录树"""

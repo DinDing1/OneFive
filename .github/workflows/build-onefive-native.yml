@@ -104,6 +104,9 @@ jobs:
                 --include-module=p115nano302 \
                 --include-module=telethon \
                 --include-module=guessit \
+                --include-package-data=babelfish \
+                --include-package-data=guessit \
+                --include-package-data=rebulk \
                 --include-module=orjson \
                 --include-module=qrcode \
                 --include-module=PIL \
@@ -181,6 +184,9 @@ jobs:
                 --include-module=p115nano302 \
                 --include-module=telethon \
                 --include-module=guessit \
+                --include-package-data=babelfish \
+                --include-package-data=guessit \
+                --include-package-data=rebulk \
                 --include-module=orjson \
                 --include-module=qrcode \
                 --include-module=PIL \

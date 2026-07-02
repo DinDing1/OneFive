@@ -11,7 +11,7 @@
 """
 import re
 import asyncio
-from typing import Dict, Any, Optional, List
+from typing import Dict, Any, Optional, List, Callable
 
 from .share_service import get_share_service
 from .file_info_service import extract_key_info, extract_tech_info, VIDEO_EXTENSIONS
@@ -182,10 +182,12 @@ class ShareOrganizeService:
         # 规则3：单个视频文件，无季集标记 → movie
         return "movie"
 
-    def organize_file(self, source_id: int, file_id: str) -> Dict[str, Any]:
+    def organize_file(self, source_id: int, file_id: str,
+                      progress_cb: Optional[Callable[[str, Dict[str, Any]], None]] = None) -> Dict[str, Any]:
         """整理单个分享文件（识别并写入数据库）
 
         如果是目录，递归整理内部所有文件。
+        progress_cb 仅对目录有效：每整理完一个子文件时回调，用于流式进度推送。
         """
         share_service = get_share_service()
         tmdb_cache: Dict[tuple, Optional[Dict]] = {}
@@ -194,9 +196,12 @@ class ShareOrganizeService:
         if not file_info:
             return {"success": False, "error": "文件不存在"}
 
-        # 目录：递归整理内部所有文件
+        # 目录：递归整理内部所有文件（可带进度回调）
         if file_info.get("is_dir"):
-            return self._organize_directory(source_id, file_id, share_service, tmdb_cache)
+            return self._organize_directory(
+                source_id, file_id, share_service, tmdb_cache,
+                progress_cb=progress_cb
+            )
 
         # 单文件：整理并发送通知
         result = self._organize_single_file(source_id, file_id, file_info["name"], share_service, tmdb_cache, file_info.get("size", 0))
@@ -249,11 +254,13 @@ class ShareOrganizeService:
                            share_service, tmdb_cache: Dict,
                            inherited_tmdb_id: int = 0,
                            inherited_media_type: str = "",
-                           send_notify: bool = True) -> Dict[str, Any]:
+                           send_notify: bool = True,
+                           progress_cb: Optional[Callable[[str, Dict[str, Any]], None]] = None) -> Dict[str, Any]:
         """递归整理目录内的所有文件，并标记目录为已整理
 
         仅在最顶层目录整理完成后发送一条汇总通知（包含集数范围）。
         子目录递归时 send_notify=False，避免嵌套目录发送多条通知。
+        progress_cb：每整理完一个子文件（非子目录）时回调，用于流式进度推送。
         """
         dir_info = share_service.get_file(source_id, dir_file_id)
         dir_name = dir_info.get("name", "") if dir_info else ""
@@ -289,7 +296,8 @@ class ShareOrganizeService:
                     source_id, fid, share_service, tmdb_cache,
                     inherited_tmdb_id=folder_tmdb_id,
                     inherited_media_type=folder_media_type,
-                    send_notify=False
+                    send_notify=False,
+                    progress_cb=progress_cb
                 )
                 results.append(sub)
                 # 目录整理成功时，按 1 个直接子项计入，避免“成功0、失败1”这种误导统计。
@@ -313,6 +321,9 @@ class ShareOrganizeService:
                     logger.warning(
                         f"[子文件失败] name={fname}, file_id={fid}, error={result.get('error')}"
                     )
+                # 流式进度回调：每整理完一个子文件就推送进度（子目录不回调，由内部子文件逐个回调）
+                if progress_cb:
+                    progress_cb(fname, result)
 
         # 标记当前目录为已整理
         share_service.db.execute(
@@ -353,6 +364,24 @@ class ShareOrganizeService:
             else:
                 flat.append(r)
         return flat
+
+    def _count_dir_files(self, source_id: int, dir_file_id: str, share_service) -> int:
+        """递归统计文件夹内所有文件数（不含目录本身，含子目录内文件）
+
+        用于流式整理时计算真实进度总数，避免文件夹只算 1 导致进度永远卡在 1/1。
+        """
+        files = share_service.db.fetchall(
+            "SELECT file_id, is_dir FROM share_file WHERE source_id = ? AND parent_id = ?",
+            (source_id, dir_file_id)
+        )
+        count = 0
+        for f in files:
+            f = dict(f)
+            if f["is_dir"]:
+                count += self._count_dir_files(source_id, f["file_id"], share_service)
+            else:
+                count += 1
+        return count
 
     def _send_directory_notify(self, dir_name: str, results: list, success_count: int):
         """汇总目录整理结果，发送一条通知"""
@@ -887,6 +916,108 @@ class ShareOrganizeService:
             "failed": len(file_ids) - success_count,
             "results": results,
         }
+
+    async def organize_batch_stream(self, source_id: int, file_ids: list):
+        """流式批量整理分享文件（生成器模式，供 SSE 端点使用）
+
+        每整理完一个文件，yield 一个进度事件 dict：
+          {type: "progress", index, total, name, success, title, category, error}
+        全部完成后，yield 一个完成事件 dict：
+          {type: "done", total, success, failed}
+
+        关键：文件夹会展开统计内部文件数作为进度总数，整理文件夹时
+        每完成一个子文件就推送一次进度，避免"一部剧永远是 1/1"的问题。
+        """
+        share_service = get_share_service()
+
+        # 预查文件信息 + 统计每个 file_id 的实际工作量（文件夹展开统计内部文件数）
+        file_infos: Dict[str, Dict] = {}
+        total = 0
+        for fid in file_ids:
+            info = share_service.get_file(source_id, fid)
+            if not info:
+                file_infos[fid] = {"name": fid, "is_dir": False}
+                total += 1
+                continue
+            is_dir = bool(info.get("is_dir"))
+            if is_dir:
+                weight = self._count_dir_files(source_id, fid, share_service)
+            else:
+                weight = 1
+            # 空目录至少算 1，避免 total 不增长
+            weight = max(weight, 1)
+            file_infos[fid] = {"name": info.get("name", fid), "is_dir": is_dir}
+            total += weight
+
+        # 用队列桥接同步回调与异步生成器：整理在线程执行，回调 put 进度，生成器 get 并 yield
+        queue: asyncio.Queue = asyncio.Queue()
+        counters = {"done": 0, "success": 0, "fail": 0}
+
+        def push_progress(fname: str, result: Dict[str, Any]):
+            """同步回调：单文件整理完成时入队一条进度事件"""
+            counters["done"] += 1
+            ok = bool(result.get("success"))
+            if ok:
+                counters["success"] += 1
+            else:
+                counters["fail"] += 1
+            queue.put_nowait({
+                "type": "progress",
+                "index": counters["done"],
+                "total": total,
+                "name": fname,
+                "success": ok,
+                "title": result.get("title", ""),
+                "category": result.get("category", ""),
+                "error": result.get("error", ""),
+            })
+
+        async def run_organize():
+            """在线程中逐个整理，文件夹内部进度通过回调实时入队"""
+            try:
+                for fid in file_ids:
+                    info = file_infos[fid]
+                    try:
+                        if info["is_dir"]:
+                            # 文件夹：传 progress_cb，内部每完成一个子文件就回调入队
+                            await asyncio.to_thread(
+                                self.organize_file, source_id, fid, push_progress
+                            )
+                        else:
+                            # 单文件：整理后手动推送一条进度
+                            result = await asyncio.to_thread(
+                                self.organize_file, source_id, fid, None
+                            )
+                            push_progress(info["name"], result)
+                    except Exception as e:
+                        logger.error(f"[流式整理] 文件异常: {info['name']}, 错误: {e}")
+                        push_progress(info["name"], {"success": False, "error": str(e)})
+            finally:
+                # 整理全部结束，入队完成事件
+                queue.put_nowait({
+                    "type": "done",
+                    "total": total,
+                    "success": counters["success"],
+                    "failed": counters["fail"],
+                })
+
+        # 启动后台整理任务
+        task = asyncio.create_task(run_organize())
+
+        # 从队列读取进度并实时 yield，直到收到完成事件
+        try:
+            while True:
+                item = await queue.get()
+                yield item
+                if item.get("type") == "done":
+                    break
+        finally:
+            if not task.done():
+                task.cancel()
+                try:
+                    await task
+                except (asyncio.CancelledError, Exception):
+                    pass
 
     # ==================== 通知 ====================
 

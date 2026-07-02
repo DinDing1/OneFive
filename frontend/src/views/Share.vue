@@ -490,6 +490,34 @@
 
         <!-- 底部操作栏（始终在最底部，不随内容滚动） -->
         <div v-if="!recognizeLoading && recognizeResult" class="sr-footer">
+          <!-- 整理进度面板（整理中或完成后显示） -->
+          <div v-if="organizeExecuting || organizeProgressDone" class="sr-progress-panel neu-inset">
+            <!-- 顶部：进度条 + 百分比 -->
+            <div class="sr-progress-top">
+              <div class="sr-progress-bar-wrap">
+                <div class="sr-progress-bar" :style="{ width: organizeProgressPercent + '%' }"></div>
+              </div>
+              <span class="sr-progress-percent">{{ organizeProgressPercent }}%</span>
+            </div>
+            <!-- 中部：计数统计 -->
+            <div class="sr-progress-stats">
+              <span class="sr-stat-text">
+                {{ organizeProgressIndex }} / {{ organizeProgressTotal }}
+              </span>
+              <span class="sr-stat-badge sr-stat-success">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="20 6 9 17 4 12" /></svg>
+                {{ organizeProgressSuccess }}
+              </span>
+              <span v-if="organizeProgressFailed > 0" class="sr-stat-badge sr-stat-fail">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><line x1="18" y1="6" x2="6" y2="18" /><line x1="6" y1="6" x2="18" y2="18" /></svg>
+                {{ organizeProgressFailed }}
+              </span>
+              <span v-if="organizeExecuting && organizeProgressName" class="sr-stat-current">
+                正在整理: {{ organizeProgressName }}
+              </span>
+            </div>
+          </div>
+
           <div v-if="organizeExecError" class="sr-footer-msg sr-footer-error">{{ organizeExecError }}</div>
           <div v-if="organizeExecSuccess" class="sr-footer-msg sr-footer-success">{{ organizeExecSuccess }}</div>
           <button class="sr-btn-organize" :disabled="organizeExecuting || !!organizeExecSuccess" @click="executeOrganize">
@@ -773,12 +801,26 @@ const manualMediaType = ref<'movie' | 'tv'>('movie')
 const manualLoading = ref(false)
 const manualError = ref('')
 const manualOverride = ref(false)
+// 流式整理进度（SSE 实时推送）
+const organizeProgressTotal = ref(0)          // 总文件数（文件夹会展开为内部真实文件数）
+const organizeProgressIndex = ref(0)          // 当前完成数
+const organizeProgressName = ref('')          // 当前正在整理的文件名
+const organizeProgressSuccess = ref(0)        // 成功计数
+const organizeProgressFailed = ref(0)         // 失败计数
+const organizeProgressDone = ref(false)       // 是否全部完成
+let organizeEventSource: EventSource | null = null
 
 // ==================== 计算属性 ====================
 
 // 分页相关
 const currentPage = ref(1)
 const pageSize = ref(30)
+
+/** 整理进度百分比（0-100） */
+const organizeProgressPercent = computed(() => {
+  if (organizeProgressTotal.value === 0) return 0
+  return Math.round((organizeProgressIndex.value / organizeProgressTotal.value) * 100)
+})
 
 /** 筛选后的所有文件列表（不分页） */
 const allFilteredFiles = computed(() => {
@@ -1095,6 +1137,32 @@ async function refreshCurrentView() {
   } else {
     const last = crumbs[crumbs.length - 1]
     await loadSubDirFiles(last.sourceId, last.parentId)
+  }
+}
+
+/**
+ * 刷新当前视图的文件列表数据（保持 fileFilter、面包屑、页码不变）
+ * 用于整理完成后就地刷新，避免 loadFiles 重置标签导致用户需重新切换。
+ */
+async function reloadCurrentFiles() {
+  try {
+    const crumbs = currentDirBreadcrumbs.value
+    if (crumbs.length <= 1) {
+      // 根目录：重新加载所有分享的根目录文件
+      const res = await shareApi.getAllFiles()
+      if (res.code === 0 && res.data) {
+        allFiles.value = res.data.files || []
+      }
+    } else {
+      // 子目录：重新加载当前子目录文件
+      const last = crumbs[crumbs.length - 1]
+      const res = await shareApi.listFiles(last.sourceId, last.parentId)
+      if (res.code === 0 && res.data) {
+        allFiles.value = res.data.items || []
+      }
+    }
+  } catch (e) {
+    console.error('刷新文件列表失败:', e)
   }
 }
 
@@ -1455,6 +1523,17 @@ function closeRecognizeModal() {
   manualLoading.value = false
   manualOverride.value = false
   organizeExecuting.value = false
+  // 重置进度状态并关闭 SSE 连接
+  organizeProgressTotal.value = 0
+  organizeProgressIndex.value = 0
+  organizeProgressName.value = ''
+  organizeProgressSuccess.value = 0
+  organizeProgressFailed.value = 0
+  organizeProgressDone.value = false
+  if (organizeEventSource) {
+    organizeEventSource.close()
+    organizeEventSource = null
+  }
 }
 
 async function manualRecognizeShare() {
@@ -1491,13 +1570,20 @@ async function manualRecognizeShare() {
   }
 }
 
-/** 执行整理（点击"开始整理"按钮） */
+/** 执行整理（点击"开始整理"按钮）—— 使用 SSE 流式推送实时进度 */
 async function executeOrganize() {
   if (pendingOrganizeIds.value.length === 0) return
 
+  // 重置执行状态与进度
   organizeExecuting.value = true
   organizeExecError.value = ''
   organizeExecSuccess.value = ''
+  organizeProgressTotal.value = pendingOrganizeIds.value.length
+  organizeProgressIndex.value = 0
+  organizeProgressName.value = ''
+  organizeProgressSuccess.value = 0
+  organizeProgressFailed.value = 0
+  organizeProgressDone.value = false
 
   try {
     // 按 source_id 分组批量调用
@@ -1512,43 +1598,108 @@ async function executeOrganize() {
     let failCount = 0
 
     for (const [sourceId, fileIds] of groups) {
-      try {
-        if (manualOverride.value && pendingOrganizeIds.value.length === 1) {
-          const tmdbId = Number(manualTmdbId.value)
+      // 手动纠错（单文件）：走 axios 调用 manualOrganizeFile，不走 SSE
+      if (manualOverride.value && pendingOrganizeIds.value.length === 1) {
+        organizeProgressName.value = recognizeItem.value?.name || fileIds[0]
+        const tmdbId = Number(manualTmdbId.value)
+        try {
           const res = await shareApi.manualOrganizeFile(sourceId, fileIds[0], tmdbId, manualMediaType.value)
-          if (res.code === 0) {
-            successCount += 1
-          } else {
-            failCount += 1
-          }
-          continue
-        }
-
-        const res = await shareApi.organizeBatch(sourceId, fileIds)
-        if (res.code === 0) {
-          successCount += 1
-        } else {
+          const ok = res.code === 0
+          if (ok) successCount += 1
+          else failCount += 1
+        } catch (e: any) {
           failCount += 1
         }
-      } catch {
-        failCount += 1
+        organizeProgressIndex.value += 1
+        organizeProgressSuccess.value = successCount
+        organizeProgressFailed.value = failCount
+        continue
       }
+
+      // 批量整理：用 EventSource 监听 SSE 流式进度
+      await runOrganizeStream(sourceId, fileIds, (evt) => {
+        if (evt.type === 'progress') {
+          // 用后端推送的 total/index（文件夹已展开为真实文件数），覆盖前端初始值
+          organizeProgressTotal.value = evt.total
+          organizeProgressIndex.value = evt.index
+          organizeProgressName.value = evt.name
+          if (evt.success) successCount += 1
+          else failCount += 1
+          organizeProgressSuccess.value = successCount
+          organizeProgressFailed.value = failCount
+        }
+      })
     }
 
+    organizeProgressDone.value = true
     if (failCount === 0) {
       organizeExecSuccess.value = `${successCount} 个文件整理完成`
     } else {
       organizeExecError.value = `${successCount} 成功，${failCount} 失败`
     }
 
-    // 刷新文件列表
+    // 刷新文件列表（保持当前标签/面包屑/页码，避免整理后被切回"全部"）
     clearSelection()
-    loadFiles()
+    await reloadCurrentFiles()
   } catch (e: any) {
     organizeExecError.value = e.message || '整理失败'
   } finally {
     organizeExecuting.value = false
+    // 关闭 EventSource 连接
+    if (organizeEventSource) {
+      organizeEventSource.close()
+      organizeEventSource = null
+    }
   }
+}
+
+/**
+ * 用 EventSource 调用 SSE 流式整理端点，Promise 包装便于 await
+ * @param sourceId 分享来源 ID
+ * @param fileIds 文件 ID 列表
+ * @param onProgress 收到 progress 事件时的回调
+ */
+function runOrganizeStream(
+  sourceId: number,
+  fileIds: string[],
+  onProgress: (evt: any) => void
+): Promise<void> {
+  return new Promise((resolve, reject) => {
+    // 关闭旧的连接（如有）
+    if (organizeEventSource) {
+      organizeEventSource.close()
+    }
+    const es = shareApi.organizeStream(sourceId, fileIds)
+    organizeEventSource = es
+
+    es.onmessage = (event) => {
+      try {
+        const data = JSON.parse(event.data)
+        if (data.type === 'progress') {
+          onProgress(data)
+        } else if (data.type === 'done') {
+          es.close()
+          organizeEventSource = null
+          resolve()
+        } else if (data.type === 'error') {
+          es.close()
+          organizeEventSource = null
+          reject(new Error(data.message || '整理失败'))
+        }
+      } catch (err) {
+        // JSON 解析失败，忽略此条消息
+        console.error('SSE 消息解析失败:', err)
+      }
+    }
+    es.onerror = () => {
+      // 浏览器自动重连可能会触发 onerror，若已完成则忽略
+      if (organizeProgressDone.value || es.readyState === EventSource.CLOSED) {
+        es.close()
+        organizeEventSource = null
+        resolve()
+      }
+    }
+  })
 }
 
 // ==================== 工具函数 ====================
@@ -3140,6 +3291,113 @@ function formatTime(ts: string | number): string {
   border-top-color: var(--text-inverse);
   border-radius: 50%;
   animation: spin 0.6s linear infinite;
+}
+
+/* ==================== 整理进度面板样式 ==================== */
+
+.sr-progress-panel {
+  padding: 14px 16px;
+  border-radius: var(--radius-md);
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+/* 进度条 + 百分比 */
+.sr-progress-top {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.sr-progress-bar-wrap {
+  flex: 1;
+  height: 8px;
+  background: var(--bg-secondary, rgba(0, 0, 0, 0.06));
+  border-radius: 4px;
+  overflow: hidden;
+}
+
+.sr-progress-bar {
+  height: 100%;
+  background: linear-gradient(90deg, var(--accent), var(--accent-hover, var(--accent)));
+  border-radius: 4px;
+  transition: width 0.4s ease;
+  position: relative;
+}
+
+/* 进度条流光动画（整理中才显示） */
+.sr-progress-bar::after {
+  content: '';
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  background: linear-gradient(90deg, transparent, rgba(255, 255, 255, 0.4), transparent);
+  animation: sr-progress-shine 1.5s infinite;
+}
+
+@keyframes sr-progress-shine {
+  0% { transform: translateX(-100%); }
+  100% { transform: translateX(100%); }
+}
+
+.sr-progress-percent {
+  font-size: 13px;
+  font-weight: 700;
+  color: var(--accent);
+  min-width: 38px;
+  text-align: right;
+}
+
+/* 计数统计行 */
+.sr-progress-stats {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.sr-stat-text {
+  font-size: 12px;
+  color: var(--text-secondary);
+  font-weight: 600;
+}
+
+.sr-stat-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 8px;
+  border-radius: 10px;
+  font-size: 11px;
+  font-weight: 600;
+}
+
+.sr-stat-badge svg {
+  width: 12px;
+  height: 12px;
+}
+
+.sr-stat-success {
+  background: var(--success-bg);
+  color: var(--success);
+}
+
+.sr-stat-fail {
+  background: var(--danger-bg);
+  color: var(--danger);
+}
+
+.sr-stat-current {
+  font-size: 11px;
+  color: var(--text-secondary);
+  margin-left: auto;
+  max-width: 180px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 /* ==================== 属性信息弹窗样式（props- 前缀，独立不冲突） ==================== */
