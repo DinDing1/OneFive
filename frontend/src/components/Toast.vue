@@ -55,7 +55,7 @@ defineExpose({ show })
   align-items: center;
   gap: 8px;
   padding: 12px 20px;
-  color: var(--text-inverse);  /* 暗底亮字，保持高对比 */
+  color: var(--text-primary);
   border-radius: var(--radius-md);
   font-size: 14px;
   font-weight: 500;
