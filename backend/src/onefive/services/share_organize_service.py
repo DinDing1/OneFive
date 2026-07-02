@@ -14,7 +14,7 @@ import asyncio
 from typing import Dict, Any, Optional, List, Callable
 
 from .share_service import get_share_service
-from .file_info_service import extract_key_info, extract_tech_info, VIDEO_EXTENSIONS
+from .file_info_service import extract_key_info, extract_tech_info, get_video_extensions
 from .classify_service import classify_media
 from .tmdb_service import get_tmdb_service
 from .rename_service import generate_movie_path, generate_tv_path
@@ -105,7 +105,7 @@ class ShareOrganizeService:
 
     def _is_video_file(self, filename: str) -> bool:
         """判断是否为视频文件（复用 file_info_service 的扩展名集合，保持一致）"""
-        return any(filename.lower().endswith(ext) for ext in VIDEO_EXTENSIONS)
+        return any(filename.lower().endswith(ext) for ext in get_video_extensions())
 
     # 季集标记正则：S01E01、第x集、EP01、E01 等（模块级常量，避免重复编译）
     # 第3条正则加前导边界，避免 MOVIE01、SAMPLE01、FILE01 等被误判为剧集标记

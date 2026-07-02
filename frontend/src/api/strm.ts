@@ -4,6 +4,8 @@ import api from './index'
 export interface StrmSettings {
   direct_link_base_url: string
   output_path: string
+  cloud_output_path: string
+  video_extensions: string
 }
 
 /** STRM 生成结果 */
@@ -31,8 +33,13 @@ export const strmApi = {
     return api.get('/strm/accessible-paths')
   },
 
-  /** 生成 STRM 文件 */
+  /** 生成分享 STRM 文件 */
   generate(): Promise<any> {
     return api.post('/strm/generate')
+  },
+
+  /** 生成云盘 STRM 文件 */
+  generateCloud(): Promise<any> {
+    return api.post('/strm/generate-cloud')
   }
 }

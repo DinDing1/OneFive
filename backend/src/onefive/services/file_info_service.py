@@ -26,9 +26,58 @@ SEASON_ONLY_PATTERNS = [
     re.compile(r'第(\d{1,2})季'),
 ]
 
-# 视频文件扩展名
+# 视频文件扩展名（默认值，可被数据库配置覆盖）
 VIDEO_EXTENSIONS = {'.mp4', '.mkv', '.avi', '.mov', '.wmv', '.flv', '.webm', '.m4v', '.ts', '.m2ts'}
 SUBTITLE_EXTENSIONS = {'.srt', '.ass', '.ssa', '.sub', '.vtt'}
+
+# 模块级缓存：避免每次调用都读数据库
+_video_extensions_cache: Optional[set] = None
+
+
+def get_video_extensions() -> set:
+    """获取视频扩展名集合（优先从数据库读取，回退到默认常量）
+
+    数据库配置格式：逗号分隔的字符串，如 ".mp4,.mkv,.avi"
+    用户输入可以带或不带点前缀，内部统一补齐。
+
+    Returns:
+        扩展名集合，如 {'.mp4', '.mkv', ...}
+    """
+    global _video_extensions_cache
+    if _video_extensions_cache is not None:
+        return _video_extensions_cache
+
+    try:
+        from .config_service import get_config_service
+        raw = get_config_service().get("video_extensions")
+        if raw:
+            exts = set()
+            for ext in raw.split(","):
+                ext = ext.strip().lower()
+                if not ext:
+                    continue
+                # 统一补点前缀
+                if not ext.startswith("."):
+                    ext = "." + ext
+                exts.add(ext)
+            if exts:
+                _video_extensions_cache = exts
+                return exts
+    except Exception:
+        pass
+
+    # 回退到默认常量
+    _video_extensions_cache = VIDEO_EXTENSIONS
+    return _video_extensions_cache
+
+
+def invalidate_video_extensions_cache():
+    """使视频扩展名缓存失效
+
+    在 STRM 设置保存后调用，确保后续读取使用新配置。
+    """
+    global _video_extensions_cache
+    _video_extensions_cache = None
 
 # ==================== 发布组列表 ====================
 

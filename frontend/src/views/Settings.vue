@@ -449,27 +449,45 @@
         <svg class="chevron" :class="{ open: expanded.strm }" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg>
       </div>
       <div class="card-body" v-show="expanded.strm">
+        <!-- 视频扩展名 -->
+        <div class="field">
+          <label>视频扩展名</label>
+          <input type="text" v-model="strmVideoExtensions" placeholder=".mp4,.mkv,.avi,.mov,.wmv,.flv,.webm,.m4v,.ts,.m2ts" />
+          <p class="strm-hint">用于云盘 STRM 生成和整理识别的视频文件过滤，逗号分隔。</p>
+        </div>
+
         <!-- 直链基地址 -->
         <div class="field">
           <label>直链服务基地址</label>
           <input type="text" v-model="strmBaseUrl" placeholder="http://127.0.0.1:11581" />
         </div>
 
-        <!-- STRM 输出路径（来自飞牛授权目录） -->
-        <div class="field">
-          <label>分享 STRM 存储路径</label>
-          <select v-model="strmOutputPath" :disabled="strmAccessiblePaths.length === 0">
-            <option value="">请选择授权目录</option>
-            <option v-for="p in strmAccessiblePaths" :key="p" :value="p">{{ p }}</option>
-          </select>
-          <p v-if="strmAccessiblePaths.length === 0" class="strm-hint">
-            请先在飞牛应用设置中给壹伍授权一个媒体库目录，保存后点击下方"刷新授权目录"。
-          </p>
+        <!-- 分享 / 云盘 STRM 存储路径（两列布局） -->
+        <div class="strm-paths-grid">
+          <div class="field">
+            <label>分享 STRM 存储路径</label>
+            <select v-model="strmOutputPath" :disabled="strmAccessiblePaths.length === 0">
+              <option value="">请选择授权目录</option>
+              <option v-for="p in strmAccessiblePaths" :key="p" :value="p">{{ p }}</option>
+            </select>
+          </div>
+          <div class="field">
+            <label>云盘 STRM 存储路径</label>
+            <select v-model="strmCloudOutputPath" :disabled="strmAccessiblePaths.length === 0">
+              <option value="">请选择授权目录</option>
+              <option v-for="p in strmAccessiblePaths" :key="p" :value="p">{{ p }}</option>
+            </select>
+          </div>
         </div>
+        <p v-if="strmAccessiblePaths.length === 0" class="strm-hint">
+          请先在飞牛应用设置中给壹伍授权一个媒体库目录，保存后点击下方"刷新授权目录"。
+        </p>
+        <p class="strm-hint">基于云盘媒体库目录（整理设置中的媒体库路径）生成 STRM，目录结构与云盘一致。</p>
 
-        <!-- 生成结果 -->
+        <!-- 分享 STRM 生成结果 -->
         <div class="strm-result" v-if="strmResult">
           <div class="strm-result-summary">
+            <span class="tag">分享 STRM</span>
             <span class="tag">总数 {{ strmResult.total }}</span>
             <span class="tag" style="background: var(--success-bg); color: var(--success);">成功 {{ strmResult.created }}</span>
             <span class="tag" v-if="strmResult.failed > 0" style="background: var(--danger-bg); color: var(--danger);">失败 {{ strmResult.failed }}</span>
@@ -483,17 +501,56 @@
           </div>
         </div>
 
+        <!-- 云盘 STRM 生成结果 -->
+        <div class="strm-result" v-if="strmCloudResult">
+          <div class="strm-result-summary">
+            <span class="tag">云盘 STRM</span>
+            <span class="tag">视频 {{ strmCloudResult.total }}</span>
+            <span class="tag" style="background: var(--success-bg); color: var(--success);">成功 {{ strmCloudResult.created }}</span>
+            <span class="tag" v-if="strmCloudResult.failed > 0" style="background: var(--danger-bg); color: var(--danger);">失败 {{ strmCloudResult.failed }}</span>
+          </div>
+          <div class="strm-error-list" v-if="strmCloudResult.errors && strmCloudResult.errors.length > 0">
+            <div v-for="(err, i) in strmCloudResult.errors.slice(0, 10)" :key="i" class="strm-error-item">
+              <span class="strm-error-name">{{ err.name }}</span>
+              <span class="strm-error-msg">{{ err.error }}</span>
+            </div>
+            <p v-if="strmCloudResult.errors.length > 10" class="strm-hint">仅展示前 10 条错误</p>
+          </div>
+        </div>
+
         <div class="card-actions">
           <button class="btn-ghost-sm" @click.stop="loadStrmAccessiblePaths">刷新授权目录</button>
           <button class="btn-ghost-sm" @click.stop="saveStrmSettings" :disabled="strmSaving">
             {{ strmSaving ? '...' : '保存' }}
           </button>
           <button class="btn-save" @click.stop="generateStrmFiles" :disabled="strmGenerating || !strmOutputPath">
-            {{ strmGenerating ? '生成中...' : '生成 STRM' }}
+            {{ strmGenerating ? '生成中...' : '分享 STRM' }}
+          </button>
+          <button class="btn-save" @click.stop="generateCloudStrmFiles" :disabled="strmCloudGenerating || !strmCloudOutputPath">
+            {{ strmCloudGenerating ? '生成中...' : '云盘 STRM' }}
           </button>
         </div>
       </div>
     </section>
+
+    <!-- STRM 确认对话框 -->
+    <div v-if="strmConfirmVisible" class="glass-overlay" @click.self="strmConfirmVisible = false">
+      <div class="strm-confirm-modal glass-solid">
+        <div class="strm-confirm-icon">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/>
+            <line x1="12" y1="9" x2="12" y2="13"/>
+            <line x1="12" y1="17" x2="12.01" y2="17"/>
+          </svg>
+        </div>
+        <h3 class="strm-confirm-title">{{ strmConfirmTitle }}</h3>
+        <p class="strm-confirm-msg">{{ strmConfirmMessage }}</p>
+        <div class="strm-confirm-footer">
+          <button class="btn-secondary" @click="strmConfirmVisible = false">取消</button>
+          <button class="btn-save" @click="executeStrmConfirm">确认</button>
+        </div>
+      </div>
+    </div>
 
     <!-- 目录选择器弹窗 -->
     <div v-if="showPathPicker" class="glass-overlay" @click.self="showPathPicker = false">
@@ -536,6 +593,7 @@ import { organizeApi } from '@/api/organize'
 import { notificationApi } from '@/api/notification'
 import { directLinkApi } from '@/api/directLink'
 import { strmApi } from '@/api/strm'
+import { showToast } from '@/composables/useToast'
 import type { FileItem } from '@/api/files'
 
 // 折叠状态
@@ -606,10 +664,20 @@ const dlSaving = ref(false)
 // STRM 配置
 const strmBaseUrl = ref('http://127.0.0.1:11581')
 const strmOutputPath = ref('')
+const strmCloudOutputPath = ref('')
+const strmVideoExtensions = ref('')
 const strmAccessiblePaths = ref<string[]>([])
 const strmSaving = ref(false)
 const strmGenerating = ref(false)
+const strmCloudGenerating = ref(false)
 const strmResult = ref<any>(null)
+const strmCloudResult = ref<any>(null)
+
+// STRM 确认对话框（替代原生 confirm）
+const strmConfirmVisible = ref(false)
+const strmConfirmTitle = ref('')
+const strmConfirmMessage = ref('')
+const strmConfirmAction = ref<() => void>(() => {})
 
 const showPathPicker = ref(false)
 const pickerLoading = ref(false)
@@ -664,7 +732,10 @@ async function saveOpenApiSettings() {
   try {
     const res = await filesApi.updateOpenApiSettings(openApiEnabled.value, selectedAppId.value)
     if (res.code === 0 && res.data) tokenValid.value = res.data.token_valid
-  } catch (e) { console.error('保存 Open API 设置失败:', e) }
+    showToast('配置已保存', 'success')
+  } catch (e: any) {
+    showToast(e.message || '保存失败', 'error')
+  }
   finally { saving.value = false }
 }
 
@@ -689,7 +760,10 @@ async function saveTmdbSettings() {
   tmdbSaving.value = true
   try {
     await organizeApi.updateSettings({ tmdb_api_key: tmdbApiKey.value, tmdb_api_url: tmdbApiUrl.value, tmdb_language: tmdbLanguage.value })
-  } catch (e) { console.error('保存失败:', e) }
+    showToast('配置已保存', 'success')
+  } catch (e: any) {
+    showToast(e.message || '保存失败', 'error')
+  }
   finally { tmdbSaving.value = false }
 }
 
@@ -707,7 +781,10 @@ async function saveMediaSettings() {
       classify_rules: JSON.stringify(rules),
       release_groups: customGroupsList.value.join('\n'),
     })
-  } catch (e) { console.error('保存失败:', e) }
+    showToast('配置已保存', 'success')
+  } catch (e: any) {
+    showToast(e.message || '保存失败', 'error')
+  }
   finally { mediaSaving.value = false }
 }
 
@@ -840,7 +917,10 @@ async function saveNotifySettings() {
       tg_admin_ids: tgAdminIds.value,
     })
     await loadNotifySettings()
-  } catch (e) { console.error('保存通知配置失败:', e) }
+    showToast('配置已保存', 'success')
+  } catch (e: any) {
+    showToast(e.message || '保存失败', 'error')
+  }
   finally { notifySaving.value = false }
 }
 
@@ -911,9 +991,12 @@ async function saveDirectLinkSettings() {
     const res = await directLinkApi.saveSettings({ enabled: dlEnabled.value, port: dlPort.value })
     if (res.code === 0) {
       dlRunning.value = res.data?.running ?? dlRunning.value
+      showToast('配置已保存', 'success')
+    } else {
+      showToast(res.message || '保存失败', 'error')
     }
-  } catch (e) {
-    console.error('保存直链设置失败:', e)
+  } catch (e: any) {
+    showToast(e.message || '保存失败', 'error')
   } finally {
     dlSaving.value = false
   }
@@ -952,6 +1035,8 @@ async function loadStrmSettings() {
     if (res.code === 0 && res.data) {
       strmBaseUrl.value = res.data.direct_link_base_url || 'http://127.0.0.1:11581'
       strmOutputPath.value = res.data.output_path || ''
+      strmCloudOutputPath.value = res.data.cloud_output_path || ''
+      strmVideoExtensions.value = res.data.video_extensions || ''
     }
   } catch (e) {
     console.error('加载 STRM 配置失败:', e)
@@ -979,39 +1064,90 @@ async function saveStrmSettings() {
     const res = await strmApi.saveSettings({
       direct_link_base_url: strmBaseUrl.value,
       output_path: strmOutputPath.value,
+      cloud_output_path: strmCloudOutputPath.value,
+      video_extensions: strmVideoExtensions.value,
     })
     if (res.code === 0) {
       strmResult.value = null
+      strmCloudResult.value = null
+      showToast('配置已保存', 'success')
     } else {
-      alert(res.message || '保存失败')
+      showToast(res.message || '保存失败', 'error')
     }
   } catch (e: any) {
-    alert(e.message || '保存失败')
+    showToast(e.message || '保存失败', 'error')
   } finally {
     strmSaving.value = false
   }
 }
 
-// 生成 STRM 文件
+// 显示 STRM 确认对话框
+function showStrmConfirm(title: string, message: string, action: () => void) {
+  strmConfirmTitle.value = title
+  strmConfirmMessage.value = message
+  strmConfirmAction.value = action
+  strmConfirmVisible.value = true
+}
+
+// 执行确认操作
+function executeStrmConfirm() {
+  strmConfirmVisible.value = false
+  strmConfirmAction.value()
+}
+
+// 生成分享 STRM 文件
 async function generateStrmFiles() {
   if (strmGenerating.value) return
-  // 二次确认，避免误操作
-  if (!confirm(`确认为所有已整理分享文件生成 STRM 到指定目录？\n\n输出目录：${strmOutputPath.value || '(未配置)'}`)) {
-    return
-  }
+  showStrmConfirm(
+    '生成分享 STRM',
+    `确认为所有已整理分享文件生成 STRM 到指定目录？\n\n输出目录：${strmOutputPath.value || '(未配置)'}`,
+    doGenerateStrmFiles
+  )
+}
+
+async function doGenerateStrmFiles() {
   strmGenerating.value = true
   strmResult.value = null
   try {
     const res = await strmApi.generate()
     if (res.code === 0 && res.data) {
       strmResult.value = res.data
+      showToast(`生成完成：成功 ${res.data.created}/${res.data.total}`, 'success')
     } else {
-      alert(res.message || '生成失败')
+      showToast(res.message || '生成失败', 'error')
     }
   } catch (e: any) {
-    alert(e.message || '生成失败')
+    showToast(e.message || '生成失败', 'error')
   } finally {
     strmGenerating.value = false
+  }
+}
+
+// 生成云盘 STRM 文件
+async function generateCloudStrmFiles() {
+  if (strmCloudGenerating.value) return
+  showStrmConfirm(
+    '生成云盘 STRM',
+    `确认为云盘媒体库目录生成 STRM 到指定目录？\n\n输出目录：${strmCloudOutputPath.value || '(未配置)'}`,
+    doGenerateCloudStrmFiles
+  )
+}
+
+async function doGenerateCloudStrmFiles() {
+  strmCloudGenerating.value = true
+  strmCloudResult.value = null
+  try {
+    const res = await strmApi.generateCloud()
+    if (res.code === 0 && res.data) {
+      strmCloudResult.value = res.data
+      showToast(`生成完成：成功 ${res.data.created}/${res.data.total}`, 'success')
+    } else {
+      showToast(res.message || '生成失败', 'error')
+    }
+  } catch (e: any) {
+    showToast(e.message || '生成失败', 'error')
+  } finally {
+    strmCloudGenerating.value = false
   }
 }
 </script>
@@ -1041,6 +1177,69 @@ async function generateStrmFiles() {
 .strm-icon { background: var(--purple-bg); color: var(--purple); }
 
 /* ==================== STRM 卡片专属样式 ==================== */
+
+/* 存储路径两列布局 */
+.strm-paths-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 16px;
+}
+
+/* 确认对话框 */
+.strm-confirm-modal {
+  width: 90%;
+  max-width: 380px;
+  border-radius: var(--radius-lg);
+  padding: 32px 24px 20px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+}
+
+.strm-confirm-icon {
+  width: 56px;
+  height: 56px;
+  border-radius: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--warning-bg);
+  color: var(--warning);
+  margin-bottom: 16px;
+}
+
+.strm-confirm-icon svg {
+  width: 28px;
+  height: 28px;
+}
+
+.strm-confirm-title {
+  font-size: 16px;
+  font-weight: 600;
+  color: var(--text-primary);
+  text-align: center;
+  margin-bottom: 8px;
+}
+
+.strm-confirm-msg {
+  font-size: 14px;
+  color: var(--text-secondary);
+  line-height: 1.6;
+  text-align: center;
+  white-space: pre-line;
+  margin-bottom: 24px;
+}
+
+.strm-confirm-footer {
+  display: flex;
+  gap: 12px;
+  width: 100%;
+}
+
+.strm-confirm-footer button {
+  flex: 1;
+}
+
 .strm-hint {
   margin-top: 6px;
   font-size: 11px;
@@ -1221,7 +1420,10 @@ async function generateStrmFiles() {
 .field-row label { margin-bottom: 0; }
 
 .field-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
-@media (max-width: 768px) { .field-grid { grid-template-columns: 1fr; } }
+@media (max-width: 768px) {
+  .field-grid { grid-template-columns: 1fr; }
+  .strm-paths-grid { grid-template-columns: 1fr; }
+}
 
 .mono-input { font-family: var(--font-mono) !important; font-size: 12px !important; }
 

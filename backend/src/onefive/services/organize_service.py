@@ -14,7 +14,7 @@ import re
 import asyncio
 from typing import Dict, Any, Optional, List
 from .tmdb_service import get_tmdb_service
-from .file_info_service import extract_key_info, extract_tech_info, VIDEO_EXTENSIONS
+from .file_info_service import extract_key_info, extract_tech_info, get_video_extensions
 from .classify_service import classify_media
 from .rename_service import generate_target_path
 from .file_service import get_file_service
@@ -26,9 +26,10 @@ logger = get_logger(__name__)
 
 def _find_first_video_file(file_names: List[str]) -> Optional[str]:
     """在文件列表中找到第一个视频文件"""
+    video_exts = get_video_extensions()
     for name in file_names:
         ext = '.' + name.rsplit('.', 1)[-1].lower() if '.' in name else ''
-        if ext in VIDEO_EXTENSIONS:
+        if ext in video_exts:
             return name
     return None
 
@@ -533,7 +534,8 @@ class OrganizeService:
 
     def _move_videos_to_subdir(self, parent_cid: int, sub_cid: int):
         """把父目录下的视频文件移动到子目录中"""
-        from .file_info_service import VIDEO_EXTENSIONS
+        from .file_info_service import get_video_extensions
+        video_exts = get_video_extensions()
         try:
             result = self.file_service.list_files(parent_cid, limit=200)
             items = result.get("items", [])
@@ -543,7 +545,7 @@ class OrganizeService:
                     continue
                 name = item.get("name", "")
                 ext = '.' + name.rsplit('.', 1)[-1].lower() if '.' in name else ''
-                if ext in VIDEO_EXTENSIONS:
+                if ext in video_exts:
                     video_ids.append(str(item["file_id"]))
 
             if video_ids:
@@ -558,8 +560,10 @@ class OrganizeService:
         Returns:
             {"files": [...], "total_size": int}
         """
-        from .file_info_service import extract_key_info, extract_tech_info, VIDEO_EXTENSIONS
+        from .file_info_service import extract_key_info, extract_tech_info, get_video_extensions
         from .rename_service import generate_target_path
+
+        video_exts = get_video_extensions()
 
         try:
             result = self.file_service.list_files(folder_cid, limit=200)
@@ -585,7 +589,7 @@ class OrganizeService:
             file_id = item.get("file_id", "")
             ext = '.' + filename.rsplit('.', 1)[-1].lower() if '.' in filename else ''
 
-            if ext not in VIDEO_EXTENSIONS:
+            if ext not in video_exts:
                 continue
 
             # 累加文件大小
