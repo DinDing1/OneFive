@@ -277,19 +277,44 @@ class ShareService:
         return True
 
     def update_file_category(self, source_id: int, file_id: str, category: str) -> bool:
-        """更新单个文件的分类路径
+        """更新文件/目录的分类路径
 
-        Args:
-            source_id: 分享来源 ID
-            file_id: 文件 ID
-            category: 新的分类路径（如 电影/国产电影）
+        对于文件：直接更新该文件的分类
+        对于目录：递归更新所有子文件的分类（目录本身不存 category）
         """
-        self.db.execute(
-            """UPDATE share_file SET
-               category = ?, updated_at = datetime('now', 'localtime')
-               WHERE source_id = ? AND file_id = ? AND is_dir = 0""",
-            (category, source_id, file_id)
+        # 查询目标是否为目录
+        row = self.db.fetchone(
+            "SELECT is_dir FROM share_file WHERE source_id = ? AND file_id = ?",
+            (source_id, file_id)
         )
+        if not row:
+            return False
+
+        if row["is_dir"]:
+            # 目录：递归更新所有子文件的分类
+            self.db.execute(
+                """WITH RECURSIVE children(file_id) AS (
+                    SELECT file_id FROM share_file
+                    WHERE source_id = ? AND parent_id = ?
+                    UNION ALL
+                    SELECT f.file_id FROM share_file f
+                    JOIN children c ON f.parent_id = c.file_id
+                    WHERE f.source_id = ?
+                )
+                UPDATE share_file SET
+                   category = ?, updated_at = datetime('now', 'localtime')
+                   WHERE source_id = ? AND file_id IN (SELECT file_id FROM children)
+                     AND is_dir = 0""",
+                (source_id, file_id, source_id, category, source_id)
+            )
+        else:
+            # 文件：直接更新
+            self.db.execute(
+                """UPDATE share_file SET
+                   category = ?, updated_at = datetime('now', 'localtime')
+                   WHERE source_id = ? AND file_id = ? AND is_dir = 0""",
+                (category, source_id, file_id)
+            )
         self.db.commit()
         return True
 
