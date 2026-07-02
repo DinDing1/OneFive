@@ -165,7 +165,7 @@ let eventSource: EventSource | null = null
 function startStream() {
   if (eventSource) return
   try {
-    eventSource = new EventSource('/api/logs/stream')
+    eventSource = new EventSource('/app/onefive/api/logs/stream')
     eventSource.onmessage = (event) => {
       try {
         const line = JSON.parse(event.data)

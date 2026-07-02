@@ -47,6 +47,7 @@ start_process() {
 
     # 设置数据目录、Socket 路径和 UI 目录
     export TRIM_PKGVAR="${TRIM_PKGVAR}"
+    export TRIM_APPDEST="${TRIM_APPDEST}"
     export ONEFIVE_SOCKET="${SOCKET_PATH}"
 
     # 运行 Nuitka 编译的二进制文件

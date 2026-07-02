@@ -11,6 +11,7 @@ const appVersion = fs.existsSync(versionFile)
 
 export default defineConfig({
   plugins: [vue()],
+  base: '/app/onefive/',
   resolve: {
     alias: {
       '@': path.resolve(__dirname, './src')
@@ -22,9 +23,10 @@ export default defineConfig({
   server: {
     port: 5173,
     proxy: {
-      '/api': {
+      '/app/onefive/api': {
         target: 'http://localhost:11580',
-        changeOrigin: true
+        changeOrigin: true,
+        rewrite: (path) => path.replace(/^\/app\/onefive/, '')
       }
     }
   },

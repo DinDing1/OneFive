@@ -13,6 +13,7 @@ from typing import List
 
 # ==================== 飞牛环境变量 ====================
 TRIM_PKGVAR = os.environ.get("TRIM_PKGVAR")   # 数据目录
+TRIM_APPDEST = os.environ.get("TRIM_APPDEST")  # 应用安装目录（飞牛环境）
 
 # ==================== 项目根目录 ====================
 # backend/src/onefive/paths.py → 向上 4 级 = d:\OneFive
@@ -98,3 +99,11 @@ def split_accessible_paths(raw: str) -> List[str]:
 # ==================== 服务端口 ====================
 # 仅本地开发使用（飞牛环境走 Unix Socket，无需端口）。
 SERVICE_PORT = int(os.environ.get("ONEFIVE_PORT", "11580"))
+
+# ==================== 前端 UI 目录 ====================
+# 飞牛环境：{TRIM_APPDEST}/ui/（由 cmd/main 启动脚本设置 TRIM_APPDEST）
+# 本地开发：{PROJECT_ROOT}/frontend/dist/（Vite 构建产物）
+if TRIM_APPDEST:
+    UI_DIR = Path(TRIM_APPDEST) / "ui"
+else:
+    UI_DIR = PROJECT_ROOT / "frontend" / "dist"

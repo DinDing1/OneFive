@@ -129,7 +129,7 @@ export const shareApi = {
    */
   organizeStream(sourceId: number, fileIds: string[]): EventSource {
     const fileIdsParam = fileIds.join(',')
-    const url = `/api/share/organize-stream?source_id=${sourceId}&file_ids=${encodeURIComponent(fileIdsParam)}`
+    const url = `/app/onefive/api/share/organize-stream?source_id=${sourceId}&file_ids=${encodeURIComponent(fileIdsParam)}`
     return new EventSource(url)
   },
 

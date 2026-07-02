@@ -28,10 +28,12 @@ except AttributeError:
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, FileResponse
+from fastapi.staticfiles import StaticFiles
+from starlette.middleware.base import BaseHTTPMiddleware
 
 from . import __version__
-from .paths import SERVICE_PORT
+from .paths import SERVICE_PORT, UI_DIR
 from .logger import setup_logging, get_logger
 from .api.auth import router as auth_router
 from .api.config import router as config_router
@@ -101,6 +103,20 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# ==================== 飞牛网关路径重写 ====================
+# 飞牛统一网关不会剥离 gatewayPrefix，请求 /app/onefive/api/xxx 到达后端路径不变。
+# 此中间件将 /app/onefive/api/* 重写为 /api/*，使 API 路由无需修改。
+class GatewayPrefixMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        if request.url.path.startswith("/app/onefive/api/"):
+            # 重写路径：/app/onefive/api/xxx → /api/xxx
+            new_path = request.url.path.replace("/app/onefive/api/", "/api/", 1)
+            request.scope["path"] = new_path
+            request.scope["raw_path"] = new_path.encode("utf-8")
+        return await call_next(request)
+
+app.add_middleware(GatewayPrefixMiddleware)
+
 # 注册路由
 app.include_router(auth_router)
 app.include_router(config_router)
@@ -111,6 +127,40 @@ app.include_router(notification_router)
 app.include_router(direct_link_router)
 app.include_router(share_router)
 app.include_router(strm_router)
+
+# ==================== 前端静态文件 ====================
+# 飞牛网关通过 gatewayPrefix="/app/onefive" 转发请求，
+# 所有 /app/onefive 开头的非 API 请求需要返回前端页面。
+# 静态资源（JS/CSS/图片等）挂载在 /app/onefive/assets，
+# SPA fallback：其他 /app/onefive/* 路径返回 index.html。
+if UI_DIR.exists() and UI_DIR.is_dir():
+    # 挂载静态资源目录（assets/ 下的 JS/CSS/图片等）
+    assets_dir = UI_DIR / "assets"
+    if assets_dir.exists():
+        app.mount("/app/onefive/assets", StaticFiles(directory=str(assets_dir)), name="static_assets")
+
+    @app.get("/app/onefive/{path:path}", tags=["前端"])
+    async def serve_spa(path: str):
+        """SPA fallback：非静态资源路径返回 index.html"""
+        # 尝试匹配 UI 目录下的具体文件（如 favicon.ico、vite.svg 等）
+        file_path = UI_DIR / path
+        if path and file_path.exists() and file_path.is_file():
+            return FileResponse(str(file_path))
+        # SPA fallback：返回 index.html 让前端路由处理
+        index_path = UI_DIR / "index.html"
+        if index_path.exists():
+            return FileResponse(str(index_path))
+        return JSONResponse(status_code=404, content={"detail": "前端页面未找到"})
+
+    @app.get("/app/onefive", tags=["前端"])
+    async def serve_spa_root():
+        """前端入口"""
+        index_path = UI_DIR / "index.html"
+        if index_path.exists():
+            return FileResponse(str(index_path))
+        return JSONResponse(status_code=404, content={"detail": "前端页面未找到"})
+
+    logger.info(f"前端 UI 目录: {UI_DIR}")
 
 
 @app.get("/api/gateway/user", tags=["网关"])
