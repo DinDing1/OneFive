@@ -229,8 +229,10 @@ watch(() => props.visible, (val) => {
 .log-panel {
   width: 100%;
   max-width: 640px;
+  height: 100vh;
   display: flex;
   flex-direction: column;
+  overflow: hidden;
   border-radius: 0;
 }
 
@@ -405,7 +407,8 @@ watch(() => props.visible, (val) => {
 /* 日志表格 */
 .log-table {
   width: 100%;
-  border-collapse: collapse;
+  border-collapse: separate;
+  border-spacing: 0;
   font-size: 12px;
   font-family: var(--font-mono);
 }
