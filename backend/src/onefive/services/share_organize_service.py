@@ -287,43 +287,53 @@ class ShareOrganizeService:
 
         results = []
         success_count = 0
+
+        # 分离子目录和视频文件
+        sub_dirs = []
+        video_files = []
         for f in files:
-            f = dict(f)  # 转换 sqlite3.Row 为 dict
-            fid = f["file_id"]
-            fname = f["name"]
+            f = dict(f)
             if f["is_dir"]:
-                sub = self._organize_directory(
-                    source_id, fid, share_service, tmdb_cache,
-                    inherited_tmdb_id=folder_tmdb_id,
-                    inherited_media_type=folder_media_type,
-                    send_notify=False,
-                    progress_cb=progress_cb
-                )
-                results.append(sub)
-                # 目录整理成功时，按 1 个直接子项计入，避免“成功0、失败1”这种误导统计。
-                if sub.get("success"):
-                    success_count += 1
-                logger.info(
-                    f"[子目录结果] name={fname}, success={sub.get('success')}, "
-                    f"total={sub.get('total')}, organized_count={sub.get('organized_count')}, "
-                    f"failed_count={sub.get('failed_count')}"
-                )
+                sub_dirs.append(f)
             else:
-                result = self._organize_single_file(
-                    source_id, fid, fname, share_service, tmdb_cache, f.get("size", 0),
-                    forced_tmdb_id=folder_tmdb_id,
-                    forced_media_type=folder_media_type
-                )
+                video_files.append(f)
+
+        # 批量整理视频文件（同一部剧只查询一次 TMDB，优化整理速度）
+        if video_files:
+            batch_results = self._organize_batch_files(
+                source_id, video_files, share_service, tmdb_cache,
+                forced_tmdb_id=folder_tmdb_id,
+                forced_media_type=folder_media_type,
+                progress_cb=progress_cb
+            )
+            for result in batch_results:
                 results.append(result)
                 if result.get("success"):
                     success_count += 1
                 else:
                     logger.warning(
-                        f"[子文件失败] name={fname}, file_id={fid}, error={result.get('error')}"
+                        f"[子文件失败] name={result.get('name')}, file_id={result.get('file_id')}, error={result.get('error')}"
                     )
-                # 流式进度回调：每整理完一个子文件就推送进度（子目录不回调，由内部子文件逐个回调）
-                if progress_cb:
-                    progress_cb(fname, result)
+
+        # 递归整理子目录
+        for f in sub_dirs:
+            fid = f["file_id"]
+            fname = f["name"]
+            sub = self._organize_directory(
+                source_id, fid, share_service, tmdb_cache,
+                inherited_tmdb_id=folder_tmdb_id,
+                inherited_media_type=folder_media_type,
+                send_notify=False,
+                progress_cb=progress_cb
+            )
+            results.append(sub)
+            if sub.get("success"):
+                success_count += 1
+            logger.info(
+                f"[子目录结果] name={fname}, success={sub.get('success')}, "
+                f"total={sub.get('total')}, organized_count={sub.get('organized_count')}, "
+                f"failed_count={sub.get('failed_count')}"
+            )
 
         # 标记当前目录为已整理
         share_service.db.execute(
@@ -497,7 +507,8 @@ class ShareOrganizeService:
 
     def _do_recognize(self, name: str, tmdb_cache: Dict,
                       forced_tmdb_id: int = 0,
-                      forced_media_type: str = "") -> Dict[str, Any]:
+                      forced_media_type: str = "",
+                      season_year_cache: Optional[Dict] = None) -> Dict[str, Any]:
         """核心识别逻辑：提取信息 → TMDB 搜索 → 分类 → 生成路径
 
         media_type 由 TMDB 返回结果判定（比文件名解析更准确）。
@@ -574,14 +585,22 @@ class ShareOrganizeService:
         if media_type and title and tech_info:
             season_year = ""
             if media_type == "tv" and season and tmdb_id:
-                try:
-                    season_info = tmdb_service.get_tv_season(int(tmdb_id), int(season))
-                    if season_info:
-                        air_date = season_info.get("air_date", "")
-                        if air_date:
-                            season_year = air_date[:4]
-                except Exception:
-                    pass
+                # 缓存 get_tv_season 结果，避免同一季每集都查询 TMDB API
+                season_cache_key = (int(tmdb_id), int(season))
+                if season_year_cache and season_cache_key in season_year_cache:
+                    season_year = season_year_cache[season_cache_key]
+                else:
+                    try:
+                        season_info = tmdb_service.get_tv_season(int(tmdb_id), int(season))
+                        if season_info:
+                            air_date = season_info.get("air_date", "")
+                            if air_date:
+                                season_year = air_date[:4]
+                    except Exception:
+                        pass
+                    # 缓存结果（即使为空也缓存，避免重复查询）
+                    if season_year_cache is not None:
+                        season_year_cache[season_cache_key] = season_year
 
             if media_type == "movie":
                 path_info = generate_movie_path(title, year, str(tmdb_id), tech_info)
@@ -716,6 +735,218 @@ class ShareOrganizeService:
             return {"success": False, "error": str(e)}
 
     # ==================== 整理（识别 + 写入数据库） ====================
+
+    def _organize_batch_files(self, source_id: int, files: list, share_service,
+                              tmdb_cache: Dict, forced_tmdb_id: int = 0,
+                              forced_media_type: str = "",
+                              progress_cb: Optional[Callable] = None) -> list:
+        """批量整理同目录下的视频文件（优化：同一部剧只查询一次 TMDB）
+
+        核心优化逻辑：
+        1. 第一个视频文件完整识别（_do_recognize），获取 TMDB 详情并缓存
+        2. 后续文件复用缓存的 TMDB 详情，只重新提取季集+技术信息+生成路径
+        3. season_year 也缓存，避免同一季每集都调 get_tv_season API
+
+        相比逐个调用 _organize_single_file，40集剧从40次TMDB查询降到1次。
+        """
+        if not files:
+            return []
+
+        # 季年份缓存（tmdb_id, season → season_year）
+        season_year_cache: Dict[tuple, str] = {}
+        results = []
+        # 已识别的 TMDB 详情（由第一个文件识别后填充，后续文件复用）
+        cached_tmdb_details: Optional[Dict] = None
+        cached_tmdb_cache_key = None
+
+        for i, f in enumerate(files):
+            fid = f["file_id"]
+            fname = f["name"]
+            file_size = f.get("size", 0)
+
+            try:
+                # 第一个文件：完整识别，获取 TMDB 详情
+                # 后续文件：复用已缓存的 TMDB 详情，跳过搜索
+                if i == 0 or cached_tmdb_details is None:
+                    # 完整识别（会查询 TMDB，结果缓存到 tmdb_cache）
+                    r = self._do_recognize(
+                        fname, tmdb_cache,
+                        forced_tmdb_id=forced_tmdb_id,
+                        forced_media_type=forced_media_type,
+                        season_year_cache=season_year_cache
+                    )
+                    # 记住 TMDB 详情的缓存键，后续文件直接取
+                    # 如果有 forced_tmdb_id，缓存键格式固定，后续文件能命中
+                    if forced_tmdb_id:
+                        cached_tmdb_cache_key = ("tmdb", forced_tmdb_id,
+                                                 forced_media_type or r.get("media_type", ""),
+                                                 bool(forced_media_type))
+                    # 缓存 TMDB 详情供后续文件复用
+                    cached_tmdb_details = tmdb_cache.get(cached_tmdb_cache_key) if cached_tmdb_cache_key else None
+                else:
+                    # 复用 TMDB 详情：只提取季集+技术信息，跳过 TMDB 搜索
+                    r = self._recognize_with_cached_tmdb(
+                        fname, cached_tmdb_details, tmdb_cache,
+                        forced_media_type=forced_media_type,
+                        season_year_cache=season_year_cache
+                    )
+
+                # 校验：识别失败不标记为已整理
+                if not r.get("media_type") or not r.get("organized_dir"):
+                    logger.warning(
+                        f"[整理失败] file_id={fid}, name={fname}, "
+                        f"media_type={r.get('media_type')!r}, organized_dir={r.get('organized_dir')!r}"
+                    )
+                    result = {
+                        "success": False, "file_id": fid, "name": fname,
+                        "error": "识别失败：未找到 TMDB 信息",
+                        "title": r.get("title", ""), "media_type": r.get("media_type", ""),
+                        "category": r.get("category", ""), "season": r.get("season"),
+                        "episode": r.get("episode"), "tmdb_id": r.get("tmdb_id", 0),
+                        "rating": r.get("rating", 0), "tech_info": r.get("tech_info", {}),
+                        "poster": r.get("poster", ""), "backdrop": r.get("backdrop", ""),
+                        "overview": r.get("overview", ""), "size": file_size,
+                    }
+                    results.append(result)
+                    if progress_cb:
+                        progress_cb(fname, result)
+                    continue
+
+                # 写入数据库
+                share_service.update_file_organize(source_id, fid, {
+                    "media_type": r["media_type"],
+                    "title": r["title"],
+                    "year": r["year"],
+                    "tmdb_id": r["tmdb_id"],
+                    "category": r["category"],
+                    "organized_dir": r["organized_dir"],
+                    "organized_name": r["organized_name"],
+                })
+
+                logger.info(
+                    f"[整理成功] file_id={fid}, name={fname}, "
+                    f"media_type={r['media_type']}, title={r['title']}, "
+                    f"tmdb_id={r['tmdb_id']}, organized_dir={r['organized_dir']}, "
+                    f"organized_name={r['organized_name']}"
+                )
+
+                result = {
+                    "success": True, "file_id": fid, "name": fname,
+                    "media_type": r["media_type"], "title": r["title"],
+                    "year": r["year"], "category": r["category"],
+                    "season": r["season"], "episode": r["episode"],
+                    "tmdb_id": r["tmdb_id"], "rating": r["rating"],
+                    "tech_info": r["tech_info"], "poster": r["poster"],
+                    "backdrop": r["backdrop"], "overview": r["overview"],
+                    "size": file_size,
+                }
+                results.append(result)
+
+            except Exception as e:
+                logger.error(f"[整理异常] file_id={fid}, name={fname}, error={e}", exc_info=True)
+                result = {"success": False, "error": str(e), "size": file_size, "name": fname, "file_id": fid}
+                results.append(result)
+
+            # 流式进度回调
+            if progress_cb:
+                progress_cb(fname, result)
+
+        return results
+
+    def _recognize_with_cached_tmdb(self, name: str, tmdb_details: Optional[Dict],
+                                     tmdb_cache: Dict, forced_media_type: str = "",
+                                     season_year_cache: Optional[Dict] = None) -> Dict[str, Any]:
+        """用已缓存的 TMDB 详情识别文件（跳过 TMDB 搜索，只提取季集+技术信息+生成路径）
+
+        用于同一目录下批量整理时，第二个及之后的文件复用第一个文件的 TMDB 结果。
+        相比完整 _do_recognize，跳过了：TMDB 搜索、分类计算。
+        """
+        # 从文件名提取基础信息
+        key_info = extract_key_info(name)
+        tech_info = extract_tech_info(name)
+
+        title = key_info.get("title", "")
+        year = key_info.get("year", "")
+        season = key_info.get("season", 0) or 0
+        episode = key_info.get("episode", "")
+        tmdb_id = key_info.get("tmdbId", 0)
+
+        # 复用 TMDB 详情
+        media_type = ""
+        category = ""
+        poster = ""
+        backdrop = ""
+        rating = 0
+        overview = ""
+
+        if tmdb_details:
+            tmdb_service = get_tmdb_service()
+            tmdb_id = tmdb_details.get("id", tmdb_id)
+            tmdb_title = tmdb_service.get_chinese_title(tmdb_details) or tmdb_details.get("title") or tmdb_details.get("name")
+            if tmdb_title:
+                title = tmdb_title
+            release_date = tmdb_details.get("release_date") or tmdb_details.get("first_air_date") or ""
+            if release_date and len(release_date) >= 4:
+                year = release_date[:4]
+            poster_path = tmdb_details.get("poster_path", "")
+            poster = tmdb_service.build_image_url(poster_path, "w500")
+            backdrop_path = tmdb_details.get("backdrop_path", "")
+            backdrop = tmdb_service.build_image_url(backdrop_path, "w780")
+            rating = tmdb_details.get("vote_average", 0)
+            overview = tmdb_details.get("overview", "")
+            if tmdb_details.get("first_air_date"):
+                media_type = "tv"
+            elif tmdb_details.get("release_date"):
+                media_type = "movie"
+            category = classify_media(tmdb_details, media_type)
+
+        # 生成整理后的目录路径和文件名
+        organized_dir = ""
+        organized_name = ""
+        if media_type and title and tech_info:
+            season_year = ""
+            if media_type == "tv" and season and tmdb_id:
+                season_cache_key = (int(tmdb_id), int(season))
+                if season_year_cache and season_cache_key in season_year_cache:
+                    season_year = season_year_cache[season_cache_key]
+                else:
+                    try:
+                        tmdb_service = get_tmdb_service()
+                        season_info = tmdb_service.get_tv_season(int(tmdb_id), int(season))
+                        if season_info:
+                            air_date = season_info.get("air_date", "")
+                            if air_date:
+                                season_year = air_date[:4]
+                    except Exception:
+                        pass
+                    if season_year_cache is not None:
+                        season_year_cache[season_cache_key] = season_year
+
+            if media_type == "movie":
+                path_info = generate_movie_path(title, year, str(tmdb_id), tech_info)
+            else:
+                path_info = generate_tv_path(title, year, str(tmdb_id), tech_info,
+                                            season_year=season_year, season=str(season) if season else "",
+                                            episode=str(episode) if episode else "")
+            organized_dir = path_info.get("dir", "")
+            organized_name = path_info.get("filename", "")
+
+        return {
+            "media_type": media_type,
+            "title": title,
+            "year": year,
+            "season": season,
+            "episode": episode,
+            "tmdb_id": tmdb_id,
+            "category": category,
+            "tech_info": tech_info,
+            "organized_dir": organized_dir,
+            "organized_name": organized_name,
+            "poster": poster,
+            "backdrop": backdrop,
+            "rating": rating,
+            "overview": overview,
+        }
 
     def _organize_single_file(self, source_id: int, file_id: str, name: str,
                              share_service, tmdb_cache: Dict,
