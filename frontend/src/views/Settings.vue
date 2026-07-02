@@ -179,7 +179,7 @@
             <div class="rule-list">
               <div v-for="(rule, i) in tvRules" :key="'t'+i" class="rule-row">
                 <input v-model="rule.category" class="rule-cat" placeholder="分类路径" />
-                <input v-model="rule.conditions" class="rule-cond" placeholder="genreIds=16,originCountry=JP" />
+                <input v-model="rule.conditions" class="rule-cond" placeholder="genreIds=16;originCountry=JP" />
                 <button class="btn-icon-sm danger" @click.stop="tvRules.splice(i, 1)" title="删除">
                   <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
                 </button>
@@ -770,8 +770,9 @@ async function loadClassifySettings() {
     if (res.code === 0 && res.data) {
       if (res.data.classify_rules) {
         const rules = JSON.parse(res.data.classify_rules)
-        movieRules.value = (rules.movie || []).map((r: any) => ({ category: r.category, conditions: Object.entries(r.conditions || {}).map(([k, v]) => `${k}=${v}`).join(',') }))
-        tvRules.value = (rules.tv || []).map((r: any) => ({ category: r.category, conditions: Object.entries(r.conditions || {}).map(([k, v]) => `${k}=${v}`).join(',') }))
+        // 用分号分隔键值对，逗号留给值内部（如 originCountry=CN,TW,HK）
+        movieRules.value = (rules.movie || []).map((r: any) => ({ category: r.category, conditions: Object.entries(r.conditions || {}).map(([k, v]) => `${k}=${v}`).join(';') }))
+        tvRules.value = (rules.tv || []).map((r: any) => ({ category: r.category, conditions: Object.entries(r.conditions || {}).map(([k, v]) => `${k}=${v}`).join(';') }))
       }
       if (res.data.builtin_release_groups) builtinReleaseGroups.value = res.data.builtin_release_groups
       if (res.data.custom_release_groups) customGroupsList.value = res.data.custom_release_groups.split('\n').filter((g: string) => g.trim())
@@ -780,7 +781,8 @@ async function loadClassifySettings() {
 }
 
 function buildClassifyRules() {
-  const pc = (s: string) => { const o: Record<string, string> = {}; s.split(',').forEach(p => { const [k, v] = p.split('='); if (k && v) o[k.trim()] = v.trim() }); return o }
+  // 用分号分隔键值对，逗号留给值内部（如 originCountry=CN,TW,HK）
+  const pc = (s: string) => { const o: Record<string, string> = {}; s.split(';').forEach(p => { const [k, v] = p.split('='); if (k && v) o[k.trim()] = v.trim() }); return o }
   return {
     movie: movieRules.value.filter(r => r.category).map(r => ({ category: r.category, conditions: pc(r.conditions) })),
     tv: tvRules.value.filter(r => r.category).map(r => ({ category: r.category, conditions: pc(r.conditions) })),
