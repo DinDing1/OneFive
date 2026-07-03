@@ -6,16 +6,15 @@
 - Open API 优先，Web API 回退
 
 使用 p115client.tool 工具函数而非直接调用 client 方法，因为：
-- tool 函数内部处理了分页、批量、错误重试等逻辑
+- tool 函数内部处理了批量、错误重试等逻辑
 - batch_move/batch_copy/batch_delete 自动按 batch_size=1000 分批执行
-- fs_files 自动分页拉取整个目录
 - iter_files/iter_dirs 支持目录树遍历
+- list_files 例外：直接调用 client.fs_files 原生 API 以保证分页语义准确
 """
 from typing import Optional, Dict, Any, List
 
 from p115client import P115Client, P115OpenClient
 from p115client.tool import (
-    fs_files,
     iter_files,
     iter_dirs,
     get_info,
@@ -69,13 +68,43 @@ class FileService:
             raise NotLoggedInError("未登录，请先扫码登录")
         return P115Client(cookies)
 
+    def _call_with_fallback(self, method_name: str, client, *args, **kwargs):
+        """调用 client 方法，Open API 失败时自动回退 Web API
+
+        115 Open API 部分端点可能返回 405（接口变更或权限不足），
+        此方法在 Open API 调用失败时自动回退到 Web API 重试。
+
+        Args:
+            method_name: client 方法名（如 "fs_files"）
+            client: 初始 client 实例
+            *args, **kwargs: 传给方法的参数
+
+        Returns:
+            方法调用的返回值
+        """
+        try:
+            return getattr(client, method_name)(*args, **kwargs)
+        except Exception as e:
+            if isinstance(client, P115OpenClient):
+                logger.warning(f"Open API {method_name} 调用失败，回退 Web API: {e}")
+                cookies = self.auth_service.get_cookies()
+                if not cookies:
+                    raise NotLoggedInError("未登录，请先扫码登录") from e
+                web_client = P115Client(cookies)
+                return getattr(web_client, method_name)(*args, **kwargs)
+            raise
+
     # ==================== 文件列表 ====================
 
     def list_files(self, cid: int = 0, limit: int = 100, offset: int = 0,
                    order: str = "file_name", asc: int = 1) -> Dict[str, Any]:
         """列出目录内容
 
-        使用 p115client.tool.fs_files 自动分页拉取。
+        直接调用 client.fs_files 原生 API（不走 tool 的自动翻页），
+        以确保 limit / offset 分页语义准确，只返回当前页数据。
+
+        Open API 的 fs_files 端点可能返回 405（接口变更或权限不足），
+        此时自动回退到 Web API。
 
         Args:
             cid: 目录 ID，0 表示根目录
@@ -96,7 +125,9 @@ class FileService:
             "o": order,
             "asc": asc,
         }
-        result = fs_files(client, payload, page_size=limit)
+        # 直接调用 client 方法，避免 tool.fs_files 自动翻页导致 limit/offset 失效
+        # Open API 可能 405，_call_with_fallback 自动回退 Web API
+        result = self._call_with_fallback("fs_files", client, payload)
         file_list = result.get("data") or []
         items = [self._parse_file_item(f) for f in file_list]
 
@@ -107,6 +138,26 @@ class FileService:
             "limit": result.get("limit", limit),
             "parent_id": str(cid),
         }
+
+    @staticmethod
+    def _detect_is_dir(f: Dict) -> bool:
+        """统一判断是否为目录，兼容 Web API 和 Open API
+
+        各来源的目录判定规则：
+        - Open API 搜索结果：含 file_name 字段，file_category=0 且无 file_size 表示目录
+        - Open API 列表 / Web API 搜索：含 fc 字段，fc == "0" 表示目录
+          （统一用 str() 比较，兼容字符串 "0" 与整数 0）
+        - Web API 列表：cid 存在且不为 "0" 表示目录
+        """
+        # Open API 搜索结果：file_category=0 且无 file_size 表示目录
+        if "file_name" in f:
+            return f.get("file_category") == 0 and "file_size" not in f
+        # Open API 列表和 Web API：fc == "0" 表示目录
+        if "fc" in f:
+            return str(f.get("fc")) == "0"
+        # Web API 列表：cid 存在且不为 "0" 表示目录
+        cid_val = f.get("cid", "0")
+        return bool(cid_val) and str(cid_val) != "0"
 
     @staticmethod
     def _parse_file_item(f: Dict) -> Dict[str, Any]:
@@ -124,21 +175,13 @@ class FileService:
         # 文件 ID：file_id > cid > fid
         file_id = f.get("file_id") or f.get("fid") or f.get("cid") or "0"
 
-        # 判断目录
-        if "file_name" in f:
-            # Open API 搜索结果：file_category=0 且无 file_size 表示目录
-            is_dir = f.get("file_category") == 0 and "file_size" not in f
-        elif "fn" in f:
-            # Open API 列表：fc == "0" 表示目录
-            is_dir = f.get("fc") == "0"
-        elif "fc" in f:
-            # Web API 搜索结果：fc == 0 表示目录
-            is_dir = f.get("fc") == 0
-        else:
-            # Web API 列表：cid 存在且不为 "0" 表示目录
+        # 统一判断是否为目录
+        is_dir = FileService._detect_is_dir(f)
+
+        # Web API 列表分支（既无 file_name 也无 fc）：目录的 ID 取自 cid 字段
+        if is_dir and "file_name" not in f and "fc" not in f:
             cid_val = f.get("cid", "0")
-            is_dir = cid_val and cid_val != "0"
-            if is_dir:
+            if cid_val and str(cid_val) != "0":
                 file_id = cid_val
 
         # 文件大小
@@ -211,14 +254,16 @@ class FileService:
             115 API 响应结果
         """
         client = self._get_client()
-        return client.fs_mkdir(name, pid=pid)
+        return self._call_with_fallback("fs_mkdir", client, name, pid=pid)
 
     # ==================== 搜索 ====================
 
     def search_files(self, keyword: str, cid: int = 0) -> Dict[str, Any]:
         """搜索文件
 
-        固定使用 Web API（P115Client），避免 Open API 搜索结果字段名不同导致解析问题。
+        使用 _get_client() 获取客户端（Open API 优先，Web API 回退），
+        Open API 用户也能正常搜索。_parse_file_item 已兼容 Open API 搜索
+        结果字段（file_name / file_id / pick_code），无需额外处理。
 
         Args:
             keyword: 搜索关键词
@@ -227,13 +272,14 @@ class FileService:
         Returns:
             {"items": [...], "count": N, ...}
         """
-        # 搜索固定用 Web API，字段名统一
-        cookies = self.auth_service.get_cookies()
-        if not cookies:
-            raise NotLoggedInError("未登录，请先扫码登录")
-        client = P115Client(cookies)
+        # 统一走 _get_client：Open API 优先，Web API 回退
+        client = self._get_client()
 
-        result = client.fs_search({"search_value": keyword, "cid": cid, "limit": 100})
+        # Open API 可能 405，_call_with_fallback 自动回退 Web API
+        result = self._call_with_fallback(
+            "fs_search", client,
+            {"search_value": keyword, "cid": cid, "limit": 100}
+        )
         file_list = result.get("data") or []
         items = [self._parse_file_item(f) for f in file_list] if isinstance(file_list, list) else []
 
@@ -350,7 +396,7 @@ class FileService:
             new_name: 新文件名（必须包含扩展名）
         """
         client = self._get_client()
-        client.fs_rename((file_id, new_name))
+        self._call_with_fallback("fs_rename", client, (file_id, new_name))
 
 
 # 全局单例

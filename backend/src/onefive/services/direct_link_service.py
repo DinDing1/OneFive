@@ -99,7 +99,7 @@ class PathStripMiddleware:
                 stripped = path[len(self.prefix):] or "/"
                 scope["path"] = stripped
                 scope["root_path"] = scope.get("root_path", "") + self.prefix
-                # 同步修改 raw_path（blacksheep 框架使用 raw_path 路由）
+                # 同步修改 raw_path，确保依赖 raw_path 路由的下游 ASGI 应用（如 p115nano302）能拿到重写后的路径
                 # 保持原始字节，只剥离前缀对应的字节部分
                 if "raw_path" in scope:
                     original_raw = scope["raw_path"]
@@ -130,8 +130,13 @@ class PathStripMiddleware:
                     raise
                 else:
                     elapsed_ms = (_time() - start_ts) * 1000
-                    # 302 表示命中（缓存或 API），404 表示未找到
-                    hit = "缓存命中" if status_code == 302 else "未命中"
+                    # 按状态码细分日志文案：302 是正常重定向，404 是未找到，其它视为异常
+                    if status_code == 302:
+                        hit = "重定向"
+                    elif status_code == 404:
+                        hit = "未找到"
+                    else:
+                        hit = f"异常:{status_code}"
                     logger.info(
                         f"[直链] {original_path} → {status_code} ({elapsed_ms:.0f}ms) {hit}"
                     )
@@ -161,17 +166,25 @@ class DirectLinkService:
         self._server: Optional[uvicorn.Server] = None
         self._thread: Optional[threading.Thread] = None
         self._stopping = threading.Event()
+        # 线程锁：保护 _server / _thread 的读写，避免多线程下竞态
+        self._lock = threading.Lock()
 
-    def start(self) -> bool:
+    def start(self, allow_lan: bool = False) -> bool:
         """启动 302 直链服务
 
         在后台守护线程中运行 uvicorn，承载 p115nano302 的 ASGI 应用。
 
+        Args:
+            allow_lan: 是否允许局域网访问。默认 False 仅绑定 127.0.0.1（本机访问）；
+                       设为 True 时绑定 0.0.0.0，同局域网设备可访问。
+
         Returns:
             是否启动成功
         """
-        # 已经在运行则跳过
-        if self.is_running():
+        # 已经在运行则跳过（加锁读取线程状态，避免与 stop 并发）
+        with self._lock:
+            running = self._thread is not None and self._thread.is_alive()
+        if running:
             logger.warning("直链服务已在运行中，跳过启动")
             return True
 
@@ -184,6 +197,8 @@ class DirectLinkService:
 
         # 获取端口配置
         port = self._get_port()
+        # 绑定地址：默认仅本机访问，allow_lan=True 时允许局域网访问
+        host = "0.0.0.0" if allow_lan else "127.0.0.1"
 
         try:
             import p115nano302
@@ -200,58 +215,75 @@ class DirectLinkService:
             # 创建 uvicorn 配置和服务器实例
             config = uvicorn.Config(
                 app,
-                host="0.0.0.0",
+                host=host,
                 port=port,
                 log_level="warning",
             )
-            self._server = uvicorn.Server(config)
+            server = uvicorn.Server(config)
 
-            # 在守护线程中启动 uvicorn
-            self._thread = threading.Thread(
-                target=self._run_server,
-                name="direct-link-302",
-                daemon=True,
-            )
-            self._thread.start()
+            # 在守护线程中启动 uvicorn（加锁保护 _server / _thread 赋值）
+            with self._lock:
+                self._server = server
+                self._thread = threading.Thread(
+                    target=self._run_server,
+                    name="direct-link-302",
+                    daemon=True,
+                )
+                self._thread.start()
 
-            logger.info(f"直链服务已启动，端口: {port}")
+            logger.info(f"直链服务已启动，端口: {port}，绑定: {host}")
             return True
 
         except Exception as e:
             logger.error(f"启动直链服务失败: {e}")
-            self._server = None
-            self._thread = None
+            with self._lock:
+                self._server = None
+                self._thread = None
             return False
 
     def _run_server(self):
         """在线程中运行 uvicorn 服务器"""
         try:
-            self._server.run()
+            # 加锁读取 server 引用，避免与 stop 并发置空
+            with self._lock:
+                server = self._server
+            if server is not None:
+                server.run()
         except Exception as e:
             if not self._stopping.is_set():
                 logger.error(f"直链服务运行异常: {e}")
         finally:
-            self._server = None
+            with self._lock:
+                self._server = None
             if not self._stopping.is_set():
                 logger.info("直链服务已停止")
 
     def stop(self) -> bool:
         """停止 302 直链服务
 
-        通过设置 uvicorn 的 should_exit 标志实现优雅关闭。
+        通过设置 uvicorn 的 should_exit 标志实现优雅关闭，
+        并等待守护线程退出（最长 5 秒），避免提前返回"已停止"但实际仍在运行。
 
         Returns:
-            是否已发送停止信号
+            是否已停止（无论线程是否在超时内退出都返回 True）
         """
-        if not self.is_running():
+        # 加锁读取线程和服务器引用
+        with self._lock:
+            thread = self._thread
+            server = self._server
+            running = thread is not None and thread.is_alive()
+        if not running:
             logger.info("直链服务未在运行")
             return True
 
         try:
             self._stopping.set()
-            if self._server:
-                self._server.should_exit = True
+            if server:
+                server.should_exit = True
             logger.info("已发送直链服务停止信号")
+            # 等待线程退出（最长 5 秒），join 后无论是否超时都返回 True
+            if thread is not None:
+                thread.join(timeout=5)
             return True
         except Exception as e:
             logger.error(f"停止直链服务失败: {e}")
@@ -263,7 +295,8 @@ class DirectLinkService:
         Returns:
             服务是否运行中
         """
-        return self._thread is not None and self._thread.is_alive()
+        with self._lock:
+            return self._thread is not None and self._thread.is_alive()
 
     def get_settings(self) -> dict:
         """获取直链服务设置
@@ -313,6 +346,8 @@ class DirectLinkService:
 
 # 全局直链服务实例（单例模式）
 _direct_link_service: Optional[DirectLinkService] = None
+# 单例锁：保护 _direct_link_service 的创建，避免多线程下重复实例化
+_singleton_lock = threading.Lock()
 
 
 def get_direct_link_service() -> DirectLinkService:
@@ -322,6 +357,7 @@ def get_direct_link_service() -> DirectLinkService:
         直链服务实例
     """
     global _direct_link_service
-    if _direct_link_service is None:
-        _direct_link_service = DirectLinkService()
+    with _singleton_lock:
+        if _direct_link_service is None:
+            _direct_link_service = DirectLinkService()
     return _direct_link_service

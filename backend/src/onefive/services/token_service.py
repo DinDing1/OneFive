@@ -44,6 +44,9 @@ HEADERS = {
 # 提前刷新时间（秒）
 REFRESH_AHEAD = 300
 
+# 默认 token 有效期（秒），API 未返回 expires_in 时使用
+DEFAULT_TOKEN_EXPIRES_IN = 7200
+
 
 class TokenService:
     """Open API Token 管理服务"""
@@ -90,11 +93,11 @@ class TokenService:
         if token and expire_str:
             try:
                 expire_ts = int(expire_str)
-                # token 有效且未过期
-                if time.time() < expire_ts:
+                # token 有效且未到提前刷新时间，直接返回
+                if time.time() < expire_ts - REFRESH_AHEAD:
                     return token
-                # 即将过期，尝试刷新
-                logger.info("Token 已过期，尝试刷新")
+                # 即将过期或已过期，提前刷新
+                logger.info("Token 即将过期，尝试刷新")
                 if self._refresh_token():
                     return self.config_service.get("open_access_token")
             except (ValueError, TypeError):
@@ -135,7 +138,7 @@ class TokenService:
             self._save_token(
                 data["access_token"],
                 data["refresh_token"],
-                data.get("expires_in", 7200),
+                data.get("expires_in", DEFAULT_TOKEN_EXPIRES_IN),
             )
             logger.info("刷新 access_token 成功")
             return True
@@ -168,7 +171,7 @@ class TokenService:
             return None
 
         try:
-            # 步骤1：获取二维码 uid + code_verifier
+            # 步骤1：本地生成 code_verifier，调用 API 获取二维码 uid
             code_verifier = self._generate_code_verifier()
             code_challenge = self._generate_code_challenge(code_verifier)
 
@@ -249,7 +252,7 @@ class TokenService:
             token_data = token_result.get("data") or token_result
             access_token = token_data["access_token"]
             refresh_token = token_data["refresh_token"]
-            expires_in = token_data.get("expires_in", 7200)
+            expires_in = token_data.get("expires_in", DEFAULT_TOKEN_EXPIRES_IN)
 
             self._save_token(access_token, refresh_token, expires_in)
             logger.info("通过 Cookie 自动获取 Open API token 成功")

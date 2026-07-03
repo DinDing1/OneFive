@@ -1,4 +1,4 @@
-import api from './index'
+import api, { type ApiResult } from './index'
 
 export interface RecognizeRequest {
   file_id: string
@@ -63,37 +63,37 @@ export interface ExecuteRequest {
 
 export const organizeApi = {
   /** 识别文件 */
-  recognize(req: RecognizeRequest): Promise<any> {
+  recognize(req: RecognizeRequest): Promise<ApiResult<RecognizeResult>> {
     return api.post('/organize/recognize', req)
   },
 
   /** 手动纠错识别 */
-  manualRecognize(req: ManualRecognizeRequest): Promise<any> {
+  manualRecognize(req: ManualRecognizeRequest): Promise<ApiResult<RecognizeResult>> {
     return api.post('/organize/recognize/manual', req)
   },
 
   /** 获取整理配置 */
-  getSettings(): Promise<any> {
+  getSettings(): Promise<ApiResult<any>> {
     return api.get('/organize/settings')
   },
 
   /** 更新整理配置 */
-  updateSettings(settings: Record<string, string>): Promise<any> {
+  updateSettings(settings: Record<string, string>): Promise<ApiResult<any>> {
     return api.put('/organize/settings', settings)
   },
 
   /** 恢复默认重命名模板 */
-  resetTemplates(): Promise<any> {
+  resetTemplates(): Promise<ApiResult<any>> {
     return api.post('/organize/settings/reset-templates')
   },
 
   /** 恢复默认分类策略 */
-  resetRules(): Promise<any> {
+  resetRules(): Promise<ApiResult<any>> {
     return api.post('/organize/settings/reset-rules')
   },
 
   /** 执行整理 */
-  execute(req: ExecuteRequest): Promise<any> {
+  execute(req: ExecuteRequest): Promise<ApiResult<any>> {
     return api.post('/organize/execute', req)
   },
 }

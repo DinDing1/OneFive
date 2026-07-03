@@ -70,7 +70,8 @@ class ShareService:
             "SELECT id FROM share_source WHERE share_code = ?", (share_code,)
         )
         if existing:
-            return {"success": False, "error": f"分享 {share_code} 已存在（source_id={existing['id']}）"}
+            # 不暴露内部 source_id，避免泄漏内部 ID
+            return {"success": False, "error": f"分享 {share_code} 已存在"}
 
         # 调用 p115client 获取文件列表
         try:
@@ -158,14 +159,33 @@ class ShareService:
 
         except Exception as e:
             logger.error(f"解析分享链接失败: {e}")
-            # 清理可能的部分数据
-            self.db.execute("DELETE FROM share_source WHERE share_code = ?", (share_code,))
-            self.db.commit()
+            # 清理可能的部分数据：同时清理 share_file 和 share_source，避免孤儿记录
+            try:
+                row = self.db.fetchone(
+                    "SELECT id FROM share_source WHERE share_code = ?", (share_code,)
+                )
+                if row:
+                    source_id = row["id"]
+                    self.db.execute("DELETE FROM share_file WHERE source_id = ?", (source_id,))
+                    self.db.execute("DELETE FROM share_source WHERE id = ?", (source_id,))
+                    self.db.commit()
+            except Exception as cleanup_err:
+                logger.warning(f"清理分享数据失败: {cleanup_err}")
+                self.db.rollback()
             return {"success": False, "error": str(e)}
 
     def _insert_files(self, source_id: int, parent_id: str, files: list,
                       share_code: str, receive_code: str, client):
-        """递归写入目录和文件"""
+        """递归写入目录和文件（当前层级用 executemany 批量插入，减少数据库往返）
+
+        保留递归结构：目录需要在线获取子文件后递归处理。
+        每个层级内：先把所有文件收集到 batch 列表，用一次 executemany 插入，
+        再遍历目录递归获取子文件。
+        """
+        # 收集当前层级的所有文件记录，准备批量插入
+        batch = []
+        # 同时记录目录项，用于后续递归获取子文件
+        dirs_to_recurse = []
         for f in files:
             file_id = str(f.get("id"))
             name = f.get("name", "")
@@ -173,27 +193,34 @@ class ShareService:
             size = f.get("size", 0)
             sha1 = f.get("sha1", "")
 
-            self.db.execute(
+            batch.append((source_id, share_code, receive_code, file_id,
+                          parent_id, name, is_dir, size, sha1))
+            if is_dir:
+                dirs_to_recurse.append((file_id, name))
+
+        # 当前层级批量插入（INSERT OR IGNORE 保证重复时不报错）
+        if batch:
+            self.db.executemany(
                 """INSERT OR IGNORE INTO share_file
                    (source_id, share_code, receive_code, file_id, parent_id, name, is_dir, size, sha1)
                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                (source_id, share_code, receive_code, file_id, parent_id, name, is_dir, size, sha1)
+                batch
             )
 
-            # 如果是目录，递归获取子文件
-            if is_dir:
-                try:
-                    from p115client.tool import share_iterdir
-                    children = list(share_iterdir(
-                        client, share_code=share_code,
-                        receive_code=receive_code, cid=int(file_id)
-                    ))
-                    if children:
-                        self._insert_files(source_id, file_id, children, share_code, receive_code, client)
-                except Exception as e:
-                    logger.warning(f"获取子目录失败 ({name}): {e}")
+        # 递归处理子目录：在线获取子文件后递归写入
+        for file_id, name in dirs_to_recurse:
+            try:
+                from p115client.tool import share_iterdir
+                children = list(share_iterdir(
+                    client, share_code=share_code,
+                    receive_code=receive_code, cid=int(file_id)
+                ))
+                if children:
+                    self._insert_files(source_id, file_id, children, share_code, receive_code, client)
+            except Exception as e:
+                logger.warning(f"获取子目录失败 ({name}): {e}")
 
-        self.db.commit()
+        # 不在此处 commit，由顶层 add_share 统一提交，避免每层递归多次 commit 影响性能
 
     def list_shares(self) -> List[Dict]:
         """列出所有分享来源"""
@@ -212,6 +239,9 @@ class ShareService:
     def delete_shares_batch(self, source_ids: List[int]) -> Dict:
         """批量删除分享来源及其所有文件
 
+        每条删除独立事务：成功才 commit，失败立即 rollback，
+        避免部分删除被统一 commit 留下不一致状态。
+
         Returns:
             {"total": int, "success": int, "failed": int}
         """
@@ -221,10 +251,11 @@ class ShareService:
             try:
                 self.db.execute("DELETE FROM share_file WHERE source_id = ?", (sid,))
                 self.db.execute("DELETE FROM share_source WHERE id = ?", (sid,))
+                self.db.commit()
                 success += 1
             except Exception:
-                pass
-        self.db.commit()
+                # 异常时回滚当前 sid 的删除，不影响其它 sid
+                self.db.rollback()
         return {"total": total, "success": success, "failed": total - success}
 
     def update_share_source(self, source_id: int, share_name: str = None,
@@ -425,27 +456,32 @@ class ShareService:
         return result
 
     def _get_first_organized_descendant(self, source_id: int, dir_file_id: str) -> Optional[Dict]:
-        """递归查找目录下第一个已整理且有 title 的后代文件（不限层级）
+        """递归查找目录下第一个已整理且有 title 的后代文件（不限层级，单条 SQL）
 
         用于目录整理名称显示：当目录含季子目录时，直接子项是目录无 title，
         需要深入到叶子文件层才能取到整理信息。
+
+        优化：用 WITH RECURSIVE 一次查出所有后代，避免深层目录触发 N+1 查询。
         """
-        rows = self.db.fetchall(
-            "SELECT file_id, is_dir, title, year, tmdb_id, organized "
-            "FROM share_file WHERE source_id = ? AND parent_id = ?",
-            (source_id, dir_file_id)
+        row = self.db.fetchone(
+            """WITH RECURSIVE descendants(file_id, depth) AS (
+                   SELECT file_id, 0 FROM share_file
+                   WHERE source_id = ? AND parent_id = ?
+                   UNION ALL
+                   SELECT f.file_id, d.depth + 1 FROM share_file f
+                   JOIN descendants d ON f.parent_id = d.file_id
+                   WHERE f.source_id = ?
+               )
+               SELECT sf.file_id, sf.title, sf.year, sf.tmdb_id, sf.media_type,
+                      sf.category, sf.organized_dir, sf.organized_name
+               FROM share_file sf
+               JOIN descendants d ON sf.file_id = d.file_id
+               WHERE sf.organized = 1 AND sf.title != '' AND sf.is_dir = 0
+               ORDER BY d.depth, sf.name
+               LIMIT 1""",
+            (source_id, dir_file_id, source_id)
         )
-        for r in rows:
-            f = dict(r)
-            # 优先返回已整理且有 title 的文件
-            if f.get("organized") and f.get("title"):
-                return f
-            # 子目录：递归查找
-            if f.get("is_dir"):
-                sub = self._get_first_organized_descendant(source_id, f["file_id"])
-                if sub:
-                    return sub
-        return None
+        return dict(row) if row else None
 
     def get_all_organized_files(self) -> Dict:
         """获取所有分享来源的已整理文件，用于构建统一的虚拟目录树"""
@@ -535,8 +571,14 @@ class ShareService:
 
         return file_info
 
-    def update_file_organize(self, source_id: int, file_id: str, data: Dict):
-        """更新文件整理信息"""
+    def update_file_organize(self, source_id: int, file_id: str, data: Dict, commit: bool = True):
+        """更新文件整理信息
+
+        Args:
+            commit: 是否立即提交事务。批量场景（如批量整理同一目录的多集）
+                传 False，由调用方在循环结束后统一 commit，避免每条记录都
+                触发一次 fsync 影响性能（40 集剧从 40 次 fsync 降到 1 次）。
+        """
         self.db.execute(
             """UPDATE share_file SET
                media_type = ?, title = ?, year = ?, tmdb_id = ?, category = ?,
@@ -555,7 +597,8 @@ class ShareService:
                 file_id,
             )
         )
-        self.db.commit()
+        if commit:
+            self.db.commit()
 
 
 # 单例

@@ -9,6 +9,15 @@ export const useAuthStore = defineStore('auth', () => {
   const vipType = ref<VipType>('none')
   const face = ref('')
 
+  /** 重置登录态为未登录的默认值（登录态校验失败 / 登出时复用） */
+  function resetState() {
+    isLoggedIn.value = false
+    userId.value = null
+    userName.value = null
+    vipType.value = 'none'
+    face.value = ''
+  }
+
   async function checkLoginStatus() {
     try {
       const status = await authApi.getLoginStatus()
@@ -18,11 +27,7 @@ export const useAuthStore = defineStore('auth', () => {
       vipType.value = status.vip_type || 'none'
       face.value = status.face || ''
     } catch (error) {
-      isLoggedIn.value = false
-      userId.value = null
-      userName.value = null
-      vipType.value = 'none'
-      face.value = ''
+      resetState()
     }
   }
 
@@ -30,11 +35,7 @@ export const useAuthStore = defineStore('auth', () => {
     try {
       await authApi.logout()
     } finally {
-      isLoggedIn.value = false
-      userId.value = null
-      userName.value = null
-      vipType.value = 'none'
-      face.value = ''
+      resetState()
     }
   }
 

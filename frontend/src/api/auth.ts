@@ -1,4 +1,4 @@
-import api from './index'
+import api, { type ApiResult } from './index'
 
 export type VipType = 'none' | 'vip' | 'forever'
 
@@ -61,12 +61,12 @@ export const authApi = {
   },
 
   // 手动设置 cookies 登录
-  loginWithCookies(cookies: string): Promise<any> {
+  loginWithCookies(cookies: string): Promise<ApiResult<any>> {
     return api.post('/auth/login/cookies', { cookies })
   },
 
   // 登出
-  logout(): Promise<any> {
+  logout(): Promise<ApiResult<any>> {
     return api.post('/auth/logout')
   }
 }

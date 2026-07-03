@@ -3,7 +3,7 @@
     <!-- 关于卡片：液态玻璃容器 -->
     <div class="about-card glass-card">
       <div class="app-logo-area">
-        <!-- 项目图标：替换原内联 SVG -->
+        <!-- 项目图标 -->
         <img src="@/assets/logo.png" alt="OneFive" class="app-logo" />
         <div class="app-title">
           <h2>OneFive</h2>

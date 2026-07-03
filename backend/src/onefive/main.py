@@ -35,6 +35,7 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from . import __version__
 from .paths import SERVICE_PORT, UI_DIR
 from .logger import setup_logging, get_logger
+from .exceptions import AppError
 from .api.auth import router as auth_router
 from .api.config import router as config_router
 from .api.files import router as files_router
@@ -94,10 +95,10 @@ app = FastAPI(
     lifespan=lifespan
 )
 
-# 配置 CORS（开发环境允许所有来源）
+# 配置 CORS（显式列出允许的来源，避免通配符 + 凭据的不安全组合）
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # 生产环境应该限制来源
+    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173", "http://localhost:11580"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -179,16 +180,26 @@ async def health_check():
     return {"status": "healthy"}
 
 
+@app.exception_handler(AppError)
+async def app_error_handler(request, exc: AppError):
+    """业务错误处理器：返回友好的业务错误消息"""
+    return JSONResponse(
+        status_code=200,
+        content={"code": exc.code, "message": exc.message, "data": None}
+    )
+
+
 @app.exception_handler(Exception)
 async def global_exception_handler(request, exc):
-    """全局异常处理器"""
+    """系统异常处理器：记录完整堆栈到日志，返回 HTTP 200 + 业务错误码
+
+    返回 HTTP 200 而非 500，确保前端 axios 拦截器能正常解析 ApiResult，
+    前端统一通过 code 字段判断成功/失败，不依赖 HTTP 状态码。
+    """
+    logger.exception(f"未处理异常: {request.url.path}")
     return JSONResponse(
-        status_code=500,
-        content={
-            "code": 500,
-            "message": f"服务器内部错误: {str(exc)}",
-            "data": None
-        }
+        status_code=200,
+        content={"code": -1, "message": "服务器内部错误，请查看服务端日志", "data": None}
     )
 
 

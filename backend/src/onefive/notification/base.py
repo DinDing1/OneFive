@@ -45,6 +45,14 @@ class NotificationChannel(ABC):
         """检查是否已连接"""
         ...
 
+    async def is_enabled(self) -> bool:
+        """检查渠道是否启用（默认启用，子类可按需覆盖）
+
+        Returns:
+            是否启用，未覆盖时默认返回 True
+        """
+        return True
+
     @abstractmethod
     async def connect(self) -> bool:
         """建立连接

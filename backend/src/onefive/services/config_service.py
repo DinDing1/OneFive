@@ -1,16 +1,10 @@
 """
-配置管理服务 - 管理应用配置的读写
+配置服务 - 管理应用配置的读写
 
 原理说明：
-- 使用 SQLite setting 表存储配置
-- 提供配置的增删改查操作
-- 支持配置的批量操作
-- 自动处理配置的序列化/反序列化
-
-执行步骤：
-1. 从数据库读取配置
-2. 进行数据验证
-3. 返回配置值或执行配置操作
+- 配置以字符串形式存储在 SQLite setting 表（name/value/description）
+- 复杂数据结构（如 JSON）由调用方自行序列化和解析
+- 采用单例模式，提供 get/set/has/delete 四个核心方法
 """
 from typing import Optional, List, Dict, Any
 from ..db.database import get_db
@@ -29,21 +23,34 @@ class ConfigService:
     def __init__(self):
         """初始化配置服务"""
         self.db = get_db()
-    
+        # 内存缓存：避免频繁读取数据库（配置项变更不频繁，但读取非常频繁）
+        # 缓存 value 字符串，未命中时查库并写入缓存；set/delete/set_many 同步更新缓存。
+        # 注意：None 也作为合法缓存值（表示该配置不存在），避免反复查库确认不存在。
+        self._cache: Dict[str, Optional[str]] = {}
+
     def get(self, name: str) -> Optional[str]:
-        """获取配置值
-        
+        """获取配置值（带内存缓存）
+
+        批量整理时该方法会被调用数百次（每次分类都要读 classify_rules），
+        加内存缓存后只在首次查库，后续直接命中缓存。
+
         Args:
             name: 配置名称
-            
+
         Returns:
             配置值，如果不存在返回 None
         """
+        # 命中缓存直接返回（None 也算命中，表示配置不存在）
+        if name in self._cache:
+            return self._cache[name]
+        # 未命中查数据库并写入缓存
         row = self.db.fetchone(
             "SELECT value FROM setting WHERE name = ?",
             (name,)
         )
-        return row["value"] if row else None
+        value = row["value"] if row else None
+        self._cache[name] = value
+        return value
     
     def get_with_info(self, name: str) -> Optional[SettingResponse]:
         """获取配置详情
@@ -69,33 +76,31 @@ class ConfigService:
         )
     
     def set(self, name: str, value: str, description: Optional[str] = None) -> SettingResponse:
-        """设置配置值（如果存在则更新，否则创建）
-        
+        """设置配置值（UPSERT：存在则更新，不存在则创建）
+
+        使用 INSERT ON CONFLICT DO UPDATE 原子化完成“先查后写”，
+        避免并发场景下的竞态条件和多余查询。
+
         Args:
             name: 配置名称
             value: 配置值
-            description: 配置说明
-            
+            description: 配置说明（为 None 时保留原值）
+
         Returns:
             配置详情
         """
-        # 检查配置是否已存在
-        existing = self.get_with_info(name)
-        
-        if existing:
-            # 更新现有配置
-            self.db.execute(
-                "UPDATE setting SET value = ?, description = COALESCE(?, description), updated_at = datetime('now', 'localtime') WHERE name = ?",
-                (value, description, name)
-            )
-        else:
-            # 创建新配置
-            self.db.execute(
-                "INSERT INTO setting (name, value, description) VALUES (?, ?, ?)",
-                (name, value, description)
-            )
-        
+        self.db.execute(
+            """INSERT INTO setting (name, value, description, updated_at)
+               VALUES (?, ?, ?, datetime('now', 'localtime'))
+               ON CONFLICT(name) DO UPDATE SET
+                   value = excluded.value,
+                   description = COALESCE(?, description),
+                   updated_at = datetime('now', 'localtime')""",
+            (name, value, description, description)
+        )
         self.db.commit()
+        # 同步更新缓存，保证后续 get 命中缓存
+        self._cache[name] = value
         return self.get_with_info(name)
     
     def delete(self, name: str) -> bool:
@@ -112,6 +117,9 @@ class ConfigService:
             (name,)
         )
         self.db.commit()
+        if cursor.rowcount > 0:
+            # 同步删除缓存，保证后续 get 重新查库
+            self._cache.pop(name, None)
         return cursor.rowcount > 0
     
     def list_all(self) -> List[SettingResponse]:
@@ -154,19 +162,32 @@ class ConfigService:
         return {row["name"]: row["value"] for row in rows}
     
     def set_many(self, settings: Dict[str, str], description: Optional[str] = None) -> int:
-        """批量设置配置
-        
+        """批量设置配置（单次 commit，减少 IO 往返）
+
         Args:
             settings: 配置字典 {name: value}
             description: 配置说明（应用于所有配置）
-            
+
         Returns:
             成功设置的配置数量
         """
         count = 0
         for name, value in settings.items():
-            self.set(name, value, description)
+            # 复用 UPSERT 语句，但不在此处 commit，统一在末尾提交一次
+            self.db.execute(
+                """INSERT INTO setting (name, value, description, updated_at)
+                   VALUES (?, ?, ?, datetime('now', 'localtime'))
+                   ON CONFLICT(name) DO UPDATE SET
+                       value = excluded.value,
+                       description = COALESCE(?, description),
+                       updated_at = datetime('now', 'localtime')""",
+                (name, value, description, description)
+            )
+            # 批量更新缓存，与数据库保持一致
+            self._cache[name] = value
             count += 1
+        if count:
+            self.db.commit()
         return count
     
     def exists(self, name: str) -> bool:

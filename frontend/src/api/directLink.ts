@@ -1,4 +1,4 @@
-import api from './index'
+import api, { type ApiResult } from './index'
 
 /** 直链服务设置 */
 export interface DirectLinkSettings {
@@ -9,27 +9,27 @@ export interface DirectLinkSettings {
 
 export const directLinkApi = {
   /** 获取直链设置 */
-  getSettings(): Promise<any> {
+  getSettings(): Promise<ApiResult<DirectLinkSettings>> {
     return api.get('/direct-link/settings')
   },
 
   /** 保存直链设置 */
-  saveSettings(settings: { enabled: boolean; port: number }): Promise<any> {
+  saveSettings(settings: { enabled: boolean; port: number }): Promise<ApiResult<any>> {
     return api.post('/direct-link/settings', settings)
   },
 
   /** 启动直链服务 */
-  start(): Promise<any> {
+  start(): Promise<ApiResult<any>> {
     return api.post('/direct-link/start')
   },
 
   /** 停止直链服务 */
-  stop(): Promise<any> {
+  stop(): Promise<ApiResult<any>> {
     return api.post('/direct-link/stop')
   },
 
   /** 查询服务状态 */
-  getStatus(): Promise<any> {
+  getStatus(): Promise<ApiResult<DirectLinkSettings>> {
     return api.get('/direct-link/status')
   }
 }

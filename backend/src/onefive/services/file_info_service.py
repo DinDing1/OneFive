@@ -32,6 +32,11 @@ SUBTITLE_EXTENSIONS = {'.srt', '.ass', '.ssa', '.sub', '.vtt'}
 
 # 模块级缓存：避免每次调用都读数据库
 _video_extensions_cache: Optional[set] = None
+# 自定义发布组缓存（同上，避免 _extract_release_group 每次都读数据库）
+_custom_release_groups_cache: Optional[List[str]] = None
+# 模块级预编译正则列表：避免每次 _extract_release_group 都编译 100+ 个正则
+# 存放 (编译后的正则, 发布组名) 元组，首次调用时懒加载构建
+_compiled_release_patterns: List[Tuple[re.Pattern, str]] = []
 
 
 def get_video_extensions() -> set:
@@ -78,6 +83,46 @@ def invalidate_video_extensions_cache():
     """
     global _video_extensions_cache
     _video_extensions_cache = None
+
+
+# ==================== 公共工具函数（供 organize_service / share_organize_service 复用） ====================
+
+# 季集标记正则：S01E01、第x集、EP01、E01、Season 01 等
+# 第3条正则加前导边界，避免 MOVIE01、SAMPLE01、FILE01 等被误判为剧集标记
+_SEASON_EPISODE_PATTERNS = [
+    re.compile(r'[Ss]\d{1,2}[Ee]\d{1,3}'),                      # S01E01 / s1e1
+    re.compile(r'第\s*\d+\s*集'),                                # 第1集 / 第 01 集
+    re.compile(r'(?:^|[\s._\-])[Ee][Pp]?\.?\s*\d{1,3}'),        # EP01 / E01 / ep.1（需前导边界）
+    re.compile(r'Season\s*\d{1,2}', re.IGNORECASE),             # Season 1
+]
+
+
+def has_season_episode_marker(name: str) -> bool:
+    """判断文件名是否包含季集标记（用于区分电视剧/电影）
+
+    统一规则：S01E01、第x集、EP01、E01、Season 01 任一命中即视为电视剧。
+    模块级预编译正则，避免每次调用重复编译。
+    """
+    return any(p.search(name) for p in _SEASON_EPISODE_PATTERNS)
+
+
+def format_size(size_bytes: int) -> str:
+    """格式化文件大小为人类可读字符串
+
+    统一实现：B → KB → MB → GB → TB → PB，保留 1 位小数（B 除外）。
+    供 organize_service / share_organize_service 复用，避免两处实现不一致。
+    """
+    # 处理空值或非正数：返回空字符串（与原 _format_size 行为一致）
+    if not size_bytes or size_bytes <= 0:
+        return ""
+    size = float(size_bytes)
+    for unit in ['B', 'KB', 'MB', 'GB', 'TB']:
+        if size < 1024.0:
+            # B 不显示小数，其它单位保留 1 位
+            return f"{size:.1f} {unit}" if unit != 'B' else f"{int(size)} B"
+        size /= 1024.0
+    return f"{size:.1f} PB"
+
 
 # ==================== 发布组列表 ====================
 
@@ -182,7 +227,10 @@ def _extract_web_source(base: str) -> str:
     """提取 WEB 来源（细分平台）"""
     sorted_sources = sorted(WEB_SOURCES.keys(), key=len, reverse=True)
     for source in sorted_sources:
-        pattern = re.compile(rf'(?:^|[.\s_\-\[\(\{{]){re.escape(source)}(?:$|[.\s_\-\]\)\}}@])', re.IGNORECASE)
+        pattern = re.compile(
+            rf'(?:^|[.\s_\-\[\(\{{]){re.escape(source)}(?:$|[.\s_\-\]\)\}}@])',
+            re.IGNORECASE
+        )
         if pattern.search(base):
             return WEB_SOURCES[source]
     return ''
@@ -220,14 +268,36 @@ def _extract_edition(base: str) -> str:
     return ' '.join(editions)
 
 
-def _extract_release_group(base: str) -> str:
-    """提取发布组（内置列表 + 用户自定义列表）"""
-    # 合并内置和自定义发布组
+def _rebuild_release_patterns():
+    """重建发布组正则列表（内置 + 自定义）
+
+    将内置发布组和自定义发布组合并后预编译为正则列表，存入模块级变量
+    _compiled_release_patterns。后续 _extract_release_group 直接遍历该列表
+    做匹配，避免每次调用都编译 100+ 个正则。
+
+    调用时机：
+    1. _extract_release_group 首次调用时懒加载
+    2. invalidate_custom_release_groups_cache 清除缓存后同步重建
+    """
     custom = _get_custom_release_groups()
     all_groups = BUILTIN_RELEASE_GROUPS + custom
-
+    _compiled_release_patterns.clear()
     for group in all_groups:
-        pattern = re.compile(rf'(?:^|[.\s_\-\[\(\{{@]){re.escape(group)}(?:$|[.\s_\-\]\)\}}@])', re.IGNORECASE)
+        pattern = re.compile(
+            rf'(?:^|[.\s_\-\[\(\{{@]){re.escape(group)}(?:$|[.\s_\-\]\)\}}@])',
+            re.IGNORECASE
+        )
+        _compiled_release_patterns.append((pattern, group))
+
+
+def _extract_release_group(base: str) -> str:
+    """提取发布组（内置列表 + 用户自定义列表，使用预编译正则）"""
+    # 懒加载：首次调用时构建预编译正则列表
+    if not _compiled_release_patterns:
+        _rebuild_release_patterns()
+
+    # 遍历预编译正则列表做匹配，命中即返回对应发布组名
+    for pattern, group in _compiled_release_patterns:
         if pattern.search(base):
             return group
 
@@ -241,16 +311,41 @@ def _extract_release_group(base: str) -> str:
 
 
 def _get_custom_release_groups() -> List[str]:
-    """从数据库读取用户自定义发布组列表"""
+    """从数据库读取用户自定义发布组列表（带缓存）
+
+    首次调用读数据库并写入模块级缓存，后续调用直接命中缓存，
+    避免每次 _extract_release_group 都查库。配置变更时由
+    invalidate_custom_release_groups_cache() 清除缓存。
+    """
+    global _custom_release_groups_cache
+    if _custom_release_groups_cache is not None:
+        return _custom_release_groups_cache
+
     try:
         from .config_service import get_config_service
         config = get_config_service()
         raw = config.get("release_groups")
         if raw:
-            return [g.strip() for g in raw.split('\n') if g.strip()]
+            groups = [g.strip() for g in raw.split('\n') if g.strip()]
+            _custom_release_groups_cache = groups
+            return groups
     except Exception:
         pass
-    return []
+    # 回退到空列表并缓存，避免反复尝试读库
+    _custom_release_groups_cache = []
+    return _custom_release_groups_cache
+
+
+def invalidate_custom_release_groups_cache():
+    """使自定义发布组缓存失效
+
+    在用户保存新的 release_groups 配置后调用，确保后续读取使用新值。
+    同时重建预编译正则列表，保证 _extract_release_group 用上新配置。
+    """
+    global _custom_release_groups_cache
+    _custom_release_groups_cache = None
+    # 同步重建预编译正则列表（_rebuild_release_patterns 内部会重新读库填充缓存）
+    _rebuild_release_patterns()
 
 
 def _extract_audio_channels(base: str) -> str:
@@ -271,7 +366,7 @@ def extract_key_info(filename: str, folder_files: Optional[List[str]] = None) ->
 
     Args:
         filename: 完整文件名（含扩展名）
-        folder_files: 文件夹内的文件列表
+        folder_files: （已废弃，保留仅为兼容性，当前实现不使用）文件夹内的文件列表
 
     Returns:
         {"title", "year", "season", "episode", "mediaType", "tmdbId", "fallbackQuery"}
@@ -297,22 +392,11 @@ def extract_key_info(filename: str, folder_files: Optional[List[str]] = None) ->
         if std_tmdb and not tmdb_id:
             tmdb_id = int(std_tmdb)
 
-        # 检测季集信息
-        season = None
-        episode = None
-
-        # 自定义中文季集
-        s, e = _detect_chinese_episode(base)
-        if s is not None:
-            season = s
-        if e is not None:
-            episode = e
-
-        # 自定义仅季无集
-        if season is None and episode is None:
-            s = _detect_season_only(base)
-            if s is not None:
-                season = s
+        # 检测季集信息（自定义中文季集 + 仅季，统一调用避免重复代码）
+        season, episode, season_only = _detect_season_episode(base)
+        # 仅当中文季集未命中时，才回退到仅季模式
+        if season is None and episode is None and season_only is not None:
+            season = season_only
 
         # 媒体类型：有季或集即为电视剧（兼容季包 S02 无集号的情况）
         media_type = 'tv' if season is not None or episode is not None else 'movie'
@@ -353,19 +437,16 @@ def extract_key_info(filename: str, folder_files: Optional[List[str]] = None) ->
     if episode is not None:
         episode = int(episode)
 
-    # 自定义中文季集（guessit 不支持 "第1集"）
+    # 自定义中文季集 + 仅季（guessit 不支持，仅在 guessit 未给出时补充）
     if season is None and episode is None:
-        s, e = _detect_chinese_episode(base)
-        if s is not None:
-            season = s
-        if e is not None:
-            episode = e
-
-    # 自定义仅季无集（guessit 不支持 "第1季"）
-    if season is None and episode is None:
-        s = _detect_season_only(base)
-        if s is not None:
-            season = s
+        cn_season, cn_episode, season_only = _detect_season_episode(base)
+        if cn_season is not None:
+            season = cn_season
+        if cn_episode is not None:
+            episode = cn_episode
+        # 中文季集仍未命中时，回退到仅季模式
+        if season is None and episode is None and season_only is not None:
+            season = season_only
 
     # 媒体类型：有季或集即为电视剧（兼容季包 S02 无集号的情况）
     media_type = 'tv' if season is not None or episode is not None else 'movie'
@@ -438,7 +519,12 @@ def _extract_year(text: str) -> Optional[str]:
 
 
 def _detect_chinese_episode(filename: str) -> Tuple[Optional[int], Optional[int]]:
-    """检测中文季集格式"""
+    """检测中文季集格式（如"第N集"）
+
+    Returns:
+        (season, episode) 元组：命中"第N集"时 season 固定为 1，episode 为集号；
+        未命中返回 (None, None)
+    """
     match = re.search(r'第(\d{1,3})集', filename)
     if match:
         return (1, int(match.group(1)))
@@ -454,6 +540,25 @@ def _detect_season_only(filename: str) -> Optional[int]:
     return None
 
 
+def _detect_season_episode(base: str) -> Tuple[Optional[int], Optional[int], Optional[int]]:
+    """统一检测中文季集与仅季信息（guessit 不支持的部分）
+
+    一次调用同时获取两种自定义检测结果，供 extract_key_info 按优先级合并，
+    消除标准格式与非标准格式两段几乎相同的"中文季集检测"重复代码。
+
+    Args:
+        base: 不含扩展名的文件名主体
+
+    Returns:
+        (season, episode, season_only)
+        - season / episode：来自 "第N集" 模式（命中时 season 固定为 1）
+        - season_only：来自 "第N季" / "Season N" / "S0N" 等仅季模式
+    """
+    season, episode = _detect_chinese_episode(base)
+    season_only = _detect_season_only(base)
+    return season, episode, season_only
+
+
 def _clean_query(text: str) -> str:
     """清理文件名用于搜索"""
     cleaned = text
@@ -465,9 +570,16 @@ def _clean_query(text: str) -> str:
     cleaned = re.sub(r'第\d+集', ' ', cleaned)
     cleaned = re.sub(r'EP?\d{1,3}', ' ', cleaned, flags=re.IGNORECASE)
     cleaned = re.sub(r'\b(2160p|1080p|720p|480p|360p|4K|8K|UHD|HD|SD)\b', ' ', cleaned, flags=re.IGNORECASE)
-    cleaned = re.sub(r'\b(WEB-?DL|WEBRip|BluRay|BDRip|HDTV|DVDRip|REMUX)\b', ' ', cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(
+        r'\b(WEB-?DL|WEBRip|BluRay|BDRip|HDTV|DVDRip|REMUX)\b',
+        ' ', cleaned, flags=re.IGNORECASE
+    )
     cleaned = re.sub(r'\b(H\.?26[45]|X\.?26[45]|HEVC|AVC|AV1)\b', ' ', cleaned, flags=re.IGNORECASE)
-    cleaned = re.sub(r'\b(DTS[-\s.]?HD[-\s.]?MA|DTS[-\s.]?HD|DDP\d*\.?\d*|AAC\d*\.?\d*|TrueHD|Atmos|FLAC)\b', ' ', cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(
+        r'\b(DTS[-\s.]?HD[-\s.]?MA|DTS[-\s.]?HD|DDP\d*\.?\d*|'
+        r'AAC\d*\.?\d*|TrueHD|Atmos|FLAC)\b',
+        ' ', cleaned, flags=re.IGNORECASE
+    )
     cleaned = re.sub(r'\b(DV|HDR10\+|HDR10|HDR|HLG|SDR)\b', ' ', cleaned, flags=re.IGNORECASE)
     cleaned = re.sub(r'\btmdb[=＝]?\d+\b', ' ', cleaned, flags=re.IGNORECASE)
     cleaned = re.sub(r'[._\-\[\]\(\)\{\}]', ' ', cleaned)
@@ -492,11 +604,17 @@ def _extract_audio_codec(base: str) -> str:
     Atmos 可在声道数前或后：DTS-HD.MA.Atmos.7.1 或 DTS-HD.MA.7.1.Atmos
     """
     # TrueHD + Dolby Atmos + 声道
-    match = re.search(r'\bTrueHD[.\s-]*(?:Dolby[.\s-]*)?Atmos[.\s-]*(\d+\.\d+)', base, re.IGNORECASE)
+    match = re.search(
+        r'\bTrueHD[.\s-]*(?:Dolby[.\s-]*)?Atmos[.\s-]*(\d+\.\d+)',
+        base, re.IGNORECASE
+    )
     if match:
         return f'TrueHD.Atmos.{match.group(1)}'
     # TrueHD + 声道 + Dolby Atmos
-    match = re.search(r'\bTrueHD[.\s-]*(\d+\.\d+)[.\s-]*(?:Dolby[.\s-]*)?Atmos\b', base, re.IGNORECASE)
+    match = re.search(
+        r'\bTrueHD[.\s-]*(\d+\.\d+)[.\s-]*(?:Dolby[.\s-]*)?Atmos\b',
+        base, re.IGNORECASE
+    )
     if match:
         return f'TrueHD.Atmos.{match.group(1)}'
     # TrueHD + 声道
@@ -515,7 +633,10 @@ def _extract_audio_codec(base: str) -> str:
     if match:
         return f'DTS-HD.MA.Atmos.{match.group(1)}'
     # DTS-HD.MA + 声道 + Atmos
-    match = re.search(r'\bDTS[- .]?HD[- .]?MA[.\s-]*(\d+\.\d+)[.\s-]*Atmos\b', base, re.IGNORECASE)
+    match = re.search(
+        r'\bDTS[- .]?HD[- .]?MA[.\s-]*(\d+\.\d+)[.\s-]*Atmos\b',
+        base, re.IGNORECASE
+    )
     if match:
         return f'DTS-HD.MA.Atmos.{match.group(1)}'
     # DTS-HD.MA + 声道
@@ -540,7 +661,10 @@ def _extract_audio_codec(base: str) -> str:
     if match:
         return f'DDP.Atmos.{match.group(1)}'
     # DDP + 声道 + Atmos
-    match = re.search(r'\b(?:DDP|DD\+|E-?AC-?3)[.\s-]*(\d+\.\d+)[.\s-]*Atmos\b', base, re.IGNORECASE)
+    match = re.search(
+        r'\b(?:DDP|DD\+|E-?AC-?3)[.\s-]*(\d+\.\d+)[.\s-]*Atmos\b',
+        base, re.IGNORECASE
+    )
     if match:
         return f'DDP.Atmos.{match.group(1)}'
     # DDP + 声道

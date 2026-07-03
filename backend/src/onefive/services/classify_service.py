@@ -33,6 +33,32 @@ DEFAULT_STRATEGY = {
     ],
 }
 
+# 模块级缓存：分类策略变更不频繁，避免每次分类都读库 + json.loads
+# _strategy_cache 缓存解析后的策略字典（None 也表示缓存了"无自定义策略"状态）
+# _strategy_cache_loaded 标记是否已加载过，避免反复查库
+_strategy_cache: Optional[Dict] = None
+_strategy_cache_loaded: bool = False
+
+# ==================== TMDB 类型/国家 查找表 ====================
+# TMDB genre ID → 中文名称（电影和电视剧共用）
+GENRE_ID_TO_NAME = {
+    28: '动作', 12: '冒险', 16: '动画', 35: '喜剧', 80: '犯罪',
+    99: '纪录片', 18: '剧情', 10751: '家庭', 14: '奇幻', 36: '历史',
+    27: '恐怖', 10402: '音乐', 9648: '悬疑', 10749: '爱情', 878: '科幻',
+    10770: '电视电影', 53: '惊悚', 10752: '战争', 37: '西部',
+    10759: '动作冒险', 10762: '儿童', 10763: '新闻', 10764: '真人秀',
+    10765: '科幻奇幻', 10766: '肥皂剧', 10767: '谈话', 10768: '战争政治',
+}
+
+# ISO 国家代码 → 中文名称
+COUNTRY_CODE_TO_NAME = {
+    'CN': '中国', 'TW': '台湾', 'HK': '香港', 'JP': '日本',
+    'KP': '朝鲜', 'KR': '韩国', 'TH': '泰国', 'IN': '印度',
+    'SG': '新加坡', 'US': '美国', 'FR': '法国', 'GB': '英国',
+    'UK': '英国', 'DE': '德国', 'ES': '西班牙', 'IT': '意大利',
+    'NL': '荷兰', 'PT': '葡萄牙', 'RU': '俄罗斯',
+}
+
 
 def _parse_genre_ids(genre_ids_str: str) -> List[int]:
     """解析类型ID字符串"""
@@ -63,12 +89,16 @@ def _normalize_to_list(value, parser=None):
 
 
 def _match_rule(details: Dict, rule: Dict) -> bool:
-    """检查媒体信息是否匹配分类规则
+    """匹配分类规则
 
-    匹配逻辑（任一匹配 = 命中）：
-    1. genreIds：媒体的 genres 中包含规则要求的任一类型ID
-    2. originCountry：媒体的原产国中包含规则要求的任一国家代码
-    3. 所有指定的条件都必须满足（AND 逻辑）
+    匹配逻辑（条件内 OR，条件间 AND）：
+    - 单个条件内：媒体的字段值命中规则要求的任一项，即视为该条件满足
+    - 多个条件之间：规则中声明的所有条件都必须满足，规则才命中
+
+    例如规则 `originCountry=CN,TW,HK;genreIds=16` 表示：
+    - originCountry 条件：媒体原产国包含 CN/TW/HK 中任一即满足
+    - genreIds 条件：媒体类型包含 16 即满足
+    - 两个条件都满足时规则命中
     """
     conditions = rule.get("conditions", {})
 
@@ -122,49 +152,37 @@ def classify_media(details: Dict, media_type: str, strategy: Optional[Dict] = No
 
 
 def _get_custom_strategy() -> Optional[Dict]:
-    """从数据库获取自定义分类策略"""
-    config_service = get_config_service()
-    saved = config_service.get("classify_rules")
+    """从数据库获取自定义分类策略（带缓存）
+
+    分类策略变更不频繁，但每次分类都要读取，避免每次都查库 + json.loads。
+    首次调用读库并解析后写入模块级缓存，后续直接命中缓存。
+    策略变更时由 invalidate_strategy_cache() 清除缓存。
+    """
+    global _strategy_cache, _strategy_cache_loaded
+    if _strategy_cache_loaded:
+        return _strategy_cache
+    saved = get_config_service().get("classify_rules")
     if saved:
         try:
-            return json.loads(saved)
+            _strategy_cache = json.loads(saved)
         except Exception:
-            pass
-    return None
+            _strategy_cache = None
+    _strategy_cache_loaded = True
+    return _strategy_cache
+
+
+def invalidate_strategy_cache():
+    """使分类策略缓存失效（保存 classify_rules 后调用）"""
+    global _strategy_cache, _strategy_cache_loaded
+    _strategy_cache = None
+    _strategy_cache_loaded = False
 
 
 def get_genre_name(genre_id: int) -> str:
     """根据类型ID获取类型名称"""
-    GENRE_MAP = {
-        28: '动作', 12: '冒险', 16: '动画', 35: '喜剧', 80: '犯罪',
-        99: '纪录片', 18: '剧情', 10751: '家庭', 14: '奇幻', 36: '历史',
-        27: '恐怖', 10402: '音乐', 9648: '悬疑', 10749: '爱情', 878: '科幻',
-        10770: '电视电影', 53: '惊悚', 10752: '战争', 37: '西部',
-        10759: '动作冒险', 10762: '儿童', 10763: '新闻', 10764: '真人秀',
-        10765: '科幻奇幻', 10766: '肥皂剧', 10767: '谈话', 10768: '战争政治',
-    }
-    return GENRE_MAP.get(genre_id, '未知')
+    return GENRE_ID_TO_NAME.get(genre_id, '未知')
 
 
 def get_country_name(code: str) -> str:
     """根据国家代码获取国家名称"""
-    COUNTRY_MAP = {
-        'CN': '中国', 'TW': '台湾', 'HK': '香港', 'JP': '日本',
-        'KP': '朝鲜', 'KR': '韩国', 'TH': '泰国', 'IN': '印度',
-        'SG': '新加坡', 'US': '美国', 'FR': '法国', 'GB': '英国',
-        'UK': '英国', 'DE': '德国', 'ES': '西班牙', 'IT': '意大利',
-        'NL': '荷兰', 'PT': '葡萄牙', 'RU': '俄罗斯',
-    }
-    return COUNTRY_MAP.get(code.upper(), code)
-
-
-# 全局单例
-_classify_service = None
-
-
-def get_classify_service():
-    """获取分类服务实例"""
-    global _classify_service
-    if _classify_service is None:
-        _classify_service = True
-    return _classify_service
+    return COUNTRY_CODE_TO_NAME.get(code.upper(), code)

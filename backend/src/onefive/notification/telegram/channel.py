@@ -8,6 +8,7 @@ Telegram 通知渠道
 两种模式独立运行，各自有独立的客户端实例。
 """
 import re
+import asyncio
 from typing import Dict, Any, Optional, List
 from ..base import NotificationChannel
 from ...services.config_service import get_config_service
@@ -72,7 +73,17 @@ class TelegramChannel(NotificationChannel):
         raw = self._cfg(CFG_ADMIN_IDS)
         if not raw:
             return []
-        return [int(x.strip()) for x in raw.split(',') if x.strip().isdigit()]
+        result = []
+        for x in raw.split(','):
+            x = x.strip()
+            if not x:
+                continue
+            # 用 try/except int() 替代 isdigit()，避免 Unicode 数字导致崩溃
+            try:
+                result.append(int(x))
+            except ValueError:
+                logger.warning(f"忽略无效的管理员 ID: {x}")
+        return result
 
     def is_admin(self, user_id: int) -> bool:
         admins = self._get_admin_ids()
@@ -118,7 +129,7 @@ class TelegramChannel(NotificationChannel):
         if self._bot_client is not None and self._bot_connected:
             return
 
-        bot_enabled = self._cfg(CFG_BOT_ENABLED) not in ("false", "0", "False")
+        bot_enabled = self._cfg(CFG_BOT_ENABLED) in ("true", "1", "True")
         bot_token = self._cfg(CFG_BOT_TOKEN)
         if not (bot_enabled and bot_token):
             return
@@ -229,10 +240,10 @@ class TelegramChannel(NotificationChannel):
             share_url = url_match.group(0)
             logger.info(f"Bot: 检测到 115 分享链接: {share_url}")
 
-            # 调用 share_service 处理分享链接
+            # 调用 share_service 处理分享链接（同步方法，用 asyncio.to_thread 包裹避免阻塞 Telethon 事件循环）
             from ...services.share_service import get_share_service
             share_service = get_share_service()
-            result = share_service.add_share(share_url, source_type='bot')
+            result = await asyncio.to_thread(share_service.add_share, share_url, source_type='bot')
 
             # 构造回复消息
             if result.get('success'):
@@ -318,6 +329,10 @@ class TelegramChannel(NotificationChannel):
         bot_ok = self._bot_client and self._bot_connected
         user_ok = self._user_client and self._user_connected
         return bot_ok or user_ok
+
+    async def is_enabled(self) -> bool:
+        """检查 Telegram 渠道是否启用（与 get_status/auto_connect 使用一致的判断逻辑）"""
+        return self._cfg(CFG_ENABLED) in ("true", "1", "True")
 
     async def connect(self) -> bool:
         self._bot_client = None

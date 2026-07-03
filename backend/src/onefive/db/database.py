@@ -9,6 +9,7 @@
 - 路径由 paths 模块统一管理，自动适配飞牛环境
 """
 import sqlite3
+import threading
 from pathlib import Path
 from typing import Optional, List
 
@@ -33,6 +34,12 @@ class Database:
         self.db_path = Path(db_path) if db_path else DB_PATH
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
 
+        # 线程锁：sqlite3.connect(check_same_thread=False) 允许多线程访问同一连接，
+        # 但 SQLite 写入需要串行化，并发写入会抛 "database is locked"。
+        # 所有数据库操作都通过 self._lock 串行化，保证线程安全。
+        # 注意：所有方法均为单次 acquire-release，不嵌套调用其他加锁方法，避免死锁。
+        self._lock = threading.Lock()
+
         # 建立连接并初始化表结构
         self._conn = sqlite3.connect(str(self.db_path), check_same_thread=False)
         self._conn.row_factory = sqlite3.Row  # 返回字典形式的结果
@@ -41,57 +48,12 @@ class Database:
     def _init_tables(self):
         """初始化数据库表结构
 
-        创建 setting 表用于存储配置变量：
-        - name: 配置名称（主键）
-        - value: 配置值
-        - description: 配置说明
-        - created_at: 创建时间
-        - updated_at: 更新时间
+        创建三张表：
+        - setting: 配置变量存储（name/value/description + 时间戳）
+        - share_source: 分享链接来源（含 share_code、receive_code、link_valid 等）
+        - share_file: 分享文件（含目录和文件，支持整理状态追踪）
 
-        创建 direct_link_cache 表用于缓存 302 直链：
-        - pickcode: 文件 pickcode（主键）
-        - file_id: 文件 ID（索引）
-        - url: 302 重定向 URL
-        - expires_at: 过期时间
-        - created_at: 创建时间
-
-        创建 share_source 表用于存储分享链接来源：
-        - id: 自增主键
-        - share_code: 分享码（唯一）
-        - receive_code: 提取码
-        - share_name: 分享名称
-        - share_url: 原始分享链接
-        - source_type: 来源类型（manual/自动等）
-        - file_count: 文件总数
-        - total_size: 文件总大小
-        - status: 状态（pending/parsed/error）
-        - error_msg: 错误信息
-        - created_at: 创建时间
-        - updated_at: 更新时间
-
-        创建 share_file 表用于存储分享文件信息：
-        - id: 自增主键
-        - source_id: 关联的 share_source ID
-        - file_id: 115 文件 ID
-        - parent_id: 父目录 ID
-        - name: 文件名
-        - is_dir: 是否为目录
-        - size: 文件大小
-        - sha1: 文件 SHA1
-        - media_type: 媒体类型（movie/tv）
-        - title: 标题
-        - year: 年份
-        - season: 季
-        - episode: 集
-        - tmdb_id: TMDB ID
-        - tmdb_poster: TMDB 海报 URL
-        - tmdb_rating: TMDB 评分
-        - category: 分类路径
-        - tech_info: 技术信息 JSON
-        - overview: 简介
-        - organized: 是否已整理
-        - created_at: 创建时间
-        - updated_at: 更新时间
+        字段含义详见下方 CREATE TABLE 语句的行内注释。
         """
         self._conn.execute("""
             CREATE TABLE IF NOT EXISTS setting (
@@ -101,19 +63,6 @@ class Database:
                 created_at TIMESTAMP DEFAULT (datetime('now', 'localtime')),
                 updated_at TIMESTAMP DEFAULT (datetime('now', 'localtime'))
             )
-        """)
-        self._conn.execute("""
-            CREATE TABLE IF NOT EXISTS direct_link_cache (
-                pickcode TEXT PRIMARY KEY,
-                file_id TEXT NOT NULL,
-                url TEXT NOT NULL,
-                expires_at TIMESTAMP NOT NULL,
-                created_at TIMESTAMP DEFAULT (datetime('now', 'localtime'))
-            )
-        """)
-        self._conn.execute("""
-            CREATE INDEX IF NOT EXISTS idx_direct_link_file_id
-            ON direct_link_cache(file_id)
         """)
         # 分享来源表
         self._conn.execute("""
@@ -163,25 +112,41 @@ class Database:
         self._conn.execute("CREATE INDEX IF NOT EXISTS idx_share_file_parent ON share_file(source_id, parent_id)")
         self._conn.execute("CREATE INDEX IF NOT EXISTS idx_share_file_name ON share_file(name)")
         self._conn.execute("CREATE INDEX IF NOT EXISTS idx_share_file_category ON share_file(category)")
+        # 频繁查询 organized + is_dir 的复合索引（get_organized_files 等使用）
+        self._conn.execute("CREATE INDEX IF NOT EXISTS idx_share_file_organized ON share_file(organized, is_dir)")
+        # 直链服务按 share_code + file_id 查询
+        self._conn.execute("CREATE INDEX IF NOT EXISTS idx_share_file_share_code ON share_file(share_code, file_id)")
         self._conn.commit()
 
     def execute(self, sql: str, params: tuple = ()) -> sqlite3.Cursor:
-        """执行 SQL 语句"""
-        return self._conn.execute(sql, params)
+        """执行 SQL 语句（线程安全）"""
+        with self._lock:
+            return self._conn.execute(sql, params)
+
+    def executemany(self, sql: str, params: list) -> None:
+        """批量执行 SQL 语句（线程安全）
+
+        用于一次性插入/更新多条记录，减少数据库往返次数。
+        """
+        with self._lock:
+            self._conn.executemany(sql, params)
 
     def commit(self):
-        """提交事务"""
-        self._conn.commit()
+        """提交事务（线程安全）"""
+        with self._lock:
+            self._conn.commit()
 
     def fetchone(self, sql: str, params: tuple = ()) -> Optional[sqlite3.Row]:
-        """查询单条记录"""
-        cursor = self._conn.execute(sql, params)
-        return cursor.fetchone()
+        """查询单条记录（线程安全）"""
+        with self._lock:
+            cursor = self._conn.execute(sql, params)
+            return cursor.fetchone()
 
     def fetchall(self, sql: str, params: tuple = ()) -> List[sqlite3.Row]:
-        """查询多条记录"""
-        cursor = self._conn.execute(sql, params)
-        return cursor.fetchall()
+        """查询多条记录（线程安全）"""
+        with self._lock:
+            cursor = self._conn.execute(sql, params)
+            return cursor.fetchall()
 
     def close(self):
         """关闭数据库连接"""

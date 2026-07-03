@@ -58,7 +58,7 @@ class QRCodeResponse(BaseModel):
 
 class LoginCheckResponse(BaseModel):
     """登录检查响应模型"""
-    status: str = Field(..., description="状态: pending/scanned/confirmed/failed")
+    status: str = Field(..., description="状态: pending/scanned/confirmed/invalid/expired/error")
     cookies: Optional[str] = Field(None, description="登录成功后的cookies")
     user_name: Optional[str] = Field(None, description="用户名")
     message: str = Field(..., description="状态消息")

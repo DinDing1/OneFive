@@ -42,11 +42,9 @@ const router = createRouter({
   ]
 })
 
-// 路由守卫
 router.beforeEach(async (to, _from, next) => {
   const authStore = useAuthStore()
-  
-  // 检查登录状态
+
   if (!authStore.isLoggedIn) {
     await authStore.checkLoginStatus()
   }

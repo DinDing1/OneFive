@@ -641,6 +641,10 @@
 import { ref, computed, onMounted } from 'vue'
 import { shareApi, type ShareSource, type ShareFile } from '@/api/share'
 import { showToast } from '@/composables/useToast'
+import { handleApiError } from '@/utils/error'
+import { useVisiblePages } from '@/composables/usePagination'
+import { formatSize, formatTime } from '@/composables/useFormat'
+import type { RecognizeResult } from '@/api/organize'
 
 // ==================== 类型定义 ====================
 
@@ -705,36 +709,8 @@ const organizedTotalPages = computed(() => {
   return total > 0 ? total : 1
 })
 
-/** 整理视图可见页码 */
-const organizedVisiblePages = computed(() => {
-  const total = organizedTotalPages.value
-  const current = organizedCurrentPage.value
-  const pages: number[] = []
-  
-  if (total <= 7) {
-    for (let i = 1; i <= total; i++) {
-      pages.push(i)
-    }
-  } else {
-    if (current <= 4) {
-      for (let i = 1; i <= 5; i++) pages.push(i)
-      pages.push(-1)
-      pages.push(total)
-    } else if (current >= total - 3) {
-      pages.push(1)
-      pages.push(-1)
-      for (let i = total - 4; i <= total; i++) pages.push(i)
-    } else {
-      pages.push(1)
-      pages.push(-1)
-      for (let i = current - 1; i <= current + 1; i++) pages.push(i)
-      pages.push(-1)
-      pages.push(total)
-    }
-  }
-  
-  return pages
-})
+/** 整理视图可见页码（-1 表示省略号，逻辑见 usePagination） */
+const organizedVisiblePages = useVisiblePages(organizedTotalPages, organizedCurrentPage)
 
 // 搜索
 const searchKeyword = ref('')
@@ -788,7 +764,7 @@ const propTargetIds = ref<{ sourceId: number; fileId: string }>({ sourceId: 0, f
 // 识别弹窗状态
 const showRecognizeModal = ref(false)
 const recognizeLoading = ref(false)
-const recognizeResult = ref<any>(null)
+const recognizeResult = ref<RecognizeResult | null>(null)
 const recognizeItem = ref<ShareFile | null>(null)
 // 待整理的文件ID列表（支持批量：单文件/多文件）
 const pendingOrganizeIds = ref<Array<{ sourceId: number; fileId: string }>>([])
@@ -844,41 +820,8 @@ const totalPages = computed(() => {
   return total > 0 ? total : 1 // 至少1页
 })
 
-/** 可见页码列表 */
-const visiblePages = computed(() => {
-  const total = totalPages.value
-  const current = currentPage.value
-  const pages: number[] = []
-  
-  if (total <= 7) {
-    // 总页数少于7页，全部显示
-    for (let i = 1; i <= total; i++) {
-      pages.push(i)
-    }
-  } else {
-    // 总页数多于7页，显示部分页码
-    if (current <= 4) {
-      // 当前页靠前
-      for (let i = 1; i <= 5; i++) pages.push(i)
-      pages.push(-1) // 省略号占位
-      pages.push(total)
-    } else if (current >= total - 3) {
-      // 当前页靠后
-      pages.push(1)
-      pages.push(-1)
-      for (let i = total - 4; i <= total; i++) pages.push(i)
-    } else {
-      // 当前页在中间
-      pages.push(1)
-      pages.push(-1)
-      for (let i = current - 1; i <= current + 1; i++) pages.push(i)
-      pages.push(-1)
-      pages.push(total)
-    }
-  }
-  
-  return pages
-})
+/** 可见页码列表（-1 表示省略号，逻辑见 usePagination） */
+const visiblePages = useVisiblePages(totalPages, currentPage)
 
 /** 当前页的文件列表（分页后） */
 const filteredFiles = computed(() => {
@@ -981,11 +924,14 @@ async function confirmDeleteShare() {
       showToast(res.message || '删除失败', 'error')
     }
   } catch (e: any) {
-    showToast(e.message || '删除失败', 'error')
+    handleApiError(e, '删除失败')
   }
 }
 
 // ==================== 行操作菜单 ====================
+
+/** 右键菜单预估高度（px）：识别 + 属性 + 分隔线 + 删除 4 项之和的近似值 */
+const MENU_HEIGHT_PX = 140
 
 /** 打开/关闭行菜单 */
 function toggleRowMenu(item: ShareFile, event: MouseEvent) {
@@ -997,8 +943,7 @@ function toggleRowMenu(item: ShareFile, event: MouseEvent) {
   // 定位到点击位置
   const rect = (event.currentTarget as HTMLElement).getBoundingClientRect()
   
-  // 菜单预估高度（根据实际菜单项数量计算：识别+属性+分隔线+删除）
-  const menuHeight = 140 // 预估菜单高度
+  const menuHeight = MENU_HEIGHT_PX
   const spaceBelow = window.innerHeight - rect.bottom
   const spaceAbove = rect.top
   
@@ -1072,7 +1017,7 @@ async function loadProperties() {
       showToast(res.message || '加载属性失败', 'error')
     }
   } catch (e: any) {
-    showToast(e.message || '加载属性失败', 'error')
+    handleApiError(e, '加载属性失败')
   } finally {
     propertiesLoading.value = false
   }
@@ -1112,7 +1057,7 @@ async function saveProperties() {
     await refreshCurrentView()
     showPropertiesModal.value = false
   } catch (e: any) {
-    showToast(e.message || '保存失败', 'error')
+    handleApiError(e, '保存失败')
   } finally {
     propertiesSaving.value = false
   }
@@ -1317,7 +1262,7 @@ function buildOrganizedEntries(currentPath: string) {
         dirs.set(dirName, existing)
       }
     } else if (fullDir === currentPath) {
-      // 精确匹配当前路径的文件（同一目录下的文件）← 优先判断
+      // 当前目录直属文件（非子目录）：fullDir 与 currentPath 完全相等
       files.push({
         name: file.organized_name || file.name,
         path: fullDir + '/' + (file.organized_name || file.name),
@@ -1406,7 +1351,7 @@ async function handleSearch() {
   } catch (e: any) {
     console.error('搜索失败:', e)
     allFiles.value = []
-    showToast(e.message || '搜索失败', 'error')
+    handleApiError(e, '搜索失败')
   } finally {
     loadingFiles.value = false
   }
@@ -1536,6 +1481,11 @@ function closeRecognizeModal() {
   }
 }
 
+/**
+ * 分享文件手动识别入口
+ * 与 RecognizeModal 中的普通文件识别不同，此处针对已整理的分享文件，
+ * 允许用户手动指定 TMDB ID 和媒体类型进行纠错。
+ */
 async function manualRecognizeShare() {
   if (!recognizeItem.value) return
   const tmdbId = Number(manualTmdbId.value)
@@ -1692,39 +1642,23 @@ function runOrganizeStream(
       }
     }
     es.onerror = () => {
-      // 浏览器自动重连可能会触发 onerror，若已完成则忽略
+      // 浏览器自动重连可能会触发 onerror，若已完成或连接已关闭则视为正常结束
       if (organizeProgressDone.value || es.readyState === EventSource.CLOSED) {
         es.close()
         organizeEventSource = null
         resolve()
+      } else {
+        // 流式过程中发生错误且未完成：必须 reject，否则 Promise 永远悬挂
+        es.close()
+        organizeEventSource = null
+        reject(new Error('整理流连接异常，请重试'))
       }
     }
   })
 }
 
 // ==================== 工具函数 ====================
-
-/** 格式化文件大小 */
-function formatSize(bytes: number): string {
-  if (!bytes || bytes === 0) return '—'
-  const units = ['B', 'KB', 'MB', 'GB', 'TB']
-  let i = 0
-  let size = bytes
-  while (size >= 1024 && i < units.length - 1) {
-    size /= 1024
-    i++
-  }
-  return `${size.toFixed(i > 0 ? 1 : 0)} ${units[i]}`
-}
-
-/** 格式化时间 */
-function formatTime(ts: string | number): string {
-  if (!ts) return '—'
-  const date = new Date(typeof ts === 'string' && /^\d+$/.test(ts) ? Number(ts) * 1000 : ts)
-  if (isNaN(date.getTime())) return '—'
-  const pad = (n: number) => String(n).padStart(2, '0')
-  return `${date.getFullYear()}/${pad(date.getMonth() + 1)}/${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}`
-}
+// formatSize / formatTime 已统一抽至 @/composables/useFormat，保证各视图行为一致
 </script>
 
 <style scoped>

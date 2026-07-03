@@ -24,7 +24,7 @@
     <!-- 工具栏 -->
     <div class="toolbar glass-card">
       <template v-if="selectedIds.size === 0">
-        <button class="toolbar-btn" @click="refresh" :disabled="loading">
+        <button class="toolbar-btn" @click="loadFiles()" :disabled="loading">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
             <polyline points="23 4 23 10 17 10" />
             <path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10" />
@@ -403,7 +403,12 @@
 import { ref, computed, onMounted } from 'vue'
 import { filesApi, type FileItem } from '@/api/files'
 import { showToast } from '@/composables/useToast'
+import { handleApiError } from '@/utils/error'
+import { formatSize, formatTime } from '@/composables/useFormat'
 import RecognizeModal from '@/components/RecognizeModal.vue'
+
+/** 右键菜单尺寸（用于边界检测，避免菜单超出视口） */
+const MENU_SIZE = 180
 
 interface Breadcrumb {
   id: string
@@ -415,35 +420,26 @@ const items = ref<FileItem[]>([])
 const breadcrumbs = ref<Breadcrumb[]>([{ id: '0', name: '根目录' }])
 const currentCid = ref('0')
 
-// 搜索
 const searchKeyword = ref('')
-const isSearching = ref(false)
 
-// 分页
 const pageSize = ref(50)
 const currentPage = ref(1)
 const totalCount = ref(0)
 
-// 排序
 const sortOrder = ref('file_name')
 const sortAsc = ref(1)
 
-// 多选
 const selectedIds = ref<Set<string>>(new Set())
 
-// 新建文件夹
 const showMkdir = ref(false)
 const newFolderName = ref('')
 
-// 重命名
 const showRename = ref(false)
 const renameName = ref('')
 
-// 删除确认
 const showDelete = ref(false)
 const deleteTargets = ref<string[]>([])
 
-// 目录选择器
 const showPicker = ref(false)
 const pickerMode = ref<'move' | 'copy'>('move')
 const pickerLoading = ref(false)
@@ -452,18 +448,14 @@ const pickerBreadcrumbs = ref<Breadcrumb[]>([{ id: '0', name: '根目录' }])
 const pickerCid = ref('0')
 const pickerTargets = ref<string[]>([])
 
-// 当前操作的文件项
 const targetItem = ref<FileItem | null>(null)
 
-// 识别弹窗
 const showRecognize = ref(false)
 const recognizeItem = ref<FileItem | null>(null)
 
-// 右键菜单位置
 const menuVisible = ref(false)
 const menuStyle = ref({})
 
-// 全选状态
 const isAllSelected = computed(() => items.value.length > 0 && selectedIds.value.size === items.value.length)
 const isPartialSelected = computed(() => selectedIds.value.size > 0 && !isAllSelected.value)
 
@@ -599,15 +591,10 @@ function navigateTo(id: string) {
   }
 }
 
-function refresh() {
-  loadFiles()
-}
-
 async function handleSearch() {
   const keyword = searchKeyword.value.trim()
   if (!keyword) return
 
-  isSearching.value = true
   loading.value = true
   selectedIds.value = new Set()
   try {
@@ -627,7 +614,7 @@ async function handleSearch() {
     console.error('搜索失败:', e)
     items.value = []
     totalCount.value = 0
-    showToast(e.message || '搜索失败', 'error')
+    handleApiError(e, '搜索失败')
   } finally {
     loading.value = false
   }
@@ -635,7 +622,6 @@ async function handleSearch() {
 
 function clearSearch() {
   searchKeyword.value = ''
-  isSearching.value = false
   loadFiles(1)
 }
 
@@ -649,7 +635,7 @@ function startRecognize() {
 }
 
 function batchRecognize() {
-  // 多选时识别第一个选中的文件
+  // 批量识别入口：取首个选中项作为识别目标（与单选共用同一识别弹窗）
   const firstId = Array.from(selectedIds.value)[0]
   const item = items.value.find(i => i.file_id === firstId)
   if (item) {
@@ -666,8 +652,8 @@ function openMenu(event: MouseEvent, item: FileItem) {
   }
   menuVisible.value = true
 
-  const x = Math.min(event.clientX, window.innerWidth - 180)
-  const y = Math.min(event.clientY, window.innerHeight - 180)
+  const x = Math.min(event.clientX, window.innerWidth - MENU_SIZE)
+  const y = Math.min(event.clientY, window.innerHeight - MENU_SIZE)
   menuStyle.value = { left: `${x}px`, top: `${y}px` }
 }
 
@@ -770,7 +756,7 @@ async function confirmPicker() {
       showToast(res.message || `${action === 'move' ? '移动' : '复制'}失败`, 'error')
     }
   } catch (e: any) {
-    showToast(e.message || `${action === 'move' ? '移动' : '复制'}失败`, 'error')
+    handleApiError(e, `${action === 'move' ? '移动' : '复制'}失败`)
   }
 }
 
@@ -801,7 +787,7 @@ async function handleDelete() {
       showToast(res.message || '删除失败', 'error')
     }
   } catch (e: any) {
-    showToast(e.message || '删除失败', 'error')
+    handleApiError(e, '删除失败')
   }
 }
 
@@ -820,7 +806,7 @@ async function handleMkdir() {
       showToast(res.message || '创建失败', 'error')
     }
   } catch (e: any) {
-    showToast(e.message || '创建失败', 'error')
+    handleApiError(e, '创建失败')
   }
 }
 
@@ -845,30 +831,12 @@ async function handleRename() {
       showToast(res.message || '重命名失败', 'error')
     }
   } catch (e: any) {
-    showToast(e.message || '重命名失败', 'error')
+    handleApiError(e, '重命名失败')
   }
 }
 
 // ==================== 工具函数 ====================
-
-function formatSize(bytes: number): string {
-  if (!bytes || bytes === 0) return ''
-  const units = ['B', 'KB', 'MB', 'GB', 'TB']
-  let i = 0
-  let size = bytes
-  while (size >= 1024 && i < units.length - 1) {
-    size /= 1024
-    i++
-  }
-  return `${size.toFixed(i > 0 ? 1 : 0)} ${units[i]}`
-}
-
-function formatTime(ts: string | number): string {
-  if (!ts) return '—'
-  const date = new Date(Number(ts) * 1000)
-  const pad = (n: number) => String(n).padStart(2, '0')
-  return `${date.getFullYear()}/${pad(date.getMonth() + 1)}/${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}`
-}
+// formatSize / formatTime 已统一抽至 @/composables/useFormat，保证各视图行为一致
 </script>
 
 <style scoped>

@@ -12,6 +12,7 @@ import time
 import uuid
 import base64
 import io
+import asyncio
 from typing import Optional, Dict, Any
 
 import qrcode
@@ -49,6 +50,11 @@ COMMON_HEADERS = {
     "Referer": "https://115.com/",
     "Origin": "https://115.com",
 }
+
+# 登录会话最大容量，超过则拒绝新请求，防止内存泄漏
+MAX_LOGIN_SESSIONS = 1000
+# 登录会话有效期（秒），超过则视为过期
+LOGIN_SESSION_TTL = 300
 
 
 class AuthService:
@@ -120,8 +126,30 @@ class AuthService:
                 # 判断 VIP 类型
                 if vip == 1:
                     vip_type = "forever" if forever == 1 else "vip"
+            else:
+                # 接口返回 state=False，说明登录已失效
+                logger.warning("用户信息接口返回 state=False，登录可能已失效")
+                return {
+                    "is_logged_in": False, "user_id": user_id, "user_name": "",
+                    "vip": 0, "vip_type": "none", "face": "",
+                    "message": "登录已失效，请重新登录"
+                }
         except Exception as e:
             logger.warning(f"获取用户信息失败: {e}")
+            error_str = str(e)
+            # 认证类异常（登录失效）：明确返回未登录
+            if "登录" in error_str or "auth" in error_str.lower() or "re-login" in error_str.lower():
+                return {
+                    "is_logged_in": False, "user_id": user_id, "user_name": "",
+                    "vip": 0, "vip_type": "none", "face": "",
+                    "message": "登录已失效，请重新登录"
+                }
+            # 网络等其他错误：cookies 可能仍有效，但无法确认用户信息
+            return {
+                "is_logged_in": True, "user_id": user_id, "user_name": "",
+                "vip": vip, "vip_type": vip_type, "face": face,
+                "message": "用户信息获取失败"
+            }
 
         return {
             "is_logged_in": True,
@@ -156,11 +184,16 @@ class AuthService:
             if device not in AVAILABLE_DEVICES:
                 return {"success": False, "message": f"不支持的设备类型: {device}"}
 
+            # 容量限制：防止 _login_sessions 无限增长导致内存泄漏
+            if len(self._login_sessions) >= MAX_LOGIN_SESSIONS:
+                logger.error(f"登录会话数已达上限 {MAX_LOGIN_SESSIONS}，拒绝新请求")
+                return {"success": False, "message": "登录会话数过多，请稍后重试"}
+
             logger.info(f"开始扫码登录，设备: {device}")
 
-            # 调用 115 passport API 获取二维码 token
+            # 调用 115 passport API 获取二维码 token（同步 requests 用 asyncio.to_thread 包裹，避免阻塞事件循环）
             token_url = f"{PASSPORT_API_BASE}/api/1.0/{device}/1.0/token/"
-            response = requests.get(token_url, headers=COMMON_HEADERS, timeout=30)
+            response = await asyncio.to_thread(requests.get, token_url, headers=COMMON_HEADERS, timeout=30)
 
             if not response.ok:
                 logger.error(f"获取二维码token请求失败，HTTP状态: {response.status_code}")
@@ -235,8 +268,8 @@ class AuthService:
 
         session = self._login_sessions[session_id]
 
-        # 检查会话是否过期（5分钟）
-        if time.time() - session["created_at"] > 300:
+        # 检查会话是否过期（LOGIN_SESSION_TTL 秒）
+        if time.time() - session["created_at"] > LOGIN_SESSION_TTL:
             del self._login_sessions[session_id]
             logger.info(f"会话已过期: {session_id}")
             return {"status": "expired", "message": "登录会话已过期，请重新扫码"}
@@ -263,7 +296,9 @@ class AuthService:
                 "Referer": "https://115.com/",
             }
 
-            response = requests.get(
+            # 调用 qrcodeapi 检查扫码状态（同步 requests 用 asyncio.to_thread 包裹，避免阻塞事件循环）
+            response = await asyncio.to_thread(
+                requests.get,
                 status_url,
                 params=status_params,
                 headers=status_headers,
@@ -285,8 +320,8 @@ class AuthService:
             if login_status == 2:
                 logger.info("用户已确认登录，开始获取 cookies...")
 
-                # 关键步骤：调用 login/qrcode/ 接口获取 cookies
-                cookies = self._fetch_login_cookies(uid=uid, device=device)
+                # 关键步骤：调用 login/qrcode/ 接口获取 cookies（同步方法用 asyncio.to_thread 包裹，避免阻塞）
+                cookies = await asyncio.to_thread(self._fetch_login_cookies, uid=uid, device=device)
 
                 if cookies:
                     self.save_cookies(cookies)
@@ -295,8 +330,9 @@ class AuthService:
                     logger.info("登录成功，cookies 已保存")
                     return {"status": "confirmed", "cookies": cookies, "message": "登录成功"}
                 else:
+                    # 获取 cookies 失败：标记为 error 而非 confirmed，避免状态矛盾
                     logger.error("获取 cookies 失败")
-                    session["status"] = "confirmed"
+                    session["status"] = "error"
                     session["cookies"] = None
                     return {"status": "error", "message": "获取 cookies 失败，请重试"}
 

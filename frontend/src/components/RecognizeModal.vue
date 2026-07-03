@@ -143,7 +143,7 @@
 
 <script setup lang="ts">
 import { ref, computed, watch } from 'vue'
-import { organizeApi } from '@/api/organize'
+import { organizeApi, type RecognizeResult } from '@/api/organize'
 import { filesApi, type FileItem } from '@/api/files'
 
 const props = defineProps<{
@@ -156,7 +156,7 @@ const emit = defineEmits<{
 }>()
 
 const loading = ref(false)
-const result = ref<any>(null)
+const result = ref<RecognizeResult | null>(null)
 const executing = ref(false)
 const execError = ref('')
 const execSuccess = ref('')
@@ -165,7 +165,10 @@ const manualMediaType = ref<'movie' | 'tv'>('movie')
 const manualLoading = ref(false)
 const manualError = ref('')
 
-// 是否有技术信息
+// 请求版本号：每次发起新识别或关闭弹窗时自增，
+// await 后比对版本可判断本次请求是否仍为"当前请求"，避免旧请求覆盖新状态
+let currentRequestId = 0
+
 const hasTechInfo = computed(() => {
   if (!result.value?.tech_info) return false
   const t = result.value.tech_info
@@ -177,6 +180,8 @@ watch(() => props.visible, (val) => {
   if (val && props.item) {
     recognizeFile(props.item)
   } else {
+    // 关闭时自增版本号，使进行中的识别请求作废，避免其 await 完成后覆盖新状态
+    currentRequestId++
     result.value = null
     execError.value = ''
     execSuccess.value = ''
@@ -192,7 +197,15 @@ function close() {
   emit('close')
 }
 
+/**
+ * 自动识别入口（打开弹窗时触发）
+ * - 文件夹模式：根据内容推断 mediaType 后调用 TMDB 搜索
+ * - 文件模式：直接调用 TMDB 搜索
+ * - 含请求版本号校验，避免旧版本响应覆盖新版本结果
+ */
 async function recognizeFile(item: FileItem) {
+  // 自增版本号并捕获，作为本次请求的"当前性"凭证
+  const reqId = ++currentRequestId
   loading.value = true
   result.value = null
   try {
@@ -202,6 +215,8 @@ async function recognizeFile(item: FileItem) {
     if (item.is_dir) {
       try {
         const listRes = await filesApi.listFiles(item.file_id, 200)
+        // 若期间已发起新请求或关闭弹窗，则丢弃本次结果
+        if (reqId !== currentRequestId) return
         if (listRes.code === 0 && listRes.data?.items) {
           folderFiles = listRes.data.items.map((f: FileItem) => f.name)
         }
@@ -216,6 +231,8 @@ async function recognizeFile(item: FileItem) {
       is_dir: item.is_dir,
       folder_files: folderFiles,
     })
+    // await 完成后再次校验版本，避免旧请求覆盖新状态
+    if (reqId !== currentRequestId) return
     if (res.code === 0 && res.data) {
       result.value = res.data
       manualTmdbId.value = res.data.tmdb_id ? String(res.data.tmdb_id) : ''
@@ -225,12 +242,20 @@ async function recognizeFile(item: FileItem) {
     }
   } catch (e) {
     console.error('识别失败:', e)
+    if (reqId !== currentRequestId) return
     result.value = null
   } finally {
-    loading.value = false
+    // 仅当本次仍为当前请求时才复位 loading
+    if (reqId === currentRequestId) {
+      loading.value = false
+    }
   }
 }
 
+/**
+ * 手动识别入口（用户输入 TMDB ID 后触发）
+ * 与 recognizeFile 的区别：跳过 TMDB 搜索，直接用用户指定的 ID 查询详情
+ */
 async function manualRecognize() {
   if (!props.item) return
   const tmdbId = Number(manualTmdbId.value)
@@ -239,6 +264,8 @@ async function manualRecognize() {
     return
   }
 
+  // 自增版本号并捕获，用于 await 后校验请求当前性
+  const reqId = ++currentRequestId
   manualLoading.value = true
   manualError.value = ''
   execError.value = ''
@@ -246,9 +273,15 @@ async function manualRecognize() {
   try {
     let folderFiles: string[] | undefined
     if (props.item.is_dir) {
-      const listRes = await filesApi.listFiles(props.item.file_id, 200)
-      if (listRes.code === 0 && listRes.data?.items) {
-        folderFiles = listRes.data.items.map((f: FileItem) => f.name)
+      // 与 recognizeFile 保持一致：listFiles 失败不应中断主流程
+      try {
+        const listRes = await filesApi.listFiles(props.item.file_id, 200)
+        if (reqId !== currentRequestId) return
+        if (listRes.code === 0 && listRes.data?.items) {
+          folderFiles = listRes.data.items.map((f: FileItem) => f.name)
+        }
+      } catch (e) {
+        console.warn('获取文件夹内容失败:', e)
       }
     }
 
@@ -260,6 +293,8 @@ async function manualRecognize() {
       tmdb_id: tmdbId,
       media_type: manualMediaType.value,
     })
+    // await 完成后校验版本，避免旧请求覆盖新状态
+    if (reqId !== currentRequestId) return
     if (res.code === 0 && res.data) {
       result.value = res.data
       manualTmdbId.value = String(res.data.tmdb_id || tmdbId)
@@ -268,12 +303,20 @@ async function manualRecognize() {
       manualError.value = res.message || '手动识别失败'
     }
   } catch (e: any) {
+    if (reqId !== currentRequestId) return
     manualError.value = e.message || '手动识别失败'
   } finally {
-    manualLoading.value = false
+    // 仅当本次仍为当前请求时才复位 manualLoading
+    if (reqId === currentRequestId) {
+      manualLoading.value = false
+    }
   }
 }
 
+/**
+ * 执行整理入口
+ * 依赖 result.target_path，调用后端整理接口将文件移动到目标路径
+ */
 async function doOrganize() {
   if (!props.item || !result.value?.target_path) return
 

@@ -21,20 +21,23 @@ STRM 文件生成服务 - 基于已整理的分享数据库记录生成本地 .s
 import os
 from pathlib import Path
 from typing import List, Dict, Optional
-from urllib.parse import urlencode
+from urllib.parse import urlencode, quote
 
 from p115client import P115Client
 
 from ..db.database import get_db
-from ..paths import ACCESSIBLE_PATHS_FILE, split_accessible_paths
+from ..paths import ACCESSIBLE_PATHS_FILE, TRIM_PKGVAR, split_accessible_paths
 from ..services.auth_service import get_auth_service
 from ..services.config_service import get_config_service
-from ..services.file_info_service import get_video_extensions, invalidate_video_extensions_cache, VIDEO_EXTENSIONS
+from ..services.file_info_service import get_video_extensions, invalidate_video_extensions_cache
 from ..services.file_service import get_file_service
-from ..exceptions import NotLoggedInError
+from ..exceptions import NotLoggedInError, ConfigError, PathNotAuthorizedError
 from ..logger import get_logger
 
 logger = get_logger(__name__)
+
+# 错误信息收集上限，超过后停止记录（避免错误过多导致响应体过大）
+MAX_ERRORS = 50
 
 # ==================== 配置键 ====================
 # STRM 直链基地址，例如 http://127.0.0.1:11581
@@ -103,32 +106,33 @@ class StrmService:
             保存后的配置字典
 
         Raises:
-            ValueError: 基地址格式非法或输出路径未授权
+            ConfigError: 基地址格式非法或未获取到授权路径
+            PathNotAuthorizedError: 输出路径不在授权目录内
         """
         # 基地址校验
         base_url = (direct_link_base_url or "").strip()
         if not base_url:
             base_url = DEFAULT_STRM_BASE_URL
         if not (base_url.startswith("http://") or base_url.startswith("https://")):
-            raise ValueError("直链基地址必须以 http:// 或 https:// 开头")
+            raise ConfigError("直链基地址必须以 http:// 或 https:// 开头")
 
         # 分享 STRM 输出路径校验
         out_path = (output_path or "").strip()
         if out_path:
             accessible = self.get_accessible_paths()
             if not accessible:
-                raise ValueError("尚未获取到飞牛授权路径，请先在飞牛应用设置中授权目录")
+                raise ConfigError("尚未获取到飞牛授权路径，请先在飞牛应用设置中授权目录")
             if not self._is_path_authorized(out_path, accessible):
-                raise ValueError(f"分享 STRM 输出路径不在飞牛授权目录内: {out_path}")
+                raise PathNotAuthorizedError(out_path, "分享 STRM 输出")
 
         # 云盘 STRM 输出路径校验（规则同上）
         cloud_path = (cloud_output_path or "").strip()
         if cloud_path:
             accessible = self.get_accessible_paths()
             if not accessible:
-                raise ValueError("尚未获取到飞牛授权路径，请先在飞牛应用设置中授权目录")
+                raise ConfigError("尚未获取到飞牛授权路径，请先在飞牛应用设置中授权目录")
             if not self._is_path_authorized(cloud_path, accessible):
-                raise ValueError(f"云盘 STRM 输出路径不在飞牛授权目录内: {cloud_path}")
+                raise PathNotAuthorizedError(cloud_path, "云盘 STRM 输出")
 
         # 视频扩展名校验：为空回退默认，非空则规范化（补点前缀）
         exts_raw = (video_extensions or "").strip()
@@ -165,18 +169,21 @@ class StrmService:
     def get_accessible_paths(self) -> List[str]:
         """获取飞牛授权的可访问路径列表
 
-        路径文件位置统一由 paths.py 管理：
-        - 飞牛环境：${TRIM_PKGVAR}/accessible_paths.env
-        - 本地开发：{PROJECT_ROOT}/data/accessible_paths.env
+        数据源优先级：
+        1. 环境变量 TRIM_DATA_ACCESSIBLE_PATHS（飞牛运行时注入，分号分隔）
+        2. 落盘文件 ACCESSIBLE_PATHS_FILE（仅本地开发使用，模拟飞牛授权目录）
+
+        飞牛正式环境只读环境变量，不使用落盘文件缓存，
+        避免授权目录变更后旧文件导致读到过时路径。
 
         Returns:
             去重后的授权路径列表
         """
         raw = os.environ.get("TRIM_DATA_ACCESSIBLE_PATHS", "")
 
-        # 环境变量为空时尝试读取落盘文件。
-        # 本地 Windows 测试时，accessible_paths.env 可以直接写 D:\OneFive\strm-test。
-        if not raw and ACCESSIBLE_PATHS_FILE.exists():
+        # 环境变量为空且非飞牛环境时，读取落盘文件（仅本地开发用）
+        # 飞牛环境（有 TRIM_PKGVAR）必须只用环境变量，保证授权目录实时生效
+        if not raw and not TRIM_PKGVAR and ACCESSIBLE_PATHS_FILE.exists():
             try:
                 raw = ACCESSIBLE_PATHS_FILE.read_text(encoding="utf-8")
             except Exception as e:
@@ -255,6 +262,8 @@ class StrmService:
             return ""
         # 去除空字节
         s = segment.replace("\x00", "")
+        # 统一反斜杠为正斜杠，避免 Windows 下 \ 绕过基于 / 的拆分造成路径穿越
+        s = s.replace("\\", "/")
         # 去除首尾空白和斜杠
         s = s.strip().strip("/").strip()
         # 禁止 . 和 ..
@@ -300,6 +309,27 @@ class StrmService:
 
         return Path(*parts)
 
+    @staticmethod
+    def _is_within_directory(full_path: Path, root: Path) -> bool:
+        """二次校验：解析后的绝对路径是否位于 root 目录之下（含 root 自身）
+
+        用于在 _sanitize_segment 清洗之后再做一道 resolve 校验，
+        防止任何残留的路径穿越（如符号链接、未过滤干净的片段）写到授权目录之外。
+
+        Args:
+            full_path: 待校验的完整路径
+            root: 输出根目录
+
+        Returns:
+            True 表示安全（在 root 之下），False 表示越界
+        """
+        try:
+            full_resolved = full_path.resolve()
+            root_resolved = root.resolve()
+            return full_resolved == root_resolved or root_resolved in full_resolved.parents
+        except Exception:
+            return False
+
     def _build_strm_url(self, base_url: str, organized_name: str,
                         share_code: str, receive_code: str, file_id: str) -> str:
         """构建 STRM 文件内容（直链 URL）
@@ -307,14 +337,13 @@ class StrmService:
         格式：
             {base_url}/d115/{organized_name}?share_code=...&receive_code=...&id=...
 
-        这里特意不编码 organized_name：
-        - STRM 文件是给 Emby 读取的普通文本，保留中文更直观
-        - 当前直链服务和 PathStripMiddleware 已按原始路径处理中文文件名
-        - query 参数仍使用 urlencode，避免分享码、提取码等参数出现特殊字符时错位
+        对文件名路径段使用 URL 编码（quote(safe='')），处理含 ?、#、&、空格
+        等特殊字符的文件名，避免破坏 URL 结构。query 参数仍用 urlencode
+        编码，避免分享码、提取码等参数出现特殊字符时错位。
 
         Args:
             base_url: 直链基地址
-            organized_name: 文件名（用于 URL 路径段，保持原文）
+            organized_name: 文件名（用于 URL 路径段，会被 URL 编码）
             share_code: 分享码
             receive_code: 提取码（可能为空）
             file_id: 文件 ID
@@ -327,9 +356,64 @@ class StrmService:
             "receive_code": receive_code or "",
             "id": file_id or "",
         })
-        return f"{base_url.rstrip('/')}/d115/{organized_name}?{query}"
+        # 对文件名进行 URL 编码以处理特殊字符（safe='' 表示所有非字母数字字符都编码）
+        encoded_name = quote(organized_name or "", safe="")
+        return f"{base_url.rstrip('/')}/d115/{encoded_name}?{query}"
 
     # ==================== 生成 ====================
+
+    def _write_strm_file(self, output_root: Path, rel_path: Path, url: str,
+                         file_id: str, name: str, errors: List) -> str:
+        """写入单个 STRM 文件的公共逻辑（generate / generate_cloud 共用）
+
+        统一处理：路径安全二次校验、跳过已存在且内容相同、创建父目录、写入文件、异常收集。
+        错误信息达到 MAX_ERRORS 上限时仍会追加本条错误，是否中断循环由调用者根据
+        len(errors) >= MAX_ERRORS 自行决定。
+
+        Args:
+            output_root: 输出根目录（已通过授权校验）
+            rel_path: STRM 文件相对路径（已清洗）
+            url: STRM 文件内容（直链 URL）
+            file_id: 文件 ID（仅用于错误上报）
+            name: 文件名（仅用于错误上报）
+            errors: 错误信息收集列表，会被原地追加
+
+        Returns:
+            'created' 新建成功；'skipped' 已存在且内容相同；'failed' 校验或写入失败
+        """
+        try:
+            full_path = output_root / rel_path
+
+            # 二次校验：解析后必须仍在输出根目录下，防止路径穿越
+            if not self._is_within_directory(full_path, output_root):
+                errors.append({
+                    "file_id": str(file_id),
+                    "name": name,
+                    "error": "路径校验失败：解析后超出输出根目录",
+                })
+                return "failed"
+
+            # 跳过已存在且内容相同的 STRM 文件，避免重复写入
+            if full_path.exists():
+                try:
+                    existing = full_path.read_text(encoding="utf-8")
+                except Exception:
+                    existing = ""
+                if existing == url:
+                    return "skipped"
+
+            full_path.parent.mkdir(parents=True, exist_ok=True)
+
+            # 写入 URL（覆盖模式）
+            full_path.write_text(url, encoding="utf-8")
+            return "created"
+        except Exception as e:
+            errors.append({
+                "file_id": str(file_id),
+                "name": name,
+                "error": f"写入失败: {e}",
+            })
+            return "failed"
 
     def generate(self) -> Dict:
         """生成 STRM 文件到配置的输出目录
@@ -338,27 +422,27 @@ class StrmService:
             {
                 "total": 120,
                 "created": 118,
-                "skipped": 0,
+                "skipped": 5,
                 "failed": 2,
-                "errors": [
-                    {"file_id": "xxx", "name": "xxx.mp4", "error": "写入失败: ..."}
-                ]
+                "errors": [...],
+                "truncated": false
             }
 
         Raises:
-            ValueError: 输出路径未配置或不在授权目录内
+            ConfigError: 输出路径未配置
+            PathNotAuthorizedError: 输出路径不在授权目录内
         """
         settings = self.get_settings()
         base_url = settings["direct_link_base_url"]
         output_path = settings["output_path"]
 
         if not output_path:
-            raise ValueError("尚未配置 STRM 输出路径，请先在设置页选择授权目录")
+            raise ConfigError("尚未配置分享 STRM 输出路径，请先在设置页选择授权目录")
 
         # 二次校验授权
         accessible = self.get_accessible_paths()
         if not accessible or not self._is_path_authorized(output_path, accessible):
-            raise ValueError("输出路径不在飞牛授权目录内，请重新选择")
+            raise PathNotAuthorizedError(output_path, "分享 STRM 输出")
 
         output_root = Path(output_path)
         files = self._query_organized_files()
@@ -368,39 +452,40 @@ class StrmService:
         skipped = 0
         errors: List[Dict] = []
 
-        for f in files:
-            try:
-                rel_path = self._build_relative_path(
-                    f.get("category", ""),
-                    f.get("organized_dir", ""),
-                    f.get("organized_name", ""),
-                )
-                url = self._build_strm_url(
-                    base_url,
-                    f.get("organized_name", ""),
-                    f.get("share_code", ""),
-                    f.get("receive_code", ""),
-                    f.get("file_id", ""),
-                )
+        for file_row in files:
+            # 构建相对路径与直链 URL
+            rel_path = self._build_relative_path(
+                file_row.get("category", ""),
+                file_row.get("organized_dir", ""),
+                file_row.get("organized_name", ""),
+            )
+            url = self._build_strm_url(
+                base_url,
+                file_row.get("organized_name", ""),
+                file_row.get("share_code", ""),
+                file_row.get("receive_code", ""),
+                file_row.get("file_id", ""),
+            )
+            # 错误上报用的标识
+            file_id = file_row.get("file_id", "")
+            name = file_row.get("organized_name") or file_row.get("name", "")
 
-                full_path = output_root / rel_path
-                full_path.parent.mkdir(parents=True, exist_ok=True)
-
-                # 写入 URL（覆盖模式）
-                full_path.write_text(url, encoding="utf-8")
+            # 公共写入逻辑：校验→跳过→创建→写入→异常收集
+            result = self._write_strm_file(output_root, rel_path, url, file_id, name, errors)
+            if result == "created":
                 created += 1
-            except Exception as e:
+            elif result == "skipped":
+                skipped += 1
+            else:
                 failed += 1
-                errors.append({
-                    "file_id": str(f.get("file_id", "")),
-                    "name": f.get("organized_name") or f.get("name", ""),
-                    "error": f"写入失败: {e}",
-                })
-                if len(errors) >= 50:
-                    break
+
+            # 错误信息达到上限后中断循环
+            if len(errors) >= MAX_ERRORS:
+                break
 
         logger.info(
-            f"STRM 生成完成：总数 {len(files)}，成功 {created}，失败 {failed}"
+            f"STRM 生成完成：总数 {len(files)}，成功 {created}，"
+            f"跳过 {skipped}，失败 {failed}"
         )
 
         return {
@@ -409,6 +494,8 @@ class StrmService:
             "skipped": skipped,
             "failed": failed,
             "errors": errors,
+            # errors 达到上限后被截断，前端可据此提示"错误较多未全部展示"
+            "truncated": len(errors) >= MAX_ERRORS,
         }
 
     # ==================== 云盘 STRM 生成 ====================
@@ -503,20 +590,20 @@ class StrmService:
 
         格式：{base_url}/d115/{filename}?pickcode={pick_code}
 
-        filename 保持原文不编码，原因：
-        - 与分享 STRM 一致
-        - STRM 是给 Emby 读取的普通文本，保留中文更直观
-        - 直链服务和 PathStripMiddleware 已按原始路径处理中文文件名
+        对文件名路径段使用 URL 编码（quote(safe='')），处理含 ?、#、&、空格
+        等特殊字符的文件名，避免破坏 URL 结构。与分享 STRM 保持一致。
 
         Args:
             base_url: 直链基地址
-            filename: 文件名（用于 URL 路径段，保持原文）
+            filename: 文件名（用于 URL 路径段，会被 URL 编码）
             pick_code: 115 文件的 pickcode
 
         Returns:
             完整直链 URL
         """
-        return f"{base_url.rstrip('/')}/d115/{filename}?pickcode={pick_code}"
+        # 对文件名进行 URL 编码以处理特殊字符
+        encoded_name = quote(filename or "", safe="")
+        return f"{base_url.rstrip('/')}/d115/{encoded_name}?pickcode={pick_code}"
 
     def _build_cloud_relative_path(self, file_path: str, media_library_path: str) -> Optional[Path]:
         """构建云盘 STRM 文件的相对路径
@@ -592,7 +679,8 @@ class StrmService:
             }
 
         Raises:
-            ValueError: 输出路径未配置或不在授权目录内
+            ConfigError: 输出路径未配置或媒体库路径不存在
+            PathNotAuthorizedError: 输出路径不在授权目录内
             NotLoggedInError: 未登录
         """
         settings = self.get_settings()
@@ -600,12 +688,12 @@ class StrmService:
         cloud_output_path = settings["cloud_output_path"]
 
         if not cloud_output_path:
-            raise ValueError("尚未配置云盘 STRM 输出路径，请先在设置页选择授权目录")
+            raise ConfigError("尚未配置云盘 STRM 输出路径，请先在设置页选择授权目录")
 
         # 二次校验授权
         accessible = self.get_accessible_paths()
         if not accessible or not self._is_path_authorized(cloud_output_path, accessible):
-            raise ValueError("云盘 STRM 输出路径不在飞牛授权目录内，请重新选择")
+            raise PathNotAuthorizedError(cloud_output_path, "云盘 STRM 输出")
 
         # 读取媒体库路径
         media_library_path = self.config_service.get("media_library_path") or ""
@@ -613,7 +701,7 @@ class StrmService:
         # 解析 media_library_path 为 cid
         root_cid = self._resolve_cid_by_path(media_library_path)
         if root_cid is None:
-            raise ValueError(f"云盘媒体库路径不存在: {media_library_path}")
+            raise ConfigError(f"云盘媒体库路径不存在: {media_library_path}，请先在设置页配置媒体库路径")
 
         output_root = Path(cloud_output_path)
 
@@ -632,48 +720,45 @@ class StrmService:
         errors: List[Dict] = []
 
         # 递归遍历云盘目录（用 fs_files 列表 API，不依赖 download_files_app）
-        for f in self._iter_cloud_files_with_path(root_cid, media_library_path):
-            try:
-                name = f.get("name", "")
-                pick_code = f.get("pick_code", "")
-                file_path = f.get("path", "")
+        for file_row in self._iter_cloud_files_with_path(root_cid, media_library_path):
+            name = file_row.get("name", "")
+            pick_code = file_row.get("pick_code", "")
+            file_path = file_row.get("path", "")
 
-                if not name or not pick_code or not file_path:
-                    skipped += 1
-                    continue
+            if not name or not pick_code or not file_path:
+                skipped += 1
+                continue
 
-                # 只处理视频文件
-                ext = Path(name).suffix.lower()
-                if ext not in video_exts:
-                    skipped += 1
-                    continue
+            # 只处理视频文件
+            ext = Path(name).suffix.lower()
+            if ext not in video_exts:
+                skipped += 1
+                continue
 
-                total += 1
+            # 构建相对路径；为空则跳过（提前判断，避免 total 先加后减造成计数不一致）
+            rel_path = self._build_cloud_relative_path(file_path, media_library_path)
+            if rel_path is None:
+                skipped += 1
+                continue
 
-                # 构建相对路径和 URL
-                rel_path = self._build_cloud_relative_path(file_path, media_library_path)
-                if rel_path is None:
-                    skipped += 1
-                    total -= 1
-                    continue
+            total += 1
 
-                url = self._build_cloud_strm_url(base_url, name, pick_code)
+            url = self._build_cloud_strm_url(base_url, name, pick_code)
+            # 错误上报用的标识
+            file_id = file_row.get("id") or file_row.get("fid") or ""
 
-                full_path = output_root / rel_path
-                full_path.parent.mkdir(parents=True, exist_ok=True)
-
-                # 写入 URL（覆盖模式）
-                full_path.write_text(url, encoding="utf-8")
+            # 公共写入逻辑：校验→跳过→创建→写入→异常收集
+            result = self._write_strm_file(output_root, rel_path, url, file_id, name, errors)
+            if result == "created":
                 created += 1
-            except Exception as e:
+            elif result == "skipped":
+                skipped += 1
+            else:
                 failed += 1
-                errors.append({
-                    "file_id": str(f.get("id") or f.get("fid") or ""),
-                    "name": f.get("name") or f.get("n") or "",
-                    "error": f"写入失败: {e}",
-                })
-                if len(errors) >= 50:
-                    break
+
+            # 错误信息达到上限后中断循环
+            if len(errors) >= MAX_ERRORS:
+                break
 
         logger.info(
             f"云盘 STRM 生成完成：视频总数 {total}，成功 {created}，"
@@ -686,6 +771,8 @@ class StrmService:
             "skipped": skipped,
             "failed": failed,
             "errors": errors,
+            # errors 达到上限后被截断，前端可据此提示"错误较多未全部展示"
+            "truncated": len(errors) >= MAX_ERRORS,
         }
 
 

@@ -97,8 +97,9 @@
 </template>
 
 <script setup lang="ts">
-import { ref, computed, watch, nextTick } from 'vue'
+import { ref, computed, watch, nextTick, onUnmounted } from 'vue'
 import { logsApi, type LogLine } from '@/api/logs'
+import api from '@/api/index'
 
 const props = defineProps<{ visible: boolean }>()
 const emit = defineEmits(['close'])
@@ -111,6 +112,13 @@ const keyword = ref('')
 const autoScroll = ref(true)
 const logBodyRef = ref<HTMLElement | null>(null)
 
+/** 日志缓冲区上限：超过后裁剪旧日志，避免内存占用过大 */
+const LOG_BUFFER_MAX = 2000
+/** 裁剪后保留的日志条数（保留最近的 N 条） */
+const LOG_BUFFER_KEEP = 1500
+/** 打开面板时初始拉取的历史日志条数 */
+const LOG_INITIAL_FETCH = 500
+
 // 日志级别优先级：DEBUG < INFO < WARNING < ERROR
 const levelPriority: Record<string, number> = {
   'DEBUG': 0,
@@ -119,7 +127,6 @@ const levelPriority: Record<string, number> = {
   'ERROR': 3,
 }
 
-// 从日志中提取唯一模块列表
 const modules = computed(() => {
   const set = new Set(lines.value.map(l => l.module).filter(Boolean))
   return Array.from(set).sort()
@@ -134,12 +141,10 @@ const filteredLines = computed(() => {
     result = result.filter(l => (levelPriority[l.level] ?? 0) >= minPriority)
   }
 
-  // 模块筛选
   if (selectedModule.value) {
     result = result.filter(l => l.module === selectedModule.value)
   }
 
-  // 关键词搜索
   if (keyword.value) {
     const kw = keyword.value.toLowerCase()
     result = result.filter(l => l.message.toLowerCase().includes(kw) || l.module.toLowerCase().includes(kw))
@@ -148,7 +153,6 @@ const filteredLines = computed(() => {
   return result
 })
 
-// 自动滚动
 watch(() => filteredLines.value.length, () => {
   if (autoScroll.value) {
     nextTick(() => {
@@ -159,27 +163,64 @@ watch(() => filteredLines.value.length, () => {
   }
 })
 
-// SSE 流
+// SSE 连接实例（用于实时接收服务端日志推送，支持断线指数退避重连）
+// 限制最大重连次数，避免后端不可达时无限重连消耗资源；
+// 指数退避（3s/6s/12s/24s/48s）缓解短时间内的密集重连。
 let eventSource: EventSource | null = null
+let reconnectTimer: number | null = null
+let retryCount = 0
+const MAX_RETRY = 5
+const BASE_DELAY = 3000
 
 function startStream() {
   if (eventSource) return
   try {
-    eventSource = new EventSource('/app/onefive/api/logs/stream')
+    // SSE 地址从 axios baseURL 拼接，保持与 REST 接口同源
+    const streamUrl = `${api.defaults.baseURL}/logs/stream`
+    eventSource = new EventSource(streamUrl)
+    // 连接成功后重置重试计数，便于本次断开后重新计数
+    eventSource.onopen = () => {
+      retryCount = 0
+    }
     eventSource.onmessage = (event) => {
       try {
         const line = JSON.parse(event.data)
         lines.value.push(line)
-        if (lines.value.length > 2000) {
-          lines.value = lines.value.slice(-1500)
+        if (lines.value.length > LOG_BUFFER_MAX) {
+          lines.value = lines.value.slice(-LOG_BUFFER_KEEP)
         }
-      } catch {}
+      } catch (e) {
+        // JSON 解析失败时记录到控制台，便于排查后端推送的异常数据
+        console.error('日志流解析失败:', e)
+      }
     }
     eventSource.onerror = () => {
       stopStream()
-      setTimeout(() => { startStream() }, 3000)
+      scheduleReconnect()
     }
-  } catch {}
+  } catch (e) {
+    // 构造异常时也走重连调度，保证流程一致
+    console.error('日志流连接异常:', e)
+    scheduleReconnect()
+  }
+}
+
+// 指数退避重连：达到 MAX_RETRY 后停止，并写入一条错误日志提示用户手动刷新
+function scheduleReconnect() {
+  if (retryCount >= MAX_RETRY) {
+    const now = new Date().toLocaleString('zh-CN', { hour12: false })
+    lines.value.push({
+      time: now,
+      level: 'ERROR',
+      module: 'LogViewer',
+      message: '日志实时连接重试已达上限，请手动刷新重试。',
+      raw: '',
+    })
+    return
+  }
+  const delay = BASE_DELAY * Math.pow(2, retryCount)
+  retryCount++
+  reconnectTimer = window.setTimeout(() => { startStream() }, delay)
 }
 
 function stopStream() {
@@ -187,12 +228,17 @@ function stopStream() {
     eventSource.close()
     eventSource = null
   }
+  // 同时清理待执行的重连定时器，避免关闭后仍触发重连
+  if (reconnectTimer) {
+    clearTimeout(reconnectTimer)
+    reconnectTimer = null
+  }
 }
 
 async function loadLogs() {
   loading.value = true
   try {
-    const res = await logsApi.getLogs(500)
+    const res = await logsApi.getLogs(LOG_INITIAL_FETCH)
     lines.value = res.lines || []
   } catch (e) {
     console.error('加载日志失败:', e)
@@ -209,11 +255,18 @@ function close() {
 // visible 变化时加载/停止
 watch(() => props.visible, (val) => {
   if (val) {
+    // 重新打开面板时重置重试计数，避免上轮已达上限影响本次
+    retryCount = 0
     loadLogs()
     startStream()
   } else {
     stopStream()
   }
+})
+
+// 组件卸载兜底清理：关闭连接与重连定时器，防止内存泄漏与卸载后回调
+onUnmounted(() => {
+  stopStream()
 })
 </script>
 

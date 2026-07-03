@@ -23,7 +23,7 @@
 </template>
 
 <script setup lang="ts">
-import { ref } from 'vue'
+import { ref, onUnmounted } from 'vue'
 
 const visible = ref(false)
 const message = ref('')
@@ -40,6 +40,14 @@ function show(msg: string, msgType: 'success' | 'error' | 'info' = 'info', durat
     visible.value = false
   }, duration)
 }
+
+// 组件卸载时清理定时器，避免卸载后仍触发 visible.value 赋值
+onUnmounted(() => {
+  if (timer) {
+    clearTimeout(timer)
+    timer = null
+  }
+})
 
 defineExpose({ show })
 </script>

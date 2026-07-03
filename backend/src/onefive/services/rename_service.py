@@ -84,50 +84,34 @@ def render_template(template: str, variables: Dict[str, Any]) -> str:
     return result
 
 
-def generate_movie_path(title: str, year: str, tmdb_id: str, tech_info: Dict[str, str],
-                        season_year: str = '', season: str = '', episode: str = '') -> Dict[str, str]:
-    """生成电影目标路径
+def _generate_path(template_key: str, title: str, year: str, tmdb_id: str,
+                   tech_info: Dict[str, str], season_year: str = '',
+                   season: str = '', episode: str = '') -> Dict[str, str]:
+    """生成目标路径（电影/电视剧通用实现）
+
+    合并原 generate_movie_path / generate_tv_path 的重复逻辑：
+    仅模板键和默认模板不同，变量字典与渲染流程完全一致。
+
+    Args:
+        template_key: 配置键名，"movie_template" 或 "tv_template"
+        title: 标题
+        year: 年份
+        tmdb_id: TMDB ID
+        tech_info: 技术信息
+        season_year: 季年份
+        season: 季数
+        episode: 集数
 
     Returns:
         {"dir": "目录路径", "filename": "文件名"}
     """
     config_service = get_config_service()
-    template = config_service.get("movie_template") or DEFAULT_MOVIE_TEMPLATE
-
-    variables = {
-        "title": title,
-        "year": year,
-        "tmdbid": tmdb_id,
-        "videoFormat": tech_info.get("videoFormat", ""),
-        "edition": tech_info.get("edition", ""),
-        "videoCodec": tech_info.get("videoCodec", ""),
-        "audioCodec": tech_info.get("audioCodec", ""),
-        "webSource": tech_info.get("webSource", ""),
-        "releaseGroup": tech_info.get("releaseGroup", ""),
-        "fileExt": tech_info.get("fileExt", ""),
-        "seasonYear": season_year,
-        "season": season,
-        "episode": episode,
-        "SXXEXX": f"S{season.zfill(2)}E{episode.zfill(2)}" if season and episode else "",
-    }
-
-    rendered = render_template(template, variables)
-    parts = rendered.rsplit('/', 1)
-    
-    if len(parts) == 2:
-        return {"dir": parts[0], "filename": parts[1]}
-    return {"dir": "", "filename": rendered}
-
-
-def generate_tv_path(title: str, year: str, tmdb_id: str, tech_info: Dict[str, str],
-                     season_year: str = '', season: str = '', episode: str = '') -> Dict[str, str]:
-    """生成电视剧目标路径
-
-    Returns:
-        {"dir": "目录路径", "filename": "文件名"}
-    """
-    config_service = get_config_service()
-    template = config_service.get("tv_template") or DEFAULT_TV_TEMPLATE
+    # 按模板键选择配置项和默认模板
+    if template_key == "movie_template":
+        default_template = DEFAULT_MOVIE_TEMPLATE
+    else:
+        default_template = DEFAULT_TV_TEMPLATE
+    template = config_service.get(template_key) or default_template
 
     variables = {
         "title": title,
@@ -153,6 +137,28 @@ def generate_tv_path(title: str, year: str, tmdb_id: str, tech_info: Dict[str, s
     if len(parts) == 2:
         return {"dir": parts[0], "filename": parts[1]}
     return {"dir": "", "filename": rendered}
+
+
+def generate_movie_path(title: str, year: str, tmdb_id: str, tech_info: Dict[str, str],
+                        season_year: str = '', season: str = '', episode: str = '') -> Dict[str, str]:
+    """生成电影目标路径（薄封装，委托 _generate_path）
+
+    Returns:
+        {"dir": "目录路径", "filename": "文件名"}
+    """
+    return _generate_path("movie_template", title, year, tmdb_id, tech_info,
+                          season_year, season, episode)
+
+
+def generate_tv_path(title: str, year: str, tmdb_id: str, tech_info: Dict[str, str],
+                     season_year: str = '', season: str = '', episode: str = '') -> Dict[str, str]:
+    """生成电视剧目标路径（薄封装，委托 _generate_path）
+
+    Returns:
+        {"dir": "目录路径", "filename": "文件名"}
+    """
+    return _generate_path("tv_template", title, year, tmdb_id, tech_info,
+                          season_year, season, episode)
 
 
 def generate_target_path(media_type: str, title: str, year: str, tmdb_id: str,

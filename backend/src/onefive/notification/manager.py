@@ -67,6 +67,9 @@ class NotificationManager:
 
         for name, channel in self._channels.items():
             try:
+                # 先检查渠道启用开关，未启用的渠道直接跳过
+                if not await channel.is_enabled():
+                    continue
                 if await channel.is_configured() and await channel.is_connected():
                     tasks.append(channel.send_message(message, image_url))
                     channel_names.append(name)

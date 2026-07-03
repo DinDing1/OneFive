@@ -20,6 +20,28 @@ DEFAULT_API_URL = "https://api.themoviedb.org/3"
 DEFAULT_LANGUAGE = "zh-CN"
 DEFAULT_API_KEY = "9cb87f133b1860fab0db5130aa4ab023"
 
+# ==================== 常量 ====================
+# TMDB API 请求超时时间（秒）
+API_TIMEOUT = 15
+# 标题匹配阈值：分数达到此值才视为匹配（用于 matches_title 和 _pick_best_result）
+MATCH_THRESHOLD = 45.0
+# 精确匹配得分（标题或别名完全一致）
+SCORE_EXACT_MATCH = 100.0
+# 子串匹配得分（标题互为子串）
+SCORE_TITLE_SUBSTRING = 80.0
+SCORE_ALIAS_SUBSTRING = 85.0
+# 模糊匹配乘数（SequenceMatcher 相似度 × 乘数）
+SCORE_TITLE_FUZZY_RATIO = 70
+SCORE_ALIAS_FUZZY_RATIO = 60
+# 年份匹配加分 / 不匹配扣分（有年份输入时强烈优先同年）
+YEAR_MATCH_BONUS = 60
+YEAR_MISMATCH_PENALTY = -80
+# 搜索结果热度权重乘数
+POPULARITY_WEIGHT = 2
+# 搜索结果位置权重：越靠前加分越多
+POSITION_BONUS_MAX = 20
+POSITION_BONUS_FACTOR = 0.1
+
 
 class TMDBService:
     """TMDB 识别服务"""
@@ -57,11 +79,13 @@ class TMDBService:
     def image_url(self) -> str:
         """获取 TMDB 图片地址
 
-        未配置代理时使用官方图片域名；配置代理时使用同一代理基础域名拼接 /t/p。
+        未配置代理或配置的是 TMDB 官方 API 地址时，使用官方图片域名 image.tmdb.org；
+        配置了第三方代理时，使用同一代理基础域名拼接 /t/p。
         如果配置的是 https://proxy.example.com/3，会自动去掉 /3 后再拼图片路径。
         """
         custom_url = (self.config_service.get("tmdb_api_url") or "").strip()
-        if not custom_url:
+        # 官方 API 地址不提供图片服务，必须走 image.tmdb.org
+        if not custom_url or "api.themoviedb.org" in custom_url:
             return "https://image.tmdb.org/t/p"
 
         normalized = custom_url.rstrip("/")
@@ -98,7 +122,7 @@ class TMDBService:
             p.update(params)
 
         try:
-            resp = requests.get(url, params=p, timeout=15)
+            resp = requests.get(url, params=p, timeout=API_TIMEOUT)
             if not resp.ok:
                 text = (resp.text or "")[:200].replace("\n", " ")
                 logger.warning(f"TMDB API 请求失败: {resp.status_code}, url={url}, body={text}")
@@ -107,7 +131,10 @@ class TMDBService:
             content_type = resp.headers.get("Content-Type", "")
             if "json" not in content_type.lower():
                 text = (resp.text or "")[:200].replace("\n", " ")
-                logger.error(f"TMDB API 返回非 JSON 内容，请检查代理地址是否正确: url={url}, content_type={content_type}, body={text}")
+                logger.error(
+                    f"TMDB API 返回非 JSON 内容，请检查代理地址是否正确: "
+                    f"url={url}, content_type={content_type}, body={text}"
+                )
                 return None
 
             try:
@@ -152,18 +179,23 @@ class TMDBService:
 
     def get_movie_details(self, tmdb_id: int) -> Optional[Dict]:
         """获取电影详情"""
-        return self._get(f"/movie/{tmdb_id}", {"append_to_response": "credits,alternative_titles,translations"})
+        return self._get(f"/movie/{tmdb_id}",
+                         {"append_to_response": "credits,alternative_titles,translations"})
 
     def get_tv_details(self, tmdb_id: int) -> Optional[Dict]:
         """获取电视剧详情"""
-        return self._get(f"/tv/{tmdb_id}", {"append_to_response": "credits,alternative_titles,translations"})
+        return self._get(f"/tv/{tmdb_id}",
+                         {"append_to_response": "credits,alternative_titles,translations"})
 
     def get_tv_season(self, tmdb_id: int, season: int) -> Optional[Dict]:
         """获取电视剧某季信息"""
         return self._get(f"/tv/{tmdb_id}/season/{season}")
 
     def get_chinese_title(self, details: Dict) -> str:
-        """获取中文标题（优先级：zh-CN > 原标题 > zh-TW > zh-HK）"""
+        """获取中文标题（优先级：zh-CN > 原标题 > zh-TW > zh-HK）
+
+        无任何可用标题时返回空字符串。
+        """
         # 先检查 translations - 只优先简体中文
         translations = details.get("translations", {}).get("translations", [])
         for t in translations:
@@ -224,11 +256,11 @@ class TMDBService:
             if not t:
                 continue
             if q == t:
-                best = max(best, 100.0)
+                best = max(best, SCORE_EXACT_MATCH)
             elif q in t or t in q:
-                best = max(best, 80.0)
+                best = max(best, SCORE_TITLE_SUBSTRING)
             else:
-                best = max(best, SequenceMatcher(None, q, t).ratio() * 70)
+                best = max(best, SequenceMatcher(None, q, t).ratio() * SCORE_TITLE_FUZZY_RATIO)
         return best
 
     def _get_result_details(self, result: Dict, media_type: str) -> Optional[Dict]:
@@ -267,15 +299,15 @@ class TMDBService:
             if not t:
                 continue
             if q == t:
-                best = max(best, 100.0)
+                best = max(best, SCORE_EXACT_MATCH)
             elif q in t or t in q:
-                best = max(best, 85.0)
+                best = max(best, SCORE_ALIAS_SUBSTRING)
             else:
-                best = max(best, SequenceMatcher(None, q, t).ratio() * 60)
+                best = max(best, SequenceMatcher(None, q, t).ratio() * SCORE_ALIAS_FUZZY_RATIO)
         return best
 
     def matches_title(self, details: Dict, query: str,
-                      threshold: float = 45.0) -> bool:
+                      threshold: float = MATCH_THRESHOLD) -> bool:
         """检查详情的标题（含别名/译名）是否与给定标题匹配
 
         复用 _alias_score 的匹配逻辑，分数达到阈值即视为匹配。
@@ -284,7 +316,7 @@ class TMDBService:
         Args:
             details: TMDB 详情（需含 alternative_titles/translations 字段）
             query: 待匹配的标题（可能是中文译名、别名等）
-            threshold: 匹配阈值，默认 45（与 _pick_best_result 一致）
+            threshold: 匹配阈值，默认 MATCH_THRESHOLD（与 _pick_best_result 一致）
         """
         if not details or not query:
             return False
@@ -308,10 +340,10 @@ class TMDBService:
                 score = max(score, self._alias_score(details, query))
 
             if year:
-                # 有年份时，年份必须被强烈优先；年份不一致的同名结果降权，避免 Upstream 2024 命中其它年份/条目。
-                score += 60 if year_matched else -80
-            score += float(result.get("popularity") or 0) * 2
-            score += max(0, 20 - index) * 0.1
+                # 有年份时强烈优先同年结果；年份不一致的同名结果降权，避免如《Upstream》(2024) 被误命中为其它年份条目
+                score += YEAR_MATCH_BONUS if year_matched else YEAR_MISMATCH_PENALTY
+            score += float(result.get("popularity") or 0) * POPULARITY_WEIGHT
+            score += max(0, POSITION_BONUS_MAX - index) * POSITION_BONUS_FACTOR
             scored.append((score, year_matched, result))
 
         scored.sort(key=lambda item: item[0], reverse=True)
@@ -320,14 +352,23 @@ class TMDBService:
         best_year = self._get_result_year(best, media_type)
 
         if year and not best_year_matched:
-            logger.warning(f"TMDB 搜索结果年份不匹配，已拒绝: query={query}, year={year}, best={best_title} ({best_year}), score={best_score:.1f}")
+            logger.warning(
+                f"TMDB 搜索结果年份不匹配，已拒绝: query={query}, year={year}, "
+                f"best={best_title} ({best_year}), score={best_score:.1f}"
+            )
             return None
-        if best_score < 45:
-            logger.warning(f"TMDB 搜索结果标题匹配度过低，已拒绝: query={query}, best={best_title} ({best_year}), score={best_score:.1f}")
+        if best_score < MATCH_THRESHOLD:
+            logger.warning(
+                f"TMDB 搜索结果标题匹配度过低，已拒绝: query={query}, "
+                f"best={best_title} ({best_year}), score={best_score:.1f}"
+            )
             return None
 
         best_popularity = float(best.get("popularity") or 0)
-        logger.info(f"TMDB 最佳匹配: query={query}, year={year or '-'} -> {best_title} ({best_year}), popularity={best_popularity:.1f}, score={best_score:.1f}")
+        logger.info(
+            f"TMDB 最佳匹配: query={query}, year={year or '-'} -> {best_title} ({best_year}), "
+            f"popularity={best_popularity:.1f}, score={best_score:.1f}"
+        )
         return best
 
     def search_and_pick(self, query: str, media_type: str, year: Optional[str] = None) -> Optional[Dict]:
@@ -352,6 +393,128 @@ class TMDBService:
             return self.get_movie_details(tmdb_id)
         else:
             return self.get_tv_details(tmdb_id)
+
+    def search_with_validation(
+        self,
+        tmdb_id: int,
+        title: str,
+        media_type: str,
+        year: str,
+        strict_media_type: bool = False,
+    ) -> tuple:
+        """TMDB 搜索验证：优先 ID 查询，验证名称和年份，智能回退
+
+        综合策略（合并自 share_organize_service 的搜索验证逻辑）：
+        1. 有 tmdb_id 时，按指定类型查询 → 验证名称和年份
+        2. 主类型查到 + 验证通过 → 直接采用
+        3. 主类型查到但验证不匹配 → 尝试另一类型（tmdbid 类型可能写错），
+           另一类型验证通过则采用；否则回退标题+年份搜索
+        4. 主类型查不到：严格模式不回退另一类型；非严格模式先尝试另一类型
+        5. 都允许同类型标题搜索兜底
+        6. 无 tmdb_id 时，直接通过标题搜索
+
+        Args:
+            tmdb_id: TMDB ID，可能为 0 或 None
+            title: 媒体标题
+            media_type: 媒体类型 ("movie" 或 "tv")
+            year: 年份字符串
+            strict_media_type: True 时主类型查不到不回退到另一类型（避免电影误判为电视剧）
+
+        Returns:
+            (details, resolved_media_type) 元组：
+            - details: TMDB 详情字典，未匹配返回 None
+            - resolved_media_type: 实际匹配的媒体类型，可能与输入不同（回退到另一类型时），
+              未匹配返回 None
+        """
+        year = str(year or "")
+
+        # ---- 内联年份验证 ----
+        def _matches_year(details: Optional[Dict], y: str) -> bool:
+            """校验 TMDB 详情的年份是否与给定年份一致
+
+            movie 取 release_date，tv 取 first_air_date，格式 YYYY-MM-DD。
+            无年份输入或详情无日期字段时返回 False（无法验证）。
+            """
+            if not details or not y:
+                return False
+            release_date = details.get("release_date") or details.get("first_air_date") or ""
+            return bool(release_date) and release_date[:4] == str(y)
+
+        # ---- 内联综合验证 ----
+        def _matches_details(details: Optional[Dict], t: str, y: str) -> bool:
+            """综合验证详情是否匹配标题和年份
+
+            - 有年份时必须年份匹配
+            - 有标题时必须标题匹配（考虑别名）
+            - 都没有时视为匹配（无法验证）
+            - 任一不匹配返回 False（tmdbid 可能写错，不采用该结果）
+            """
+            if not details:
+                return False
+            if y and not _matches_year(details, y):
+                return False
+            # 标题匹配委托给已有的 matches_title（内部使用 _alias_score，覆盖原标题、别名、译名）
+            if t and not self.matches_title(details, t):
+                return False
+            return True
+
+        # ---- 按 ID 查询主类型详情 ----
+        if tmdb_id:
+            # 1. 按指定类型查询主类型
+            if media_type == "movie":
+                primary_details = self.get_movie_details(tmdb_id)
+            else:
+                primary_details = self.get_tv_details(tmdb_id)
+
+            # 2. 主类型查到 + 综合验证通过（名称和年份都匹配，或无可验证）→ 直接采用
+            if _matches_details(primary_details, title, year):
+                return primary_details, media_type
+
+            # 3. 主类型查到但验证不匹配：tmdbid 类型可能写错，尝试另一类型
+            if primary_details:
+                fallback_type = "tv" if media_type == "movie" else "movie"
+                if fallback_type == "movie":
+                    fallback_details = self.get_movie_details(tmdb_id)
+                else:
+                    fallback_details = self.get_tv_details(tmdb_id)
+                if _matches_details(fallback_details, title, year):
+                    return fallback_details, fallback_type
+                # 另一类型也不匹配：tmdbid 可能是错的，回退到标题+年份搜索
+                if title:
+                    search_result = self.search_and_pick(title, media_type, year)
+                    if search_result:
+                        return search_result, media_type
+                # 搜索也失败：不采用名称/年份不符的 tmdbid 结果
+                return None, None
+
+            # 4. 主类型查不到：严格模式不回退到另一类型，非严格模式先尝试另一类型
+            if not strict_media_type:
+                fallback_type = "tv" if media_type == "movie" else "movie"
+                if fallback_type == "movie":
+                    fallback_details = self.get_movie_details(tmdb_id)
+                else:
+                    fallback_details = self.get_tv_details(tmdb_id)
+                if _matches_details(fallback_details, title, year):
+                    return fallback_details, fallback_type
+
+            # 5. 严格模式主类型查不到，或非严格模式另一类型也失败：
+            #    尝试同类型标题搜索兜底（严格模式不允许跨类型，但允许同类型标题搜索）
+            if title:
+                search_result = self.search_and_pick(title, media_type, year)
+                if search_result:
+                    return search_result, media_type
+
+            # 6. 所有回退都失败：返回 None（不采用名称/年份不符的结果）
+            return None, None
+
+        # ---- 无 tmdb_id，通过标题搜索 ----
+        if title:
+            result = self.search_and_pick(title, media_type, year)
+            if result:
+                return result, media_type
+            return None, None
+
+        return None, None
 
 
 # 全局单例

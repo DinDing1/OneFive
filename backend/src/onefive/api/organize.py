@@ -3,16 +3,17 @@
 
 提供媒体文件识别和整理接口。
 """
+import asyncio
 import json
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter
 from pydantic import BaseModel
 from typing import Dict, List, Optional
 from ..models.schemas import ApiResponse
 from ..services.organize_service import get_organize_service
 from ..services.config_service import get_config_service
 from ..services.rename_service import DEFAULT_MOVIE_TEMPLATE, DEFAULT_TV_TEMPLATE
-from ..services.classify_service import DEFAULT_STRATEGY
-from ..services.file_info_service import BUILTIN_RELEASE_GROUPS
+from ..services.classify_service import DEFAULT_STRATEGY, invalidate_strategy_cache
+from ..services.file_info_service import BUILTIN_RELEASE_GROUPS, invalidate_custom_release_groups_cache
 from ..exceptions import NotLoggedInError
 from ..logger import get_logger
 
@@ -52,48 +53,42 @@ class SettingsRequest(BaseModel):
 @router.post("/recognize", summary="识别文件")
 async def recognize_file(req: RecognizeRequest):
     """识别文件/文件夹，返回 TMDB 匹配结果和建议路径"""
-    try:
-        organize_service = get_organize_service()
-        file_info = {
-            "file_id": req.file_id,
-            "name": req.file_name,
-            "is_dir": req.is_dir,
-        }
-        result = organize_service.recognize_file(file_info, req.folder_files)
-        return ApiResponse(code=0, message="识别成功", data=result)
-    except NotLoggedInError as e:
-        raise HTTPException(status_code=401, detail=str(e))
-    except Exception as e:
-        logger.error(f"识别失败: {e}")
-        return ApiResponse(code=-1, message=f"识别失败: {str(e)}")
+    organize_service = get_organize_service()
+    file_info = {
+        "file_id": req.file_id,
+        "name": req.file_name,
+        "is_dir": req.is_dir,
+    }
+    # 用 asyncio.to_thread 把同步的 TMDB 网络请求放到线程池执行，
+    # 避免阻塞 FastAPI 事件循环导致其他请求卡住
+    result = await asyncio.to_thread(
+        organize_service.recognize_file, file_info, req.folder_files
+    )
+    return ApiResponse(code=0, message="识别成功", data=result)
 
 
 @router.post("/recognize/manual", summary="手动纠错识别")
 async def manual_recognize_file(req: ManualRecognizeRequest):
     """用户输入 TMDB ID 和媒体类型后，按指定 ID 重新识别"""
-    try:
-        if req.media_type not in ("movie", "tv"):
-            return ApiResponse(code=-1, message="媒体类型只能是 movie 或 tv")
-        if req.tmdb_id <= 0:
-            return ApiResponse(code=-1, message="TMDB ID 不正确")
+    if req.media_type not in ("movie", "tv"):
+        return ApiResponse(code=-1, message="媒体类型只能是 movie 或 tv")
+    if req.tmdb_id <= 0:
+        return ApiResponse(code=-1, message="TMDB ID 不正确")
 
-        organize_service = get_organize_service()
-        file_info = {
-            "file_id": req.file_id,
-            "name": req.file_name,
-            "is_dir": req.is_dir,
-        }
-        result = organize_service.recognize_file_manual(
-            file_info, req.tmdb_id, req.media_type, req.folder_files
-        )
-        if not result.get("target_path"):
-            return ApiResponse(code=-1, message="手动识别失败，请检查 TMDB ID 和媒体类型")
-        return ApiResponse(code=0, message="手动识别成功", data=result)
-    except NotLoggedInError as e:
-        raise HTTPException(status_code=401, detail=str(e))
-    except Exception as e:
-        logger.error(f"手动识别失败: {e}")
-        return ApiResponse(code=-1, message=f"手动识别失败: {str(e)}")
+    organize_service = get_organize_service()
+    file_info = {
+        "file_id": req.file_id,
+        "name": req.file_name,
+        "is_dir": req.is_dir,
+    }
+    # 同步 TMDB 查询放到线程池，避免阻塞事件循环
+    result = await asyncio.to_thread(
+        organize_service.recognize_file_manual,
+        file_info, req.tmdb_id, req.media_type, req.folder_files
+    )
+    if not result.get("target_path"):
+        return ApiResponse(code=-1, message="手动识别失败，请检查 TMDB ID 和媒体类型")
+    return ApiResponse(code=0, message="手动识别成功", data=result)
 
 
 class ExecuteRequest(BaseModel):
@@ -119,37 +114,33 @@ class ExecuteRequest(BaseModel):
 @router.post("/execute", summary="执行整理")
 async def execute_organize(req: ExecuteRequest):
     """执行文件整理：创建目录 → 移动/复制 → 重命名"""
-    try:
-        organize_service = get_organize_service()
-        result = organize_service.execute_organize(
-            file_id=req.file_id,
-            file_name=req.file_name,
-            is_dir=req.is_dir,
-            target_path=req.target_path,
-            organize_mode=req.organize_mode,
-            category=req.category,
-            target_title=req.target_title,
-            tmdb_id=req.tmdb_id,
-            media_info={
-                "media_type": req.media_type,
-                "year": req.year,
-                "season": req.season,
-                "episode": req.episode,
-                "tmdb_poster": req.tmdb_poster,
-                "tmdb_backdrop": req.tmdb_backdrop,
-                "tmdb_rating": req.tmdb_rating,
-                "tech_info": req.tech_info or {},
-            },
-        )
-        if result["success"]:
-            return ApiResponse(code=0, message=result["message"], data=result)
-        else:
-            return ApiResponse(code=-1, message=result["message"])
-    except NotLoggedInError as e:
-        raise HTTPException(status_code=401, detail=str(e))
-    except Exception as e:
-        logger.error(f"执行整理失败: {e}")
-        return ApiResponse(code=-1, message=f"执行整理失败: {str(e)}")
+    organize_service = get_organize_service()
+    # execute_organize 内部有 time.sleep 和同步文件操作 API 调用，
+    # 用 asyncio.to_thread 放到线程池执行，避免阻塞事件循环
+    result = await asyncio.to_thread(
+        organize_service.execute_organize,
+        file_id=req.file_id,
+        file_name=req.file_name,
+        is_dir=req.is_dir,
+        target_path=req.target_path,
+        organize_mode=req.organize_mode,
+        category=req.category,
+        target_title=req.target_title,
+        tmdb_id=req.tmdb_id,
+        media_info={
+            "media_type": req.media_type,
+            "year": req.year,
+            "season": req.season,
+            "episode": req.episode,
+            "tmdb_poster": req.tmdb_poster,
+            "tmdb_backdrop": req.tmdb_backdrop,
+            "tmdb_rating": req.tmdb_rating,
+            "tech_info": req.tech_info or {},
+        },
+    )
+    if result["success"]:
+        return ApiResponse(code=0, message=result["message"], data=result)
+    return ApiResponse(code=-1, message=result["message"])
 
 
 @router.get("/settings", summary="获取整理配置")
@@ -211,8 +202,12 @@ async def update_settings(req: SettingsRequest):
         config_service.set("organize_mode", req.organize_mode, "整理方式")
     if req.classify_rules is not None:
         config_service.set("classify_rules", req.classify_rules, "分类策略")
+        # 配置变更后刷新策略缓存，确保后续分类使用新的策略
+        invalidate_strategy_cache()
     if req.release_groups is not None:
         config_service.set("release_groups", req.release_groups, "自定义发布组")
+        # 配置变更后刷新缓存，确保后续解析使用新的自定义发布组
+        invalidate_custom_release_groups_cache()
 
     return ApiResponse(code=0, message="配置已保存")
 

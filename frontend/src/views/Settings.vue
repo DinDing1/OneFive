@@ -493,11 +493,11 @@
             <span class="tag" v-if="strmResult.failed > 0" style="background: var(--danger-bg); color: var(--danger);">失败 {{ strmResult.failed }}</span>
           </div>
           <div class="strm-error-list" v-if="strmResult.errors && strmResult.errors.length > 0">
-            <div v-for="(err, i) in strmResult.errors.slice(0, 10)" :key="i" class="strm-error-item">
+            <div v-for="(err, i) in strmResult.errors.slice(0, MAX_ERROR_DISPLAY)" :key="i" class="strm-error-item">
               <span class="strm-error-name">{{ err.name }}</span>
               <span class="strm-error-msg">{{ err.error }}</span>
             </div>
-            <p v-if="strmResult.errors.length > 10" class="strm-hint">仅展示前 10 条错误</p>
+            <p v-if="strmResult.errors.length > MAX_ERROR_DISPLAY" class="strm-hint">仅展示前 10 条错误</p>
           </div>
         </div>
 
@@ -510,11 +510,11 @@
             <span class="tag" v-if="strmCloudResult.failed > 0" style="background: var(--danger-bg); color: var(--danger);">失败 {{ strmCloudResult.failed }}</span>
           </div>
           <div class="strm-error-list" v-if="strmCloudResult.errors && strmCloudResult.errors.length > 0">
-            <div v-for="(err, i) in strmCloudResult.errors.slice(0, 10)" :key="i" class="strm-error-item">
+            <div v-for="(err, i) in strmCloudResult.errors.slice(0, MAX_ERROR_DISPLAY)" :key="i" class="strm-error-item">
               <span class="strm-error-name">{{ err.name }}</span>
               <span class="strm-error-msg">{{ err.error }}</span>
             </div>
-            <p v-if="strmCloudResult.errors.length > 10" class="strm-hint">仅展示前 10 条错误</p>
+            <p v-if="strmCloudResult.errors.length > MAX_ERROR_DISPLAY" class="strm-hint">仅展示前 10 条错误</p>
           </div>
         </div>
 
@@ -523,10 +523,10 @@
           <button class="btn-ghost-sm" @click.stop="saveStrmSettings" :disabled="strmSaving">
             {{ strmSaving ? '...' : '保存' }}
           </button>
-          <button class="btn-save" @click.stop="generateStrmFiles" :disabled="strmGenerating || !strmOutputPath">
+          <button class="btn-save" @click.stop="generateStrm('share')" :disabled="strmGenerating || !strmOutputPath">
             {{ strmGenerating ? '生成中...' : '分享 STRM' }}
           </button>
-          <button class="btn-save" @click.stop="generateCloudStrmFiles" :disabled="strmCloudGenerating || !strmCloudOutputPath">
+          <button class="btn-save" @click.stop="generateStrm('cloud')" :disabled="strmCloudGenerating || !strmCloudOutputPath">
             {{ strmCloudGenerating ? '生成中...' : '云盘 STRM' }}
           </button>
         </div>
@@ -592,11 +592,22 @@ import { filesApi } from '@/api/files'
 import { organizeApi } from '@/api/organize'
 import { notificationApi } from '@/api/notification'
 import { directLinkApi } from '@/api/directLink'
-import { strmApi } from '@/api/strm'
+import { strmApi, type StrmGenerateResult } from '@/api/strm'
 import { showToast } from '@/composables/useToast'
+import { handleApiError } from '@/utils/error'
 import type { FileItem } from '@/api/files'
 
-// 折叠状态
+// ==================== 常量 ====================
+/** 直链服务默认端口 */
+const DEFAULT_DL_PORT = 11581
+/** 直链服务默认基地址（基于默认端口拼接） */
+const DEFAULT_DL_BASE_URL = `http://127.0.0.1:${DEFAULT_DL_PORT}`
+/** STRM 生成错误列表最大展示条数 */
+const MAX_ERROR_DISPLAY = 10
+
+/** 分类规则（电影/电视剧通用） */
+interface ClassifyRule { category: string; conditions: string }
+
 const expanded = reactive<Record<string, boolean>>({ tmdb: false, api: false, media: false, notify: false, directLink: false, strm: false })
 function toggle(key: string) { expanded[key] = !expanded[key] }
 
@@ -610,7 +621,6 @@ const tmdbApiUrl = ref('')
 const tmdbLanguage = ref('zh-CN')
 const tmdbSaving = ref(false)
 
-// 密码显示/隐藏状态
 const showApiKey = ref(false)
 const showBotToken = ref(false)
 const showApiHash = ref(false)
@@ -623,8 +633,8 @@ const movieTemplate = ref('')
 const tvTemplate = ref('')
 const mediaSaving = ref(false)
 
-const movieRules = ref<{ category: string; conditions: string }[]>([])
-const tvRules = ref<{ category: string; conditions: string }[]>([])
+const movieRules = ref<ClassifyRule[]>([])
+const tvRules = ref<ClassifyRule[]>([])
 
 const builtinReleaseGroups = ref<string[]>([])
 const customGroupsList = ref<string[]>([])
@@ -653,16 +663,14 @@ const tgBotName = ref('')
 const tgUserName = ref('')
 const notifySaving = ref(false)
 const tgTesting = ref(false)
-const tgStatus = ref({ configured: false, connected: false, mode: '', message: '未检查' })
 
 // 直链服务配置
 const dlEnabled = ref(false)
-const dlPort = ref(11581)
+const dlPort = ref(DEFAULT_DL_PORT)
 const dlRunning = ref(false)
-const dlSaving = ref(false)
 
 // STRM 配置
-const strmBaseUrl = ref('http://127.0.0.1:11581')
+const strmBaseUrl = ref(DEFAULT_DL_BASE_URL)
 const strmOutputPath = ref('')
 const strmCloudOutputPath = ref('')
 const strmVideoExtensions = ref('')
@@ -670,8 +678,8 @@ const strmAccessiblePaths = ref<string[]>([])
 const strmSaving = ref(false)
 const strmGenerating = ref(false)
 const strmCloudGenerating = ref(false)
-const strmResult = ref<any>(null)
-const strmCloudResult = ref<any>(null)
+const strmResult = ref<StrmGenerateResult | null>(null)
+const strmCloudResult = ref<StrmGenerateResult | null>(null)
 
 // STRM 确认对话框（替代原生 confirm）
 const strmConfirmVisible = ref(false)
@@ -699,18 +707,15 @@ const appIds = [
 
 onMounted(() => {
   loadOpenApiSettings()
-  loadTmdbSettings()
-  loadClassifySettings()
+  loadOrganizeSettings()
   loadNotifySettings()
-  // 加载直链设置
   directLinkApi.getSettings().then((res: any) => {
     if (res.code === 0 && res.data) {
       dlEnabled.value = res.data.enabled
-      dlPort.value = res.data.port || 11581
+      dlPort.value = res.data.port || DEFAULT_DL_PORT
       dlRunning.value = res.data.running
     }
   }).catch(() => {})
-  // 加载 STRM 设置、授权路径
   loadStrmSettings()
   loadStrmAccessiblePaths()
 })
@@ -734,15 +739,17 @@ async function saveOpenApiSettings() {
     if (res.code === 0 && res.data) tokenValid.value = res.data.token_valid
     showToast('配置已保存', 'success')
   } catch (e: any) {
-    showToast(e.message || '保存失败', 'error')
+    handleApiError(e, '保存失败')
   }
   finally { saving.value = false }
 }
 
-async function loadTmdbSettings() {
+// 统一加载整理配置（TMDB + 分类策略合并为一次请求，避免 onMounted 重复调用 /organize/settings）
+async function loadOrganizeSettings() {
   try {
     const res = await organizeApi.getSettings()
     if (res.code === 0 && res.data) {
+      // TMDB / 媒体库 / 模板相关
       tmdbApiKey.value = res.data.tmdb_api_key || ''
       tmdbApiUrl.value = res.data.tmdb_api_url || ''
       tmdbLanguage.value = res.data.tmdb_language || 'zh-CN'
@@ -751,6 +758,15 @@ async function loadTmdbSettings() {
       tvTemplate.value = res.data.tv_template || ''
       organizeMode.value = res.data.organize_mode || 'move'
       sourcePath.value = res.data.source_path || ''
+      // 分类策略相关
+      if (res.data.classify_rules) {
+        const rules = JSON.parse(res.data.classify_rules)
+        // 用分号分隔键值对，逗号留给值内部（如 originCountry=CN,TW,HK）
+        movieRules.value = (rules.movie || []).map(toRule)
+        tvRules.value = (rules.tv || []).map(toRule)
+      }
+      if (res.data.builtin_release_groups) builtinReleaseGroups.value = res.data.builtin_release_groups
+      if (res.data.custom_release_groups) customGroupsList.value = res.data.custom_release_groups.split('\n').filter((g: string) => g.trim())
     }
   } catch (e) { console.error('加载设置失败:', e) }
 }
@@ -762,7 +778,7 @@ async function saveTmdbSettings() {
     await organizeApi.updateSettings({ tmdb_api_key: tmdbApiKey.value, tmdb_api_url: tmdbApiUrl.value, tmdb_language: tmdbLanguage.value })
     showToast('配置已保存', 'success')
   } catch (e: any) {
-    showToast(e.message || '保存失败', 'error')
+    handleApiError(e, '保存失败')
   }
   finally { tmdbSaving.value = false }
 }
@@ -783,7 +799,7 @@ async function saveMediaSettings() {
     })
     showToast('配置已保存', 'success')
   } catch (e: any) {
-    showToast(e.message || '保存失败', 'error')
+    handleApiError(e, '保存失败')
   }
   finally { mediaSaving.value = false }
 }
@@ -841,33 +857,59 @@ function addCustomGroup() {
 
 function removeCustomGroup(i: number) { customGroupsList.value.splice(i, 1) }
 
-async function loadClassifySettings() {
-  try {
-    const res = await organizeApi.getSettings()
-    if (res.code === 0 && res.data) {
-      if (res.data.classify_rules) {
-        const rules = JSON.parse(res.data.classify_rules)
-        // 用分号分隔键值对，逗号留给值内部（如 originCountry=CN,TW,HK）
-        movieRules.value = (rules.movie || []).map((r: any) => ({ category: r.category, conditions: Object.entries(r.conditions || {}).map(([k, v]) => `${k}=${v}`).join(';') }))
-        tvRules.value = (rules.tv || []).map((r: any) => ({ category: r.category, conditions: Object.entries(r.conditions || {}).map(([k, v]) => `${k}=${v}`).join(';') }))
-      }
-      if (res.data.builtin_release_groups) builtinReleaseGroups.value = res.data.builtin_release_groups
-      if (res.data.custom_release_groups) customGroupsList.value = res.data.custom_release_groups.split('\n').filter((g: string) => g.trim())
-    }
-  } catch (e) { console.error('加载分类策略失败:', e) }
+/** 将条件对象序列化为字符串（键值对用分号分隔，逗号留给值内部，如 originCountry=CN,TW,HK） */
+function conditionsToString(conditions: Record<string, string>): string {
+  return Object.entries(conditions || {}).map(([k, v]) => `${k}=${v}`).join(';')
 }
 
+/** 将后端规则对象转为前端表单规则 */
+function toRule(r: any): ClassifyRule {
+  return { category: r.category, conditions: conditionsToString(r.conditions) }
+}
+
+/** 将条件字符串解析为对象（conditionsToString 的逆运算） */
+function parseConditions(s: string): Record<string, string> {
+  const o: Record<string, string> = {}
+  s.split(';').forEach(p => {
+    const [k, v] = p.split('=')
+    if (k && v) o[k.trim()] = v.trim()
+  })
+  return o
+}
+
+/**
+ * 构建分类规则对象（供保存接口使用）
+ * @returns 按 media_type 分组的规则数组，每条含 category 与解析后的 conditions
+ */
 function buildClassifyRules() {
-  // 用分号分隔键值对，逗号留给值内部（如 originCountry=CN,TW,HK）
-  const pc = (s: string) => { const o: Record<string, string> = {}; s.split(';').forEach(p => { const [k, v] = p.split('='); if (k && v) o[k.trim()] = v.trim() }); return o }
   return {
-    movie: movieRules.value.filter(r => r.category).map(r => ({ category: r.category, conditions: pc(r.conditions) })),
-    tv: tvRules.value.filter(r => r.category).map(r => ({ category: r.category, conditions: pc(r.conditions) })),
+    movie: movieRules.value.filter(r => r.category).map(r => ({ category: r.category, conditions: parseConditions(r.conditions) })),
+    tv: tvRules.value.filter(r => r.category).map(r => ({ category: r.category, conditions: parseConditions(r.conditions) })),
   }
 }
 
-async function resetTemplates() { try { await organizeApi.resetTemplates(); await loadTmdbSettings() } catch (e) { console.error(e) } }
-async function resetRules() { try { await organizeApi.resetRules(); await loadClassifySettings() } catch (e) { console.error(e) } }
+// 恢复默认重命名模板：成功/失败均给出 Toast 反馈，避免用户无感知
+async function resetTemplates() {
+  try {
+    await organizeApi.resetTemplates()
+    await loadOrganizeSettings()
+    showToast('已恢复默认模板', 'success')
+  } catch (e: any) {
+    console.error(e)
+    handleApiError(e, '恢复失败')
+  }
+}
+// 恢复默认分类策略：与 resetTemplates 同样在成功/失败时给出 Toast 反馈
+async function resetRules() {
+  try {
+    await organizeApi.resetRules()
+    await loadOrganizeSettings()
+    showToast('已恢复默认分类策略', 'success')
+  } catch (e: any) {
+    console.error(e)
+    handleApiError(e, '恢复失败')
+  }
+}
 
 // ==================== 通知配置 ====================
 
@@ -892,7 +934,6 @@ async function loadNotifySettings() {
     if (statusRes.code === 0 && statusRes.data) {
       const tg = statusRes.data.channels?.find((c: any) => c.name === 'telegram')
       if (tg) {
-        tgStatus.value = tg
         tgBotName.value = tg.bot_name || ''
         tgUserName.value = tg.user_name || ''
       }
@@ -919,7 +960,7 @@ async function saveNotifySettings() {
     await loadNotifySettings()
     showToast('配置已保存', 'success')
   } catch (e: any) {
-    showToast(e.message || '保存失败', 'error')
+    handleApiError(e, '保存失败')
   }
   finally { notifySaving.value = false }
 }
@@ -973,20 +1014,21 @@ async function testNotify() {
   try {
     const res = await notificationApi.test('telegram')
     if (res.code === 0) {
-      tgStatus.value = { ...tgStatus.value, message: '测试消息已发送', connected: true }
+      showToast('测试消息已发送', 'success')
     } else {
-      tgStatus.value = { ...tgStatus.value, message: res.message || '发送失败' }
+      showToast(res.message || '发送失败', 'error')
     }
     await loadNotifySettings()
-  } catch (e) { console.error(e) }
+  } catch (e: any) {
+    console.error(e)
+    handleApiError(e, '发送失败')
+  }
   finally { tgTesting.value = false }
 }
 
 // ==================== 直链服务 ====================
 
-// 保存直链设置
 async function saveDirectLinkSettings() {
-  dlSaving.value = true
   try {
     const res = await directLinkApi.saveSettings({ enabled: dlEnabled.value, port: dlPort.value })
     if (res.code === 0) {
@@ -996,9 +1038,7 @@ async function saveDirectLinkSettings() {
       showToast(res.message || '保存失败', 'error')
     }
   } catch (e: any) {
-    showToast(e.message || '保存失败', 'error')
-  } finally {
-    dlSaving.value = false
+    handleApiError(e, '保存失败')
   }
 }
 
@@ -1028,12 +1068,11 @@ async function stopDirectLink() {
 
 // ==================== STRM 文件 ====================
 
-// 加载 STRM 配置
 async function loadStrmSettings() {
   try {
     const res = await strmApi.getSettings()
     if (res.code === 0 && res.data) {
-      strmBaseUrl.value = res.data.direct_link_base_url || 'http://127.0.0.1:11581'
+      strmBaseUrl.value = res.data.direct_link_base_url || DEFAULT_DL_BASE_URL
       strmOutputPath.value = res.data.output_path || ''
       strmCloudOutputPath.value = res.data.cloud_output_path || ''
       strmVideoExtensions.value = res.data.video_extensions || ''
@@ -1043,7 +1082,6 @@ async function loadStrmSettings() {
   }
 }
 
-// 加载飞牛授权目录列表
 async function loadStrmAccessiblePaths() {
   try {
     const res = await strmApi.getAccessiblePaths()
@@ -1056,7 +1094,6 @@ async function loadStrmAccessiblePaths() {
   }
 }
 
-// 保存 STRM 配置
 async function saveStrmSettings() {
   if (strmSaving.value) return
   strmSaving.value = true
@@ -1075,13 +1112,12 @@ async function saveStrmSettings() {
       showToast(res.message || '保存失败', 'error')
     }
   } catch (e: any) {
-    showToast(e.message || '保存失败', 'error')
+    handleApiError(e, '保存失败')
   } finally {
     strmSaving.value = false
   }
 }
 
-// 显示 STRM 确认对话框
 function showStrmConfirm(title: string, message: string, action: () => void) {
   strmConfirmTitle.value = title
   strmConfirmMessage.value = message
@@ -1089,65 +1125,49 @@ function showStrmConfirm(title: string, message: string, action: () => void) {
   strmConfirmVisible.value = true
 }
 
-// 执行确认操作
 function executeStrmConfirm() {
   strmConfirmVisible.value = false
   strmConfirmAction.value()
 }
 
-// 生成分享 STRM 文件
-async function generateStrmFiles() {
-  if (strmGenerating.value) return
-  showStrmConfirm(
-    '生成分享 STRM',
-    `确认为所有已整理分享文件生成 STRM 到指定目录？\n\n输出目录：${strmOutputPath.value || '(未配置)'}`,
-    doGenerateStrmFiles
-  )
-}
-
-async function doGenerateStrmFiles() {
-  strmGenerating.value = true
-  strmResult.value = null
-  try {
-    const res = await strmApi.generate()
-    if (res.code === 0 && res.data) {
-      strmResult.value = res.data
-      showToast(`生成完成：成功 ${res.data.created}/${res.data.total}`, 'success')
-    } else {
-      showToast(res.message || '生成失败', 'error')
-    }
-  } catch (e: any) {
-    showToast(e.message || '生成失败', 'error')
-  } finally {
-    strmGenerating.value = false
+// 生成 STRM 文件（分享 / 云盘统一入口）
+async function generateStrm(kind: 'share' | 'cloud') {
+  if (kind === 'share') {
+    if (strmGenerating.value) return
+    showStrmConfirm(
+      '生成分享 STRM',
+      `确认为所有已整理分享文件生成 STRM 到指定目录？\n\n输出目录：${strmOutputPath.value || '(未配置)'}`,
+      () => doGenerateStrm(true)
+    )
+  } else {
+    if (strmCloudGenerating.value) return
+    showStrmConfirm(
+      '生成云盘 STRM',
+      `确认为云盘媒体库目录生成 STRM 到指定目录？\n\n输出目录：${strmCloudOutputPath.value || '(未配置)'}`,
+      () => doGenerateStrm(false)
+    )
   }
 }
 
-// 生成云盘 STRM 文件
-async function generateCloudStrmFiles() {
-  if (strmCloudGenerating.value) return
-  showStrmConfirm(
-    '生成云盘 STRM',
-    `确认为云盘媒体库目录生成 STRM 到指定目录？\n\n输出目录：${strmCloudOutputPath.value || '(未配置)'}`,
-    doGenerateCloudStrmFiles
-  )
-}
-
-async function doGenerateCloudStrmFiles() {
-  strmCloudGenerating.value = true
-  strmCloudResult.value = null
+// 执行 STRM 生成（isShare=true 分享，false 云盘）
+async function doGenerateStrm(isShare: boolean) {
+  // 通过引用统一操作两套状态，避免分支重复
+  const generating = isShare ? strmGenerating : strmCloudGenerating
+  const result = isShare ? strmResult : strmCloudResult
+  generating.value = true
+  result.value = null
   try {
-    const res = await strmApi.generateCloud()
+    const res = isShare ? await strmApi.generate() : await strmApi.generateCloud()
     if (res.code === 0 && res.data) {
-      strmCloudResult.value = res.data
+      result.value = res.data
       showToast(`生成完成：成功 ${res.data.created}/${res.data.total}`, 'success')
     } else {
       showToast(res.message || '生成失败', 'error')
     }
   } catch (e: any) {
-    showToast(e.message || '生成失败', 'error')
+    handleApiError(e, '生成失败')
   } finally {
-    strmCloudGenerating.value = false
+    generating.value = false
   }
 }
 </script>

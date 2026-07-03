@@ -11,10 +11,14 @@
 4. 电视剧文件夹只生成文件夹级路径
 """
 import re
+import time
 import asyncio
 from typing import Dict, Any, Optional, List
 from .tmdb_service import get_tmdb_service
-from .file_info_service import extract_key_info, extract_tech_info, get_video_extensions
+from .file_info_service import (
+    extract_key_info, extract_tech_info, get_video_extensions,
+    has_season_episode_marker, format_size,
+)
 from .classify_service import classify_media
 from .rename_service import generate_target_path
 from .file_service import get_file_service
@@ -22,6 +26,16 @@ from .config_service import get_config_service
 from ..logger import get_logger
 
 logger = get_logger(__name__)
+
+# ==================== 常量 ====================
+# 等待 115 服务端目录创建同步（秒）
+DIR_CREATE_WAIT = 0.5
+# 等待 115 服务端文件移动同步（秒）
+FILE_MOVE_WAIT = 1.0
+# TMDB 海报图片尺寸
+POSTER_IMAGE_SIZE = "w500"
+# TMDB 背景图尺寸
+BACKDROP_IMAGE_SIZE = "w780"
 
 
 def _find_first_video_file(file_names: List[str]) -> Optional[str]:
@@ -35,15 +49,8 @@ def _find_first_video_file(file_names: List[str]) -> Optional[str]:
 
 
 def _has_season_pattern(file_names: List[str]) -> bool:
-    """检查文件列表中是否有季集标识"""
-    for name in file_names:
-        if re.search(r'\bS\d{1,2}E\d{1,3}\b', name, re.IGNORECASE):
-            return True
-        if re.search(r'Season\s*\d{1,2}', name, re.IGNORECASE):
-            return True
-        if re.search(r'第\d+集', name):
-            return True
-    return False
+    """检查文件列表中是否有季集标识（委托公共函数 has_season_episode_marker）"""
+    return any(has_season_episode_marker(name) for name in file_names)
 
 
 class OrganizeService:
@@ -83,7 +90,16 @@ class OrganizeService:
         key_info = extract_key_info(filename)
         tech_info = extract_tech_info(filename)
 
-        tmdb_details, key_info = self._search_tmdb(key_info)
+        # TMDB 搜索（使用公共验证方法）
+        tmdb_details, resolved_media_type = self.tmdb_service.search_with_validation(
+            tmdb_id=key_info.get("tmdbId"),
+            title=key_info.get("title", ""),
+            media_type=key_info["mediaType"],
+            year=key_info.get("year"),
+        )
+        # 回退到另一类型时更新 mediaType
+        if resolved_media_type:
+            key_info["mediaType"] = resolved_media_type
 
         # 分类
         category = ""
@@ -141,8 +157,16 @@ class OrganizeService:
             key_info["season"] = 1
             logger.info("检测到季集标识，判定为电视剧")
 
-        # TMDB 搜索
-        tmdb_details, key_info = self._search_tmdb(key_info)
+        # TMDB 搜索（使用公共验证方法）
+        tmdb_details, resolved_media_type = self.tmdb_service.search_with_validation(
+            tmdb_id=key_info.get("tmdbId"),
+            title=key_info.get("title", ""),
+            media_type=key_info["mediaType"],
+            year=key_info.get("year"),
+        )
+        # 回退到另一类型时更新 mediaType
+        if resolved_media_type:
+            key_info["mediaType"] = resolved_media_type
 
         # 分类
         category = ""
@@ -184,49 +208,19 @@ class OrganizeService:
         key_info["tmdbId"] = tmdb_id
         key_info["mediaType"] = media_type
 
-        tmdb_details, key_info = self._search_tmdb(key_info)
+        # TMDB 搜索（使用公共验证方法）
+        tmdb_details, resolved_media_type = self.tmdb_service.search_with_validation(
+            tmdb_id=tmdb_id,
+            title=key_info.get("title", ""),
+            media_type=media_type,
+            year=key_info.get("year"),
+        )
+        # 回退到另一类型时更新 mediaType
+        if resolved_media_type:
+            key_info["mediaType"] = resolved_media_type
         category = classify_media(tmdb_details, key_info["mediaType"]) if tmdb_details else ""
         target_path = self._generate_path(tmdb_details, key_info, tech_info, is_folder=is_dir) if tmdb_details else None
         return self._build_result(file_info, key_info, tech_info, tmdb_details, category, target_path)
-
-    def _search_tmdb(self, key_info: Dict[str, Any]):
-        """TMDB 搜索，返回 (tmdb_details, key_info)"""
-        tmdb_details = None
-        tmdb_id = key_info.get("tmdbId")
-        title = key_info.get("title", "")
-        media_type = key_info["mediaType"]
-
-        if tmdb_id:
-            logger.info(f"通过 TMDB ID 查询: {tmdb_id}，类型: {media_type}")
-            if media_type == "movie":
-                tmdb_details = self.tmdb_service.get_movie_details(tmdb_id)
-                if not tmdb_details:
-                    tmdb_details = self.tmdb_service.get_tv_details(tmdb_id)
-                    if tmdb_details:
-                        key_info["mediaType"] = "tv"
-                        logger.info("电影查询无结果，切换为电视剧")
-            else:
-                tmdb_details = self.tmdb_service.get_tv_details(tmdb_id)
-                if not tmdb_details:
-                    tmdb_details = self.tmdb_service.get_movie_details(tmdb_id)
-                    if tmdb_details:
-                        key_info["mediaType"] = "movie"
-                        logger.info("电视剧查询无结果，切换为电影")
-        else:
-            year = key_info.get("year")
-            if title:
-                logger.info(f"通过标题搜索: {title}，类型: {media_type}，年份: {year}")
-                tmdb_details = self.tmdb_service.search_and_pick(
-                    title, media_type, year
-                )
-
-        if tmdb_details:
-            tmdb_title = tmdb_details.get("title") or tmdb_details.get("name")
-            logger.info(f"TMDB 匹配成功: {tmdb_title} (ID={tmdb_details.get('id')})")
-        else:
-            logger.warning(f"TMDB 未匹配到结果: {title}")
-
-        return tmdb_details, key_info
 
     def _generate_path(self, tmdb_details: Dict, key_info: Dict[str, Any],
                        tech_info: Dict[str, str],
@@ -276,6 +270,11 @@ class OrganizeService:
                       tech_info: Dict[str, str], tmdb_details: Optional[Dict],
                       category: str, target_path: Optional[Dict]) -> Dict[str, Any]:
         """构建识别结果"""
+        # 提前计算海报/背景图 URL，避免字典字面量中行过长
+        poster_url = self.tmdb_service.build_image_url(
+            tmdb_details.get("poster_path", ""), POSTER_IMAGE_SIZE) if tmdb_details else None
+        backdrop_url = self.tmdb_service.build_image_url(
+            tmdb_details.get("backdrop_path", ""), BACKDROP_IMAGE_SIZE) if tmdb_details else None
         return {
             "file_id": file_info.get("file_id", ""),
             "filename": file_info.get("name", ""),
@@ -291,8 +290,8 @@ class OrganizeService:
             "category": category,
             "tech_info": tech_info,
             "target_path": target_path,
-            "tmdb_poster": self.tmdb_service.build_image_url(tmdb_details.get("poster_path", ""), "w500") if tmdb_details else None,
-            "tmdb_backdrop": self.tmdb_service.build_image_url(tmdb_details.get("backdrop_path", ""), "w780") if tmdb_details else None,
+            "tmdb_poster": poster_url,
+            "tmdb_backdrop": backdrop_url,
             "tmdb_overview": tmdb_details.get("overview", "") if tmdb_details else "",
             "tmdb_rating": tmdb_details.get("vote_average", 0) if tmdb_details else 0,
         }
@@ -360,8 +359,7 @@ class OrganizeService:
             logger.info(f"{action}成功: {file_name} → {full_dir}")
 
             # 步骤3：重命名
-            import time
-            time.sleep(1)  # 等待 115 服务端同步
+            time.sleep(FILE_MOVE_WAIT)  # 等待 115 服务端同步
 
             if is_dir:
                 # 文件夹模式：dir_path 可能包含子目录（如 "标题 (年份) {tmdb=ID}/Season 01"）
@@ -393,7 +391,7 @@ class OrganizeService:
                         else:
                             try:
                                 result = self.file_service.create_folder(sub, final_cid)
-                                time.sleep(0.5)
+                                time.sleep(DIR_CREATE_WAIT)
                                 sub_id = self._find_subdir(final_cid, sub)
                                 if sub_id:
                                     final_cid = sub_id
@@ -414,7 +412,7 @@ class OrganizeService:
                         if not media_info:
                             media_info = {}
                         media_info["_file_count"] = len(file_details)
-                        media_info["_file_size"] = self._format_size(rename_result.get("total_size", 0))
+                        media_info["_file_size"] = format_size(rename_result.get("total_size", 0))
                         # 收集所有集数
                         episodes = [d["episode"] for d in file_details if d.get("episode")]
                         seasons = [d["season"] for d in file_details if d.get("season")]
@@ -455,7 +453,6 @@ class OrganizeService:
 
         except Exception as e:
             logger.error(f"整理失败: {e}")
-            # 失败也发通知
             asyncio.create_task(self._send_notify(
                 success=False, file_name=file_name,
                 title=target_title or file_name, category=category,
@@ -495,8 +492,7 @@ class OrganizeService:
                 logger.warning(f"创建目录异常（可能已存在）: {part}, {e}")
 
             # 创建后再查找（无论 create_folder 返回什么）
-            import time
-            time.sleep(0.5)
+            time.sleep(DIR_CREATE_WAIT)
             found_cid = self._find_subdir(current_cid, part)
             if found_cid is not None:
                 current_cid = found_cid
@@ -507,25 +503,48 @@ class OrganizeService:
 
         return current_cid
 
-    def _find_subdir(self, parent_cid: int, name: str) -> Optional[int]:
-        """在父目录下查找指定名称的子目录"""
-        try:
-            result = self.file_service.list_files(parent_cid, limit=200)
+    def _list_all_files_paged(self, cid: int, page_size: int = 200) -> List[Dict]:
+        """分页拉取目录下全部文件（避免大目录只取前 200 条导致找不到目标）
+
+        Args:
+            cid: 目录 ID
+            page_size: 每页大小，默认 200
+
+        Returns:
+            全部文件列表（已合并所有分页）
+        """
+        offset = 0
+        all_items: List[Dict] = []
+        while True:
+            try:
+                result = self.file_service.list_files(cid, limit=page_size, offset=offset)
+            except Exception as e:
+                logger.warning(f"分页拉取目录失败: cid={cid}, offset={offset}, {e}")
+                break
             items = result.get("items", [])
-            for item in items:
+            if not items:
+                break
+            all_items.extend(items)
+            # 不足一页说明已到末尾
+            if len(items) < page_size:
+                break
+            offset += page_size
+        return all_items
+
+    def _find_subdir(self, parent_cid: int, name: str) -> Optional[int]:
+        """在父目录下查找指定名称的子目录（分页遍历，支持大目录）"""
+        try:
+            for item in self._list_all_files_paged(parent_cid):
                 if item.get("is_dir") and item.get("name") == name:
                     return int(item["file_id"])
-            # 如果 200 条没找到，不继续翻页（避免性能问题）
         except Exception as e:
             logger.warning(f"查找子目录失败: {parent_cid}/{name}, {e}")
         return None
 
     def _find_file_in_dir(self, dir_cid: int, name: str) -> Optional[int]:
-        """在目录下查找指定名称的文件"""
+        """在目录下查找指定名称的文件（分页遍历，支持大目录）"""
         try:
-            result = self.file_service.list_files(dir_cid, limit=200)
-            items = result.get("items", [])
-            for item in items:
+            for item in self._list_all_files_paged(dir_cid):
                 if item.get("name") == name:
                     return int(item["file_id"])
         except Exception:
@@ -533,14 +552,11 @@ class OrganizeService:
         return None
 
     def _move_videos_to_subdir(self, parent_cid: int, sub_cid: int):
-        """把父目录下的视频文件移动到子目录中"""
-        from .file_info_service import get_video_extensions
+        """把父目录下的视频文件移动到子目录中（分页遍历，支持大目录）"""
         video_exts = get_video_extensions()
         try:
-            result = self.file_service.list_files(parent_cid, limit=200)
-            items = result.get("items", [])
             video_ids = []
-            for item in items:
+            for item in self._list_all_files_paged(parent_cid):
                 if item.get("is_dir"):
                     continue
                 name = item.get("name", "")
@@ -560,9 +576,6 @@ class OrganizeService:
         Returns:
             {"files": [...], "total_size": int}
         """
-        from .file_info_service import extract_key_info, extract_tech_info, get_video_extensions
-        from .rename_service import generate_target_path
-
         video_exts = get_video_extensions()
 
         try:
@@ -570,7 +583,8 @@ class OrganizeService:
             items = result.get("items", [])
         except Exception as e:
             logger.warning(f"列出文件夹内容失败: {e}")
-            return []
+            # 异常路径必须返回与正常路径一致的 dict 结构，否则调用方 .get() 会 AttributeError
+            return {"files": [], "total_size": 0}
 
         renamed_count = 0
         file_details = []
@@ -637,100 +651,30 @@ class OrganizeService:
 
         return {"files": file_details, "total_size": total_size}
 
-    @staticmethod
-    def _format_size(size_bytes: int) -> str:
-        """格式化文件大小"""
-        if size_bytes <= 0:
-            return ""
-        for unit in ['B', 'KB', 'MB', 'GB', 'TB']:
-            if size_bytes < 1024:
-                return f"{size_bytes:.1f} {unit}" if unit != 'B' else f"{size_bytes} B"
-            size_bytes /= 1024
-        return f"{size_bytes:.1f} PB"
-
     async def _send_notify(self, success: bool, file_name: str,
                            title: str, category: str,
                            action: str, target_dir: str,
                            media_info: Optional[Dict[str, Any]] = None):
-        """发送整理通知"""
+        """发送整理通知（使用公共格式化器构建消息）"""
         try:
             from ..notification import get_notification_manager
+            from ..notification.format import format_organize_notify
             manager = get_notification_manager()
 
-            if not media_info:
-                media_info = {}
+            # 用公共格式化器构建消息，消除与 share_organize_service 的重复代码
+            # title 参数是目标媒体名（target_title），file_name 是原文件名
+            status_title = "整理完成" if success else "整理失败"
+            msg = format_organize_notify(
+                success=success,
+                title=status_title,
+                target_title=title or file_name,
+                file_name=file_name,
+                category=category,
+                media_info=media_info,
+                action=action if success else None,
+            )
 
-            if not success:
-                msg = (
-                    f"━━━━━━━━━━━━━━━━\n"
-                    f"  ❌  整理失败\n"
-                    f"━━━━━━━━━━━━━━━━\n\n"
-                    f"  {title}\n"
-                    f"  原文件：{file_name}"
-                )
-                await manager.send_all(msg)
-                return
-
-            media_type = media_info.get("media_type", "")
-            year = media_info.get("year", "")
-            season = media_info.get("season", 0)
-            rating = media_info.get("tmdb_rating", 0)
-            tech = media_info.get("tech_info", {})
-            file_count = media_info.get("_file_count", 0)
-            episode_range = media_info.get("_episode_range")
-            release_group = tech.get("releaseGroup", "")
-            file_size = media_info.get("_file_size", "")
-
-            # 标题
-            full_title = title
-            if year:
-                full_title += f" ({year})"
-
-            type_label = "电影" if media_type == "movie" else "电视剧"
-
-            msg = f"✅ <b>整理完成</b>\n\n"
-            msg += f"🎬 <b>名称</b>：{full_title}\n\n"
-
-            if rating:
-                msg += f"⭐ <b>评分</b>：{rating:.1f}\n"
-
-            if episode_range:
-                s_str = str(season).zfill(2) if season else "01"
-                e_min = str(episode_range[0]).zfill(2)
-                e_max = str(episode_range[1]).zfill(2)
-                ep_str = f"S{s_str}E{e_min}-E{e_max}" if episode_range[0] != episode_range[1] else f"S{s_str}E{e_min}"
-                msg += f"📺 <b>集数</b>：{ep_str}\n"
-
-            if category:
-                msg += f"📁 <b>类别</b>：{category}\n"
-
-            if release_group:
-                msg += f"👥 <b>小组</b>：{release_group}\n"
-
-            # 质量
-            tech_parts = []
-            if tech.get("videoFormat"):
-                tech_parts.append(tech["videoFormat"])
-            if tech.get("edition"):
-                tech_parts.append(tech["edition"])
-            if tech.get("videoCodec"):
-                tech_parts.append(tech["videoCodec"])
-            if tech.get("audioCodec"):
-                tech_parts.append(tech["audioCodec"])
-            if tech.get("webSource"):
-                tech_parts.append(tech["webSource"])
-            if tech_parts:
-                msg += f"🎞️ <b>质量</b>：{' '.join(tech_parts)}\n"
-
-            if file_size:
-                msg += f"💾 <b>大小</b>：{file_size}\n"
-
-            if file_count > 1:
-                msg += f"📄 <b>文件数</b>：{file_count}\n"
-
-            msg += f"📦 <b>整理方式</b>：{action}"
-
-            image_url = media_info.get("tmdb_backdrop") or media_info.get("tmdb_poster") or None
+            image_url = (media_info or {}).get("tmdb_backdrop") or (media_info or {}).get("tmdb_poster") or None
             await manager.send_all(msg, image_url)
 
         except Exception as e:
