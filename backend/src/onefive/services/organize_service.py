@@ -60,6 +60,10 @@ class OrganizeService:
         self.tmdb_service = get_tmdb_service()
         self.file_service = get_file_service()
         self.config_service = get_config_service()
+        # 主线程事件循环引用：execute_organize 在线程池中执行，
+        # 子线程无法通过 asyncio.get_event_loop() 获取循环，
+        # 必须在主线程初始化时保存引用
+        self._main_loop: Optional[asyncio.AbstractEventLoop] = None
 
     def recognize_file(self, file_info: Dict[str, Any],
                        folder_files: Optional[List[str]] = None) -> Dict[str, Any]:
@@ -81,9 +85,18 @@ class OrganizeService:
         is_dir = file_info.get("is_dir", False)
 
         # ==================== 文件夹模式 ====================
-        if is_dir and folder_files:
-            logger.info(f"识别文件夹: {filename}，内部文件数: {len(folder_files)}")
-            return self._recognize_folder(file_info, filename, folder_files)
+        if is_dir:
+            # folder_files 可能只含直接子文件名（前端只列一层），
+            # 如果没有视频文件，尝试用 file_id 作为 CID 递归查找
+            if not folder_files or not _find_first_video_file(folder_files):
+                recursive_files = self._recursive_list_video_names(file_info.get("file_id", ""))
+                if recursive_files:
+                    folder_files = recursive_files
+                    logger.info(f"递归查找视频文件: 找到 {len(recursive_files)} 个")
+
+            if folder_files:
+                logger.info(f"识别文件夹: {filename}，内部文件数: {len(folder_files)}")
+                return self._recognize_folder(file_info, filename, folder_files)
 
         # ==================== 单文件模式 ====================
         logger.info(f"识别文件: {filename}")
@@ -368,10 +381,26 @@ class OrganizeService:
                 folder_name = dir_parts[0] if dir_parts else dir_path
                 sub_dirs = dir_parts[1:] if len(dir_parts) > 1 else []
 
-                # 重命名文件夹
+                # 查找刚复制/移动的文件夹（仍用原始文件名）
+                moved_id = self._find_file_in_dir(target_cid, file_name)
+
+                # 检查目标文件夹名是否已存在（同一部剧的不同规格版本）
+                existing_folder = self._quick_find_in_dir(target_cid, folder_name, is_dir=True) if folder_name else None
+
                 folder_id = None
-                if folder_name and folder_name != file_name:
-                    moved_id = self._find_file_in_dir(target_cid, file_name)
+                if existing_folder and existing_folder != moved_id:
+                    # 目标文件夹已存在 → 合并内容到已有文件夹，避免创建 "(1)" 重复目录
+                    if moved_id:
+                        self._merge_folder_contents(moved_id, existing_folder)
+                        # 合并后删除空的原文件夹
+                        try:
+                            self.file_service.delete_files([str(moved_id)])
+                            logger.info(f"合并到已有文件夹并删除原目录: {file_name} → {folder_name}")
+                        except Exception as e:
+                            logger.warning(f"删除原文件夹失败: {e}")
+                    folder_id = existing_folder
+                elif folder_name and folder_name != file_name:
+                    # 正常重命名流程
                     if moved_id:
                         self.file_service.rename_file(str(moved_id), folder_name)
                         logger.info(f"重命名文件夹: {file_name} → {folder_name}")
@@ -379,50 +408,74 @@ class OrganizeService:
                     else:
                         logger.warning(f"未找到已移动的文件夹: {file_name}")
                 else:
-                    folder_id = self._find_file_in_dir(target_cid, file_name)
+                    folder_id = moved_id
 
-                if folder_id:
-                    # 创建子目录（如 Season 01）
-                    final_cid = folder_id
-                    for sub in sub_dirs:
-                        sub_id = self._find_subdir(final_cid, sub)
+                # 文件夹找不到 → 整理失败（复制可能还在同步，重试已耗尽）
+                if not folder_id:
+                    self._submit_notify(
+                        success=False, file_name=file_name,
+                        title=target_title or file_name, category=category,
+                        action=action, target_dir=full_dir,
+                        media_info=media_info or {},
+                    )
+                    return {"success": False, "message": f"整理失败：复制后未找到文件夹 {file_name}，请稍后重试"}
+
+                # 创建子目录（如 Season 01）
+                # 优先使用已有子目录（模糊匹配 Season 01 ≈ Season 1），
+                # 避免原始文件夹已有 Season 子目录时创建多余空目录
+                final_cid = folder_id
+                for sub in sub_dirs:
+                    # 1. 精确匹配
+                    sub_id = self._quick_find_in_dir(final_cid, sub, is_dir=True)
+                    if sub_id:
+                        final_cid = sub_id
+                        continue
+                    # 2. 模糊匹配：原始文件夹可能有 Season 1/S01 等变体
+                    sub_id = self._find_season_dir_variant(final_cid, sub)
+                    if sub_id:
+                        # 重命名为标准名称（如 Season 1 → Season 01）
+                        try:
+                            self.file_service.rename_file(str(sub_id), sub)
+                            logger.info(f"重命名子目录: 变体 → {sub}")
+                        except Exception as e:
+                            logger.warning(f"重命名子目录失败: {e}")
+                        final_cid = sub_id
+                        continue
+                    # 3. 子目录不存在，直接创建
+                    try:
+                        self.file_service.create_folder(sub, final_cid)
+                        time.sleep(DIR_CREATE_WAIT)
+                        sub_id = self._quick_find_in_dir(final_cid, sub, is_dir=True)
                         if sub_id:
                             final_cid = sub_id
-                        else:
-                            try:
-                                result = self.file_service.create_folder(sub, final_cid)
-                                time.sleep(DIR_CREATE_WAIT)
-                                sub_id = self._find_subdir(final_cid, sub)
-                                if sub_id:
-                                    final_cid = sub_id
-                            except Exception:
-                                sub_id = self._find_subdir(final_cid, sub)
-                                if sub_id:
-                                    final_cid = sub_id
+                    except Exception:
+                        sub_id = self._quick_find_in_dir(final_cid, sub, is_dir=True)
+                        if sub_id:
+                            final_cid = sub_id
 
-                    # 如果有子目录（如 Season 01），需要把视频文件移进去
-                    if sub_dirs and final_cid != folder_id:
-                        self._move_videos_to_subdir(folder_id, final_cid)
+                # 如果有子目录（如 Season 01），需要把视频文件移进去
+                if sub_dirs and final_cid != folder_id:
+                    self._move_videos_to_subdir(folder_id, final_cid)
 
-                    # 遍历内部文件重命名（传入正确的标题和TMDB ID）
-                    rename_result = self._rename_files_in_folder(final_cid, target_title, str(tmdb_id))
-                    file_details = rename_result.get("files", [])
-                    # 收集文件夹整理的额外信息
-                    if file_details:
-                        if not media_info:
-                            media_info = {}
-                        media_info["_file_count"] = len(file_details)
-                        media_info["_file_size"] = format_size(rename_result.get("total_size", 0))
-                        # 收集所有集数
-                        episodes = [d["episode"] for d in file_details if d.get("episode")]
-                        seasons = [d["season"] for d in file_details if d.get("season")]
-                        if episodes:
-                            media_info["_episode_range"] = (min(episodes), max(episodes))
-                        if seasons:
-                            media_info["season"] = seasons[0]
-                        # 取最后一个文件的技术信息
-                        if file_details[-1].get("tech_info"):
-                            media_info["tech_info"] = file_details[-1]["tech_info"]
+                # 遍历内部文件重命名（传入正确的标题和TMDB ID）
+                rename_result = self._rename_files_in_folder(final_cid, target_title, str(tmdb_id))
+                file_details = rename_result.get("files", [])
+                # 收集文件夹整理的额外信息
+                if file_details:
+                    if not media_info:
+                        media_info = {}
+                    media_info["_file_count"] = len(file_details)
+                    media_info["_file_size"] = format_size(rename_result.get("total_size", 0))
+                    # 收集所有集数
+                    episodes = [d["episode"] for d in file_details if d.get("episode")]
+                    seasons = [d["season"] for d in file_details if d.get("season")]
+                    if episodes:
+                        media_info["_episode_range"] = (min(episodes), max(episodes))
+                    if seasons:
+                        media_info["season"] = seasons[0]
+                    # 取最后一个文件的技术信息
+                    if file_details[-1].get("tech_info"):
+                        media_info["tech_info"] = file_details[-1]["tech_info"]
             else:
                 # 文件模式：重命名文件
                 if target_filename and target_filename != file_name:
@@ -431,15 +484,24 @@ class OrganizeService:
                         self.file_service.rename_file(str(moved_id), target_filename)
                         logger.info(f"重命名成功: {file_name} → {target_filename}")
                     else:
-                        logger.warning(f"未找到已移动的文件，跳过重命名: {file_name}")
+                        # 文件找不到 → 整理失败
+                        self._submit_notify(
+                            success=False, file_name=file_name,
+                            title=target_title or file_name, category=category,
+                            action=action, target_dir=full_dir,
+                            media_info=media_info or {},
+                        )
+                        return {"success": False, "message": f"整理失败：复制后未找到文件 {file_name}，请稍后重试"}
 
             # 异步发送通知（不阻塞返回）
-            asyncio.create_task(self._send_notify(
+            # execute_organize 在线程池中执行，没有运行中的事件循环，
+            # 必须用 run_coroutine_threadsafe 提交到主线程事件循环
+            self._submit_notify(
                 success=True, file_name=file_name,
                 title=target_title or file_name, category=category,
                 action=action, target_dir=full_dir,
                 media_info=media_info or {},
-            ))
+            )
 
             return {
                 "success": True,
@@ -453,16 +515,20 @@ class OrganizeService:
 
         except Exception as e:
             logger.error(f"整理失败: {e}")
-            asyncio.create_task(self._send_notify(
+            self._submit_notify(
                 success=False, file_name=file_name,
                 title=target_title or file_name, category=category,
                 action="", target_dir="",
                 media_info=media_info or {},
-            ))
+            )
             return {"success": False, "message": f"整理失败: {str(e)}"}
 
     def _ensure_directory(self, dir_path: str) -> Optional[int]:
-        """确保目录路径存在，逐级创建缺失的目录
+        """确保目录路径存在，使用 makedir 一次性创建多级目录
+
+        替代逐级创建+sleep 的低效方式：
+        - 旧：每级先查找→不存在则创建→sleep→再查找确认，3级目录至少1.5秒+6次API
+        - 新：makedir(contain_dir=True) 一次调用创建整条路径，自带 Busy 重试
 
         Args:
             dir_path: 目录路径，如 "媒体库/电影/国产电影/四喜 (2025) {tmdb=273131}"
@@ -474,65 +540,96 @@ class OrganizeService:
         # "根目录" 就是 cid=0，不应该创建这个文件夹
         while parts and parts[0] in ('根目录', '/', ''):
             parts.pop(0)
-        current_cid = 0
 
-        for part in parts:
-            # 先查找是否已存在
-            found_cid = self._find_subdir(current_cid, part)
-            if found_cid is not None:
-                current_cid = found_cid
-                logger.debug(f"目录已存在: {part} (cid={current_cid})")
-                continue
+        if not parts:
+            return 0
 
-            # 不存在则创建
-            try:
-                result = self.file_service.create_folder(part, current_cid)
-                logger.info(f"创建目录: {part}，返回: {result}")
-            except Exception as e:
-                logger.warning(f"创建目录异常（可能已存在）: {part}, {e}")
-
-            # 创建后再查找（无论 create_folder 返回什么）
-            time.sleep(DIR_CREATE_WAIT)
-            found_cid = self._find_subdir(current_cid, part)
-            if found_cid is not None:
-                current_cid = found_cid
-                logger.info(f"确认目录: {part} (cid={current_cid})")
-            else:
-                logger.error(f"创建目录后未找到: {part}")
-                return None
-
-        return current_cid
+        clean_path = '/'.join(parts)
+        try:
+            cid = self.file_service.create_folder_path(clean_path, pid=0)
+            logger.info(f"目录就绪: {clean_path} (cid={cid})")
+            return cid
+        except Exception as e:
+            logger.error(f"创建目录失败: {clean_path}, {e}")
+            return None
 
     def _list_all_files_paged(self, cid: int, page_size: int = 200) -> List[Dict]:
-        """分页拉取目录下全部文件（避免大目录只取前 200 条导致找不到目标）
+        """拉取目录下全部文件（自动分页，不丢数据）
+
+        使用 file_service.iter_all_files（内部用 iter_fs_files），
+        自动分页、自带 P115BusyOSError 重试，替代手动 limit+offset。
 
         Args:
             cid: 目录 ID
-            page_size: 每页大小，默认 200
+            page_size: 已废弃，保留参数兼容性
 
         Returns:
-            全部文件列表（已合并所有分页）
+            全部文件列表
         """
-        offset = 0
-        all_items: List[Dict] = []
-        while True:
-            try:
-                result = self.file_service.list_files(cid, limit=page_size, offset=offset)
-            except Exception as e:
-                logger.warning(f"分页拉取目录失败: cid={cid}, offset={offset}, {e}")
-                break
-            items = result.get("items", [])
-            if not items:
-                break
-            all_items.extend(items)
-            # 不足一页说明已到末尾
-            if len(items) < page_size:
-                break
-            offset += page_size
-        return all_items
+        try:
+            return self.file_service.iter_all_files(cid)
+        except Exception as e:
+            logger.warning(f"拉取目录文件失败: cid={cid}, {e}")
+            return []
+
+    def _recursive_list_video_names(self, cid, depth: int = 0, max_depth: int = 3) -> List[str]:
+        """递归列出目录下所有视频文件名（用于识别阶段的嵌套文件夹）
+
+        当前端只传了一层子目录名（如 ["Season 01"]）而没有视频文件名时，
+        用此方法递归查找嵌套子目录中的视频文件，解决识别不完整的问题。
+
+        Args:
+            cid: 目录 ID（字符串或整数）
+            depth: 当前递归深度
+            max_depth: 最大递归深度（防止无限递归）
+
+        Returns:
+            视频文件名列表
+        """
+        if depth > max_depth or not cid:
+            return []
+        video_exts = get_video_extensions()
+        video_names = []
+        try:
+            items = self.file_service.iter_all_files(int(cid))
+        except Exception:
+            return []
+        for item in items:
+            if item.get("is_dir"):
+                # 递归子目录
+                sub_names = self._recursive_list_video_names(item["file_id"], depth + 1, max_depth)
+                video_names.extend(sub_names)
+            else:
+                name = item.get("name", "")
+                ext = '.' + name.rsplit('.', 1)[-1].lower() if '.' in name else ''
+                if ext in video_exts:
+                    video_names.append(name)
+        return video_names
+
+    def _merge_folder_contents(self, src_cid: int, dst_cid: int):
+        """将源文件夹的所有内容移动到目标文件夹（合并，不重命名）
+
+        用于同一部剧不同规格版本复用同一文件夹的场景：
+        整理第二个版本时，目标文件夹已存在，将新文件夹内容合并进去。
+
+        Args:
+            src_cid: 源文件夹 ID
+            dst_cid: 目标文件夹 ID
+        """
+        try:
+            items = self.file_service.iter_all_files(src_cid)
+        except Exception as e:
+            logger.warning(f"合并文件夹失败，无法列出源目录: {e}")
+            return
+
+        # 收集所有子项 ID（文件和子目录）
+        all_ids = [str(item["file_id"]) for item in items]
+        if all_ids:
+            self.file_service.move_files(all_ids, str(dst_cid))
+            logger.info(f"合并 {len(all_ids)} 个项目到已有文件夹")
 
     def _find_subdir(self, parent_cid: int, name: str) -> Optional[int]:
-        """在父目录下查找指定名称的子目录（分页遍历，支持大目录）"""
+        """在父目录下查找指定名称的子目录（分页遍历）"""
         try:
             for item in self._list_all_files_paged(parent_cid):
                 if item.get("is_dir") and item.get("name") == name:
@@ -541,8 +638,75 @@ class OrganizeService:
             logger.warning(f"查找子目录失败: {parent_cid}/{name}, {e}")
         return None
 
+    def _find_season_dir_variant(self, parent_cid: int, target_name: str) -> Optional[int]:
+        """模糊匹配 Season 子目录变体
+
+        目标名 "Season 01" 可匹配的变体：
+        - Season 1, season 01, season 1, S01, s01
+        避免原始文件夹已有 Season 子目录时创建多余空目录。
+
+        Args:
+            parent_cid: 父目录 ID
+            target_name: 目标子目录名（如 "Season 01"）
+
+        Returns:
+            匹配到的子目录 ID，未匹配返回 None
+        """
+        # 从目标名提取季号，如 "Season 01" → 1
+        season_match = re.search(r'[Ss]eason\s*(\d+)', target_name)
+        if not season_match:
+            return None
+        season_num = int(season_match.group(1))
+
+        # 生成所有可能变体
+        variants = {
+            f"Season {season_num:02d}",   # Season 01
+            f"Season {season_num}",        # Season 1
+            f"season {season_num:02d}",    # season 01
+            f"season {season_num}",        # season 1
+            f"S{season_num:02d}",          # S01
+            f"s{season_num:02d}",          # s01
+        }
+        # 移除目标名自身（已精确匹配过）
+        variants.discard(target_name)
+
+        try:
+            for item in self._list_all_files_paged(parent_cid):
+                if item.get("is_dir") and item.get("name") in variants:
+                    logger.info(f"找到 Season 变体: {item['name']} → {target_name}")
+                    return int(item["file_id"])
+        except Exception:
+            pass
+        return None
+
+    def _quick_find_in_dir(self, dir_cid: int, name: str, is_dir: bool = False) -> Optional[int]:
+        """在目录下快速查找指定名称的项（单次查找，不重试）
+
+        适用于：检查子目录是否存在等场景，不需要等待 115 同步。
+        对于复制/移动后需要等待同步的场景，请用 _find_file_in_dir（含重试）。
+
+        Args:
+            dir_cid: 目录 ID
+            name: 文件/目录名
+            is_dir: 是否只匹配目录
+        """
+        try:
+            for item in self._list_all_files_paged(dir_cid):
+                if is_dir and not item.get("is_dir"):
+                    continue
+                if item.get("name") == name:
+                    return int(item["file_id"])
+        except Exception:
+            pass
+        return None
+
     def _find_file_in_dir(self, dir_cid: int, name: str) -> Optional[int]:
-        """在目录下查找指定名称的文件（分页遍历，支持大目录）"""
+        """在目录下查找指定名称的文件（分页遍历）
+
+        Args:
+            dir_cid: 目录 ID
+            name: 文件名
+        """
         try:
             for item in self._list_all_files_paged(dir_cid):
                 if item.get("name") == name:
@@ -571,7 +735,12 @@ class OrganizeService:
             logger.warning(f"移动视频文件到子目录失败: {e}")
 
     def _rename_files_in_folder(self, folder_cid: int, tmdb_title: str = "", tmdb_id: str = "") -> Dict[str, Any]:
-        """遍历文件夹内的视频文件，逐个按模板重命名
+        """遍历文件夹内的视频文件，批量按模板重命名
+
+        优化策略：
+        - 先遍历收集所有需要重命名的 (file_id, new_name) 对
+        - 用 file_service.batch_rename 一次提交（内部用 update_name 批量处理）
+        - 40集剧从40次API调用降到1次，自带 P115BusyOSError 自动重试
 
         Returns:
             {"files": [...], "total_size": int}
@@ -579,16 +748,14 @@ class OrganizeService:
         video_exts = get_video_extensions()
 
         try:
-            result = self.file_service.list_files(folder_cid, limit=200)
-            items = result.get("items", [])
+            items = self.file_service.iter_all_files(folder_cid)
         except Exception as e:
             logger.warning(f"列出文件夹内容失败: {e}")
-            # 异常路径必须返回与正常路径一致的 dict 结构，否则调用方 .get() 会 AttributeError
             return {"files": [], "total_size": 0}
 
-        renamed_count = 0
         file_details = []
         total_size = 0
+        rename_pairs = []  # 收集 (file_id, new_name) 用于批量重命名
 
         for item in items:
             if item.get("is_dir"):
@@ -638,18 +805,48 @@ class OrganizeService:
                 "tech_info": tech_info,
             })
 
+            # 收集需要重命名的条目，稍后批量提交
             if new_name and new_name != filename:
-                try:
-                    self.file_service.rename_file(str(file_id), new_name)
-                    logger.info(f"重命名文件: {filename} → {new_name}")
-                    renamed_count += 1
-                except Exception as e:
-                    logger.warning(f"重命名文件失败: {filename}, {e}")
+                rename_pairs.append((file_id, new_name))
 
-        if renamed_count > 0:
-            logger.info(f"文件夹内重命名完成: {renamed_count} 个文件")
+        # 批量重命名：一次 API 请求处理所有文件
+        if rename_pairs:
+            try:
+                self.file_service.batch_rename(rename_pairs)
+                logger.info(f"批量重命名完成: {len(rename_pairs)} 个文件")
+            except Exception as e:
+                logger.warning(f"批量重命名失败，回退逐个重命名: {e}")
+                # 回退：逐个重命名（兼容性保底）
+                for file_id, new_name in rename_pairs:
+                    try:
+                        self.file_service.rename_file(str(file_id), new_name)
+                    except Exception as re:
+                        logger.warning(f"重命名文件失败: {new_name}, {re}")
 
         return {"files": file_details, "total_size": total_size}
+
+    def _submit_notify(self, **notify_kwargs):
+        """提交通知协程到事件循环（线程池安全）
+
+        execute_organize 在线程池中执行，没有运行中的事件循环，
+        直接用 asyncio.create_task 会报 RuntimeError。
+        通过 run_coroutine_threadsafe 提交到主线程事件循环。
+        """
+        coro = self._send_notify(**notify_kwargs)
+        # 优先使用初始化时保存的主线程事件循环
+        loop = self._main_loop
+        if loop and loop.is_running():
+            asyncio.run_coroutine_threadsafe(coro, loop)
+            return
+        # 回退：尝试从当前线程获取
+        try:
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                asyncio.run_coroutine_threadsafe(coro, loop)
+            else:
+                asyncio.ensure_future(coro)
+        except RuntimeError:
+            logger.warning("无法发送通知：无可用事件循环，通知已丢弃")
 
     async def _send_notify(self, success: bool, file_name: str,
                            title: str, category: str,

@@ -115,6 +115,9 @@ class ExecuteRequest(BaseModel):
 async def execute_organize(req: ExecuteRequest):
     """执行文件整理：创建目录 → 移动/复制 → 重命名"""
     organize_service = get_organize_service()
+    # 在主线程保存事件循环引用，供子线程 _submit_notify 使用
+    # asyncio.to_thread 内部无法通过 get_event_loop() 获取循环
+    organize_service._main_loop = asyncio.get_running_loop()
     # execute_organize 内部有 time.sleep 和同步文件操作 API 调用，
     # 用 asyncio.to_thread 放到线程池执行，避免阻塞事件循环
     result = await asyncio.to_thread(

@@ -11,8 +11,6 @@ import re
 from typing import Optional, List, Dict, Any
 from urllib.parse import urlparse, parse_qs
 
-from importlib import import_module
-
 from ..db.database import get_db
 from ..logger import get_logger
 
@@ -75,38 +73,11 @@ class ShareService:
 
         # 调用 p115client 获取文件列表
         try:
-            from p115client import P115Client
             from p115client.tool import share_iterdir
 
-            # 优先尝试 Open API
-            from .token_service import get_token_service
-            token_service = get_token_service()
-            access_token = token_service.get_access_token()
-            
-            if access_token:
-                # 使用 Open API
-                try:
-                    open_mod = import_module("p115client.open")
-                    P115OpenClient = getattr(open_mod, "P115OpenClient")
-                    app_id = token_service.get_app_id()
-                    client = P115OpenClient(
-                        access_token=access_token,
-                        app_id=int(app_id) if app_id else 0,
-                    )
-                except (ImportError, AttributeError):
-                    # p115client 版本不支持 Open API，回退 Web API
-                    from .auth_service import get_auth_service
-                    cookies = get_auth_service().get_cookies()
-                    if not cookies:
-                        return {"success": False, "error": "未登录，无法解析分享链接"}
-                    client = P115Client(cookies)
-            else:
-                # 回退 Web API
-                from .auth_service import get_auth_service
-                cookies = get_auth_service().get_cookies()
-                if not cookies:
-                    return {"success": False, "error": "未登录，无法解析分享链接"}
-                client = P115Client(cookies)
+            # 复用 file_service._get_client()（统一 Open API 优先 + 动态 app）
+            from .file_service import get_file_service
+            client = get_file_service()._get_client()
 
             # 获取根目录
             root_files = list(share_iterdir(client, share_code=share_code, receive_code=receive_code))

@@ -21,7 +21,7 @@ STRM 文件生成服务 - 基于已整理的分享数据库记录生成本地 .s
 import os
 from pathlib import Path
 from typing import List, Dict, Optional
-from urllib.parse import urlencode, quote
+from urllib.parse import urlencode
 
 from p115client import P115Client
 
@@ -337,13 +337,12 @@ class StrmService:
         格式：
             {base_url}/d115/{organized_name}?share_code=...&receive_code=...&id=...
 
-        对文件名路径段使用 URL 编码（quote(safe='')），处理含 ?、#、&、空格
-        等特殊字符的文件名，避免破坏 URL 结构。query 参数仍用 urlencode
-        编码，避免分享码、提取码等参数出现特殊字符时错位。
+        文件名保持原始不编码：直链服务通过 query 参数（id/share_code/pickcode）
+        定位文件，路径中的文件名仅供 Emby 识别媒体信息，不需要 URL 编码。
 
         Args:
             base_url: 直链基地址
-            organized_name: 文件名（用于 URL 路径段，会被 URL 编码）
+            organized_name: 文件名（保持原始，不编码）
             share_code: 分享码
             receive_code: 提取码（可能为空）
             file_id: 文件 ID
@@ -356,9 +355,7 @@ class StrmService:
             "receive_code": receive_code or "",
             "id": file_id or "",
         })
-        # 对文件名进行 URL 编码以处理特殊字符（safe='' 表示所有非字母数字字符都编码）
-        encoded_name = quote(organized_name or "", safe="")
-        return f"{base_url.rstrip('/')}/d115/{encoded_name}?{query}"
+        return f"{base_url.rstrip('/')}/d115/{organized_name}?{query}"
 
     # ==================== 生成 ====================
 
@@ -503,8 +500,9 @@ class StrmService:
     def _iter_cloud_files_with_path(self, cid: int, current_path: str):
         """递归遍历云盘目录，生成带完整路径的文件信息
 
-        用 file_service.list_files（内部用 fs_files 列表 API）逐目录拉取，
-        递归处理子目录，自己构建文件完整路径。
+        使用 file_service.iter_all_files（内部用 iter_fs_files 自动分页），
+        替代手动 limit=5000 单页拉取，避免大目录文件遗漏。
+        自带 P115BusyOSError 自动重试。
 
         不使用 p115client 的 iter_files_with_path_skim，因为后者内部
         依赖 download_files_app 下载接口获取路径，该接口对部分 cookies
@@ -519,12 +517,12 @@ class StrmService:
         """
         file_service = get_file_service()
         try:
-            result = file_service.list_files(cid, limit=5000)
+            items = file_service.iter_all_files(cid)
         except Exception as e:
             logger.error(f"列出云盘目录失败: cid={cid}, {e}")
             return
 
-        for item in result.get("items", []):
+        for item in items:
             name = item.get("name", "")
             if not name:
                 continue
@@ -547,7 +545,7 @@ class StrmService:
     def _resolve_cid_by_path(self, path: str) -> Optional[int]:
         """将云盘路径字符串转为 cid
 
-        逐级用 file_service.list_files 查找子目录（仅查找不创建）。
+        逐级用 file_service.iter_all_files 查找子目录（仅查找不创建）。
         区别于 organize_service._ensure_directory 的创建逻辑。
 
         Args:
@@ -569,8 +567,9 @@ class StrmService:
         for part in parts:
             found_cid = None
             try:
-                result = file_service.list_files(current_cid, limit=200)
-                for item in result.get("items", []):
+                # 用 iter_all_files 自动分页，避免大目录 limit=200 找不到目标
+                items = file_service.iter_all_files(current_cid)
+                for item in items:
                     if item.get("is_dir") and item.get("name") == part:
                         found_cid = int(item["file_id"])
                         break
@@ -590,20 +589,18 @@ class StrmService:
 
         格式：{base_url}/d115/{filename}?pickcode={pick_code}
 
-        对文件名路径段使用 URL 编码（quote(safe='')），处理含 ?、#、&、空格
-        等特殊字符的文件名，避免破坏 URL 结构。与分享 STRM 保持一致。
+        文件名保持原始不编码：直链服务通过 pickcode 参数定位文件，
+        路径中的文件名仅供 Emby 识别媒体信息。
 
         Args:
             base_url: 直链基地址
-            filename: 文件名（用于 URL 路径段，会被 URL 编码）
+            filename: 文件名（保持原始，不编码）
             pick_code: 115 文件的 pickcode
 
         Returns:
             完整直链 URL
         """
-        # 对文件名进行 URL 编码以处理特殊字符
-        encoded_name = quote(filename or "", safe="")
-        return f"{base_url.rstrip('/')}/d115/{encoded_name}?pickcode={pick_code}"
+        return f"{base_url.rstrip('/')}/d115/{filename}?pickcode={pick_code}"
 
     def _build_cloud_relative_path(self, file_path: str, media_library_path: str) -> Optional[Path]:
         """构建云盘 STRM 文件的相对路径

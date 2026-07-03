@@ -1258,6 +1258,23 @@ async function doGenerateStrm(isShare: boolean) {
 
 .strm-confirm-footer button {
   flex: 1;
+  height: 36px;
+  padding: 0 18px;
+  font-size: 13px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: all var(--transition-base);
+  border-radius: var(--radius-sm);
+}
+.strm-confirm-footer .btn-secondary {
+  background: transparent;
+  color: var(--text-primary);
+  border: 1px solid var(--border);
+  box-shadow: var(--shadow-sm);
+}
+.strm-confirm-footer .btn-secondary:hover {
+  background: var(--bg-hover);
+  box-shadow: var(--shadow-md);
 }
 
 .strm-hint {

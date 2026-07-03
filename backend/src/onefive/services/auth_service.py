@@ -113,7 +113,15 @@ class AuthService:
         vip_type = "none"  # none / vip / forever
         face = ""
         try:
-            client = P115Client(cookies)
+            # app 值必须与登录设备匹配，否则报 errno:99
+            login_device = self.config_service.get("login_device") or "web"
+            if login_device in ("android", "115android", "qandroid", "tv", "harmony"):
+                app = "android"
+            elif login_device in ("ios", "115ios", "115ipad", "wechatmini", "alipaymini"):
+                app = "ios"
+            else:
+                app = "web"
+            client = P115Client(cookies, app=app)
             user_info = client.user_my()
             if user_info and user_info.get("state"):
                 data = user_info.get("data", {})
@@ -325,6 +333,10 @@ class AuthService:
 
                 if cookies:
                     self.save_cookies(cookies)
+                    # 记录登录设备类型到配置，API 调用时需使用匹配的 app 值
+                    # web 登录 → app="web"，android 登录 → app="android"
+                    from .config_service import get_config_service
+                    get_config_service().set("login_device", device, "扫码登录时选择的设备类型")
                     session["status"] = "confirmed"
                     session["cookies"] = cookies
                     logger.info("登录成功，cookies 已保存")

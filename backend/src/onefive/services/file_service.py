@@ -11,17 +11,22 @@
 - iter_files/iter_dirs 支持目录树遍历
 - list_files 例外：直接调用 client.fs_files 原生 API 以保证分页语义准确
 """
+import time
 from typing import Optional, Dict, Any, List
 
 from p115client import P115Client, P115OpenClient
+from p115client.exception import P115BusyOSError
 from p115client.tool import (
     iter_files,
     iter_dirs,
+    iter_fs_files,
     get_info,
     get_path,
     batch_move,
     batch_copy,
     batch_delete,
+    makedir,
+    update_name,
 )
 
 from .auth_service import get_auth_service
@@ -43,6 +48,40 @@ class FileService:
         self.auth_service = get_auth_service()
         self.token_service = get_token_service()
 
+    def _get_client_app(self) -> str:
+        """根据登录设备类型返回 P115Client 初始化的 app 参数
+
+        app 值必须与扫码登录时选择的设备类型一致，否则会报 errno:99 "请重新登录"。
+        仅用于 P115Client(cookies, app=...) 的初始化，决定请求头和身份标识。
+
+        映射规则：
+        - android 系设备（android/115android/qandroid/tv/harmony）→ "android"
+        - ios 系设备（ios/115ios/115ipad/wechatmini/alipaymini）→ "ios"
+        - web 及其他 → "web"
+        """
+        from .config_service import get_config_service
+        login_device = get_config_service().get("login_device") or "web"
+        if login_device in ("android", "115android", "qandroid", "tv", "harmony"):
+            return "android"
+        if login_device in ("ios", "115ios", "115ipad", "wechatmini", "alipaymini"):
+            return "ios"
+        return "web"
+
+    @staticmethod
+    def _get_tool_app() -> str:
+        """返回 p115client tool 函数的 app 参数
+
+        p115client tool 函数（iter_fs_files/makedir/update_name 等）的 app 参数
+        决定走哪个 API 端点：
+        - app="web" → 标准端点 fs_files/fs_mkdir/fs_rename（稳定可靠）
+        - app="android" → 专用端点 fs_files_app(app="android")（部分返回 405）
+
+        实测结论：专用端点（android/ios）不稳定，统一用 "web" 走标准端点。
+        P115Client 初始化的 app 参数（决定 cookie 身份）与 tool 函数的 app 参数
+        （决定 API 端点）是两个独立概念，互不影响。
+        """
+        return "web"
+
     def _get_client(self) -> P115Client | P115OpenClient:
         """获取已登录的客户端实例
 
@@ -52,27 +91,33 @@ class FileService:
         tool 函数根据传入的 client 类型自动选择 API：
         - P115OpenClient → Open API（proapi.115.com，分页上限 7000+）
         - P115Client → Web API（webapi.115.com，分页上限 1150）
-        """
-        # 优先尝试 Open API
-        access_token = self.token_service.get_access_token()
-        if access_token:
-            app_id = self.token_service.get_app_id()
-            return P115OpenClient(
-                access_token=access_token,
-                app_id=int(app_id) if app_id else 0,
-            )
 
-        # 回退 Web API
+        app 参数根据登录设备动态选择，保证与 cookie 身份一致。
+        """
+        # 优先尝试 Open API（必须同时满足：开关启用 + token 有效）
+        if self.token_service.is_open_api_enabled():
+            access_token = self.token_service.get_access_token()
+            if access_token:
+                app_id = self.token_service.get_app_id()
+                return P115OpenClient(
+                    access_token=access_token,
+                    app_id=int(app_id) if app_id else 0,
+                )
+
+        # 回退 Web API：app 值必须与登录设备匹配，否则报 errno:99
         cookies = self.auth_service.get_cookies()
         if not cookies:
             raise NotLoggedInError("未登录，请先扫码登录")
-        return P115Client(cookies)
+        return P115Client(cookies, app=self._get_client_app())
 
     def _call_with_fallback(self, method_name: str, client, *args, **kwargs):
         """调用 client 方法，Open API 失败时自动回退 Web API
 
         115 Open API 部分端点可能返回 405（接口变更或权限不足），
         此方法在 Open API 调用失败时自动回退到 Web API 重试。
+
+        P115BusyOSError（115 正忙）不触发回退，直接向上抛出，
+        由 _retry_on_busy 统一重试同一 API，避免双重浪费请求。
 
         Args:
             method_name: client 方法名（如 "fs_files"）
@@ -84,15 +129,40 @@ class FileService:
         """
         try:
             return getattr(client, method_name)(*args, **kwargs)
+        except P115BusyOSError:
+            # 115 正忙：不回退，由 _retry_on_busy 统一重试
+            raise
         except Exception as e:
             if isinstance(client, P115OpenClient):
                 logger.warning(f"Open API {method_name} 调用失败，回退 Web API: {e}")
                 cookies = self.auth_service.get_cookies()
                 if not cookies:
                     raise NotLoggedInError("未登录，请先扫码登录") from e
-                web_client = P115Client(cookies)
+                web_client = P115Client(cookies, app=self._get_client_app())
                 return getattr(web_client, method_name)(*args, **kwargs)
             raise
+
+    @staticmethod
+    def _retry_on_busy(func, *args, max_retries=3, delay=2, **kwargs):
+        """115 忙时自动重试
+
+        115 云盘在高并发或高峰期经常返回 P115BusyOSError，
+        这是暂时性错误，等一会儿重试同一 API 即可恢复。
+
+        Args:
+            func: 要调用的函数
+            max_retries: 最大重试次数
+            delay: 基础等待秒数（实际等待 = delay × 重试序号）
+        """
+        for attempt in range(max_retries):
+            try:
+                return func(*args, **kwargs)
+            except P115BusyOSError:
+                if attempt == max_retries - 1:
+                    raise
+                wait = delay * (attempt + 1)
+                logger.warning(f"115 系统繁忙，{wait}秒后重试 ({attempt+1}/{max_retries})")
+                time.sleep(wait)
 
     # ==================== 文件列表 ====================
 
@@ -127,7 +197,10 @@ class FileService:
         }
         # 直接调用 client 方法，避免 tool.fs_files 自动翻页导致 limit/offset 失效
         # Open API 可能 405，_call_with_fallback 自动回退 Web API
-        result = self._call_with_fallback("fs_files", client, payload)
+        # P115BusyOSError 自动重试
+        result = self._retry_on_busy(
+            lambda: self._call_with_fallback("fs_files", client, payload)
+        )
         file_list = result.get("data") or []
         items = [self._parse_file_item(f) for f in file_list]
 
@@ -254,7 +327,27 @@ class FileService:
             115 API 响应结果
         """
         client = self._get_client()
-        return self._call_with_fallback("fs_mkdir", client, name, pid=pid)
+        # P115BusyOSError 自动重试
+        return self._retry_on_busy(
+            lambda: self._call_with_fallback("fs_mkdir", client, name, pid=pid)
+        )
+
+    def create_folder_path(self, path: str, pid: int = 0) -> int:
+        """一次性创建多级目录路径，返回最终目录的 cid
+
+        使用 p115client.tool.makedir(contain_dir=True)，
+        一次 API 调用创建整条路径，替代逐级创建+sleep 的低效方式。
+        makedir 内部已自带 P115BusyOSError 自动重试。
+
+        Args:
+            path: 多级目录路径，如 "媒体库/电影/国产电影"
+            pid: 根父目录 ID，0 表示云盘根目录
+
+        Returns:
+            最终目录的 cid（int）
+        """
+        client = self._get_client()
+        return makedir(client, path, pid=pid, contain_dir=True, app=self._get_tool_app())
 
     # ==================== 搜索 ====================
 
@@ -274,11 +367,12 @@ class FileService:
         """
         # 统一走 _get_client：Open API 优先，Web API 回退
         client = self._get_client()
-
-        # Open API 可能 405，_call_with_fallback 自动回退 Web API
-        result = self._call_with_fallback(
-            "fs_search", client,
-            {"search_value": keyword, "cid": cid, "limit": 100}
+        # P115BusyOSError 自动重试
+        result = self._retry_on_busy(
+            lambda: self._call_with_fallback(
+                "fs_search", client,
+                {"search_value": keyword, "cid": cid, "limit": 100}
+            )
         )
         file_list = result.get("data") or []
         items = [self._parse_file_item(f) for f in file_list] if isinstance(file_list, list) else []
@@ -292,6 +386,31 @@ class FileService:
         }
 
     # ==================== 目录树遍历 ====================
+
+    def iter_all_files(self, cid: int = 0) -> List[Dict[str, Any]]:
+        """自动分页遍历目录下全部文件（含子目录中的文件）
+
+        使用 p115client.tool.iter_fs_files，自动分页、自带 P115BusyOSError 重试。
+        替代手动 limit+offset 分页，避免大目录文件遗漏。
+
+        注意：
+        - iter_fs_files 每次迭代返回一整页响应（含 data/count/cid 等），
+          需要从 page["data"] 提取文件列表，而非把整页当作单个文件
+        - 只返回当前目录直属文件，不递归子目录
+        - 如需递归整个目录树，请用 iter_files 方法
+
+        Args:
+            cid: 目录 ID，0 表示根目录
+
+        Returns:
+            文件信息列表
+        """
+        client = self._get_client()
+        result = []
+        for page in iter_fs_files(client, cid, app=self._get_tool_app()):
+            for f in page.get("data", []):
+                result.append(self._parse_file_item(f))
+        return result
 
     def iter_files(self, cid: int = 0) -> List[Dict[str, Any]]:
         """递归遍历目录树，获取所有文件
@@ -396,7 +515,27 @@ class FileService:
             new_name: 新文件名（必须包含扩展名）
         """
         client = self._get_client()
-        self._call_with_fallback("fs_rename", client, (file_id, new_name))
+        # P115BusyOSError 自动重试
+        self._retry_on_busy(
+            lambda: self._call_with_fallback("fs_rename", client, (file_id, new_name))
+        )
+
+    def batch_rename(self, id_name_pairs: List[tuple]) -> None:
+        """批量重命名文件/目录
+
+        使用 p115client.tool.update_name，一次请求处理大量文件，
+        内部自带 P115BusyOSError 自动重试。
+        替代循环调用 rename_file 的低效方式（40集剧从40次API降到1次）。
+
+        注意：update_name 不支持 Open API，仅 Web API 可用。
+
+        Args:
+            id_name_pairs: (file_id, new_name) 元组列表
+        """
+        if not id_name_pairs:
+            return
+        client = self._get_client()
+        update_name(client, id_name_pairs, app=self._get_tool_app())
 
 
 # 全局单例
