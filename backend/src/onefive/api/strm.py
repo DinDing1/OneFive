@@ -62,6 +62,44 @@ async def get_accessible_paths():
     return ApiResponse(code=0, message="success", data={"paths": paths})
 
 
+@router.get("/accessible-paths/children", summary="列出授权目录下的子目录")
+async def list_accessible_children(path: str = ""):
+    """列出指定授权目录下的子目录（一层）
+
+    前端选择 STRM 存储路径时，先选授权目录，再逐级浏览子目录，
+    最终路径 = 授权目录 + 选中的子目录路径。
+
+    Args:
+        path: 要列出的目录路径，为空时返回所有授权目录
+    """
+    from pathlib import Path
+    service = get_strm_service()
+
+    # path 为空：返回所有授权目录
+    if not path:
+        paths = await asyncio.to_thread(service.get_accessible_paths)
+        return ApiResponse(code=0, message="success", data={"dirs": paths})
+
+    # 校验 path 在授权范围内
+    accessible = await asyncio.to_thread(service.get_accessible_paths)
+    if not service._is_path_authorized(path, accessible):
+        return ApiResponse(code=0, message="success", data={"dirs": [], "error": "路径不在授权范围内"})
+
+    # 列出子目录
+    def _list_subdirs(p: str):
+        result = []
+        try:
+            for entry in sorted(Path(p).iterdir(), key=lambda x: x.name.lower()):
+                if entry.is_dir():
+                    result.append(str(entry))
+        except (PermissionError, FileNotFoundError, OSError):
+            pass
+        return result
+
+    dirs = await asyncio.to_thread(_list_subdirs, path)
+    return ApiResponse(code=0, message="success", data={"dirs": dirs})
+
+
 @router.post("/generate", summary="生成分享 STRM 文件")
 async def generate():
     """根据已整理的分享文件生成 STRM 文件到配置的输出目录

@@ -170,26 +170,29 @@ class StrmService:
         """获取飞牛授权的可访问路径列表
 
         数据源优先级：
-        1. 环境变量 TRIM_DATA_ACCESSIBLE_PATHS（飞牛运行时注入，分号分隔）
-        2. 落盘文件 ACCESSIBLE_PATHS_FILE（仅本地开发使用，模拟飞牛授权目录）
+        1. 落盘文件 ACCESSIBLE_PATHS_FILE（config_callback 写入的最新值）
+        2. 环境变量 TRIM_DATA_ACCESSIBLE_PATHS（进程启动时的快照，兜底）
 
-        飞牛正式环境只读环境变量，不使用落盘文件缓存，
-        避免授权目录变更后旧文件导致读到过时路径。
+        飞牛修改授权目录后会调用 config_callback 脚本，将新值写入文件。
+        Python 进程内 os.environ 是启动快照不会更新，所以飞牛环境
+        必须优先读文件才能拿到最新授权路径，"刷新授权目录"按钮才有用。
+
+        本地开发环境没有 config_callback，用 accessible_paths.env 模拟。
 
         Returns:
             去重后的授权路径列表
         """
-        raw = os.environ.get("TRIM_DATA_ACCESSIBLE_PATHS", "")
-
-        # 环境变量为空且非飞牛环境时，读取落盘文件（仅本地开发用）
-        # 飞牛环境（有 TRIM_PKGVAR）必须只用环境变量，保证授权目录实时生效
-        if not raw and not TRIM_PKGVAR and ACCESSIBLE_PATHS_FILE.exists():
+        # 优先读落盘文件（飞牛 config_callback 写入 / 本地开发模拟）
+        if ACCESSIBLE_PATHS_FILE.exists():
             try:
-                raw = ACCESSIBLE_PATHS_FILE.read_text(encoding="utf-8")
+                raw = ACCESSIBLE_PATHS_FILE.read_text(encoding="utf-8").strip()
+                if raw:
+                    return split_accessible_paths(raw)
             except Exception as e:
                 logger.warning(f"读取授权路径文件失败: {e}")
-                return []
 
+        # 兜底：环境变量（进程启动时的快照）
+        raw = os.environ.get("TRIM_DATA_ACCESSIBLE_PATHS", "")
         return split_accessible_paths(raw)
 
     def _is_path_authorized(self, path: str, accessible: List[str]) -> bool:

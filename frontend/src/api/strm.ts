@@ -33,6 +33,11 @@ export const strmApi = {
     return api.get('/strm/accessible-paths')
   },
 
+  /** 列出授权目录下的子目录（一层） */
+  getAccessibleChildren(path: string): Promise<ApiResult<any>> {
+    return api.get('/strm/accessible-paths/children', { params: { path } })
+  },
+
   /** 生成分享 STRM 文件 */
   generate(): Promise<ApiResult<StrmGenerateResult>> {
     return api.post('/strm/generate')
