@@ -14,6 +14,9 @@ from pydantic import BaseModel
 
 from ..models.schemas import ApiResponse
 from ..services.strm_service import get_strm_service
+from ..logger import get_logger
+
+logger = get_logger(__name__)
 
 router = APIRouter(prefix="/api/strm", tags=["STRM"])
 

@@ -84,34 +84,22 @@
 
             <div class="toolbar-spacer"></div>
 
-            <!-- 检测链接按钮 + 统计 -->
-            <div v-if="viewMode === 'original'" class="check-links-group">
-              <!-- 有效/无效统计（非检测中时显示，让用户一眼看到当前状态分布） -->
-              <div v-if="!checkingLinks" class="link-stats">
-                <span class="link-stat link-stat-valid" :title="`有效 ${validCountTotal} 个`">
-                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="20 6 9 17 4 12" /></svg>
-                  {{ validCountTotal }}
-                </span>
-                <span v-if="invalidCountTotal > 0" class="link-stat link-stat-invalid" :title="`无效 ${invalidCountTotal} 个`">
-                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><line x1="18" y1="6" x2="6" y2="18" /><line x1="6" y1="6" x2="18" y2="18" /></svg>
-                  {{ invalidCountTotal }}
-                </span>
-              </div>
-              <button
-                class="btn-check-links"
-                :disabled="checkingLinks"
-                @click="handleCheckLinks"
-              >
-                <svg v-if="!checkingLinks" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                  <path d="M9 12l2 2 4-4" />
-                  <circle cx="12" cy="12" r="10" />
-                </svg>
-                <svg v-else class="icon-spin" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                  <path d="M21 12a9 9 0 1 1-6.219-8.56" />
-                </svg>
-                <span>{{ checkingLinks ? `检测中 ${checkProgress}` : '检测链接' }}</span>
-              </button>
-            </div>
+            <!-- 检测链接按钮 -->
+            <button
+              v-if="viewMode === 'original'"
+              class="btn-check-links"
+              :disabled="checkingLinks"
+              @click="handleCheckLinks"
+            >
+              <svg v-if="!checkingLinks" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <path d="M9 12l2 2 4-4" />
+                <circle cx="12" cy="12" r="10" />
+              </svg>
+              <svg v-else class="icon-spin" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <path d="M21 12a9 9 0 1 1-6.219-8.56" />
+              </svg>
+              <span>{{ checkingLinks ? `检测中 ${checkProgress}` : '检测链接' }}</span>
+            </button>
 
             <!-- 搜索框 -->
             <div class="search-box neu-inset">
@@ -705,9 +693,6 @@ const sources = ref<ShareSource[]>([])
 const linkValidMap = ref<Map<number, number>>(new Map())
 const checkingLinks = ref(false)
 const checkProgress = ref('')
-// 有效/无效统计
-const validCountTotal = computed(() => sources.value.filter(s => (linkValidMap.value.get(s.id) ?? 1) === 1).length)
-const invalidCountTotal = computed(() => sources.value.filter(s => linkValidMap.value.get(s.id) === 0).length)
 const loadingShares = ref(false)
 
 // 视图模式：原始 / 整理
@@ -2347,42 +2332,6 @@ function runOrganizeStream(
   color: var(--success);
 }
 .link-invalid {
-  background: var(--danger-bg);
-  color: var(--danger);
-}
-
-/* 检测链接按钮 + 统计 组合容器 */
-.check-links-group {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-}
-
-/* 有效/无效统计小徽章 */
-.link-stats {
-  display: flex;
-  align-items: center;
-  gap: 4px;
-}
-.link-stat {
-  display: inline-flex;
-  align-items: center;
-  gap: 3px;
-  padding: 3px 8px;
-  font-size: 11px;
-  font-weight: 600;
-  border-radius: var(--radius-full);
-  line-height: 1;
-}
-.link-stat svg {
-  width: 11px;
-  height: 11px;
-}
-.link-stat-valid {
-  background: var(--success-bg);
-  color: var(--success);
-}
-.link-stat-invalid {
   background: var(--danger-bg);
   color: var(--danger);
 }
