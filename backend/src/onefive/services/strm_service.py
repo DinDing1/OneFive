@@ -329,8 +329,18 @@ class StrmService:
         try:
             full_resolved = full_path.resolve()
             root_resolved = root.resolve()
-            return full_resolved == root_resolved or root_resolved in full_resolved.parents
-        except Exception:
+            is_safe = full_resolved == root_resolved or root_resolved in full_resolved.parents
+            if not is_safe:
+                logger.warning(
+                    f"[STRM] 路径校验失败: full_resolved={full_resolved}, "
+                    f"root_resolved={root_resolved}, full_path={full_path}, root={root}"
+                )
+            return is_safe
+        except Exception as e:
+            logger.warning(
+                f"[STRM] _is_within_directory 异常: full_path={full_path}, root={root}, "
+                f"error={type(e).__name__}: {e}"
+            )
             return False
 
     def _build_strm_url(self, base_url: str, organized_name: str,
