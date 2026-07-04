@@ -92,14 +92,27 @@ async def list_accessible_children(path: str = ""):
     # 列出子目录
     def _list_subdirs(p: str):
         result = []
+        skipped = 0
         try:
             for entry in sorted(Path(p).iterdir(), key=lambda x: x.name.lower()):
                 if entry.is_dir():
-                    result.append(str(entry))
+                    path_str = str(entry)
+                    # 跳过包含代理对的路径（非 UTF-8 文件名），避免 JSON 序列化失败
+                    # Linux 文件系统允许任意字节作为文件名，Python 用 surrogateescape 解码
+                    # 产生代理对（U+D800-U+DFFF），FastAPI 用 UTF-8 编码 JSON 时会报错
+                    try:
+                        path_str.encode('utf-8')
+                    except UnicodeEncodeError:
+                        skipped += 1
+                        logger.warning(f"[子目录] 跳过非 UTF-8 路径: {path_str!r}")
+                        continue
+                    result.append(path_str)
         except (PermissionError, FileNotFoundError, OSError) as e:
             logger.warning(f"[子目录] 列出子目录失败: path={p}, error={type(e).__name__}: {e}")
         except Exception as e:
             logger.error(f"[子目录] 列出子目录未知异常: path={p}, error={type(e).__name__}: {e}")
+        if skipped > 0:
+            logger.info(f"[子目录] 跳过 {skipped} 个非 UTF-8 路径")
         return result
 
     dirs = await asyncio.to_thread(_list_subdirs, path)
