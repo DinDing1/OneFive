@@ -467,57 +467,28 @@
           <!-- 分享 STRM 路径选择器 -->
           <div class="field">
             <label>分享 STRM 存储路径</label>
-            <div class="path-picker">
-              <div class="path-breadcrumb">
-                <span
-                  v-for="(crumb, idx) in strmPathBreadcrumbs"
-                  :key="idx"
-                  class="path-crumb"
-                  @click="browseStrmPath(idx)"
-                >{{ crumb.name }}<span v-if="idx < strmPathBreadcrumbs.length - 1" class="path-sep">/</span></span>
-                <span v-if="strmPathBreadcrumbs.length === 0" class="path-placeholder">请选择目录</span>
-              </div>
-              <div class="path-dropdown" v-if="strmPathDropdown.length > 0">
-                <div
-                  v-for="dir in strmPathDropdown"
-                  :key="dir"
-                  class="path-option"
-                  @click="selectStrmPathDir(dir)"
-                >📁 {{ pathBasename(dir) }}</div>
-              </div>
-              <button class="btn-ghost-sm path-confirm-btn" v-if="strmPathBreadcrumbs.length > 0 && strmPendingPath !== strmOutputPath" @click="confirmStrmPath">确认选择</button>
+            <div class="path-field">
+              <span class="path-text" :class="{ 'path-empty': !strmOutputPath }">{{ strmOutputPath || '选择目录' }}</span>
+              <button class="btn-ghost" @click.stop="openStrmPathPicker('strm')">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>
+              </button>
             </div>
           </div>
 
           <!-- 云盘 STRM 路径选择器 -->
           <div class="field">
             <label>云盘 STRM 存储路径</label>
-            <div class="path-picker">
-              <div class="path-breadcrumb">
-                <span
-                  v-for="(crumb, idx) in cloudPathBreadcrumbs"
-                  :key="idx"
-                  class="path-crumb"
-                  @click="browseCloudPath(idx)"
-                >{{ crumb.name }}<span v-if="idx < cloudPathBreadcrumbs.length - 1" class="path-sep">/</span></span>
-                <span v-if="cloudPathBreadcrumbs.length === 0" class="path-placeholder">请选择目录</span>
-              </div>
-              <div class="path-dropdown" v-if="cloudPathDropdown.length > 0">
-                <div
-                  v-for="dir in cloudPathDropdown"
-                  :key="dir"
-                  class="path-option"
-                  @click="selectCloudPathDir(dir)"
-                >📁 {{ pathBasename(dir) }}</div>
-              </div>
-              <button class="btn-ghost-sm path-confirm-btn" v-if="cloudPathBreadcrumbs.length > 0 && cloudPendingPath !== strmCloudOutputPath" @click="confirmCloudPath">确认选择</button>
+            <div class="path-field">
+              <span class="path-text" :class="{ 'path-empty': !strmCloudOutputPath }">{{ strmCloudOutputPath || '选择目录' }}</span>
+              <button class="btn-ghost" @click.stop="openStrmPathPicker('cloud')">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>
+              </button>
             </div>
           </div>
         </div>
         <p v-if="strmAccessiblePaths.length === 0" class="strm-hint">
           请先在飞牛应用设置中给壹伍授权一个媒体库目录，保存后点击下方"刷新授权目录"。
         </p>
-        <p class="strm-hint">点击路径可逐级浏览子目录，选中目标目录后点击"确认选择"。</p>
 
         <!-- 分享 STRM 生成结果 -->
         <div class="strm-result" v-if="strmResult">
@@ -618,11 +589,46 @@
         </div>
       </div>
     </div>
+
+    <!-- STRM 目录选择器弹窗 -->
+    <div v-if="showStrmPathPicker" class="glass-overlay" @click.self="showStrmPathPicker = false">
+      <div class="modal glass-solid">
+        <div class="modal-head">
+          <h4>选择目录</h4>
+          <button class="btn-icon-sm neu-circle" @click="showStrmPathPicker = false">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+          </button>
+        </div>
+        <div class="modal-nav">
+          <span v-if="strmPickerBreadcrumbs.length === 0" class="nav-item">授权目录</span>
+          <template v-for="(b, i) in strmPickerBreadcrumbs" :key="i">
+            <span class="nav-item" @click="strmPickerNavigateTo(i)">
+              {{ b.name }}<span v-if="i < strmPickerBreadcrumbs.length - 1" class="nav-sep">/</span>
+            </span>
+          </template>
+        </div>
+        <div class="modal-list">
+          <div v-if="strmPickerLoading" class="modal-empty">加载中...</div>
+          <div v-else-if="strmPickerDirs.length === 0" class="modal-empty">此目录为空</div>
+          <div v-else v-for="dir in strmPickerDirs" :key="dir" class="modal-dir" @click="strmPickerEnterDir(dir)">
+            <svg viewBox="0 0 24 24" fill="currentColor"><path d="M10 4H4c-1.1 0-2 .9-2 2v12c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2V8c0-1.1-.9-2-2-2h-8l-2-2z"/></svg>
+            <span>{{ pathBasename(dir) }}</span>
+          </div>
+        </div>
+        <div class="modal-foot">
+          <span class="modal-path">{{ strmPickerCurrentPath || '请选择目录' }}</span>
+          <div class="modal-btns">
+            <button class="btn-ghost" @click="showStrmPathPicker = false">取消</button>
+            <button class="btn-save" @click="confirmStrmPathPick" :disabled="!strmPickerCurrentPath">确定</button>
+          </div>
+        </div>
+      </div>
+    </div>
   </div>
 </template>
 
 <script setup lang="ts">
-import { ref, reactive, onMounted, type Ref } from 'vue'
+import { ref, reactive, onMounted } from 'vue'
 import { filesApi } from '@/api/files'
 import { organizeApi } from '@/api/organize'
 import { notificationApi } from '@/api/notification'
@@ -716,15 +722,13 @@ const strmCloudGenerating = ref(false)
 const strmResult = ref<StrmGenerateResult | null>(null)
 const strmCloudResult = ref<StrmGenerateResult | null>(null)
 
-// 路径选择器状态（分享 STRM）
-const strmPathBreadcrumbs = ref<{name: string, path: string}[]>([])  // 面包屑导航
-const strmPathDropdown = ref<string[]>([])                            // 当前层级的子目录列表
-const strmPendingPath = ref('')                                       // 待确认的路径
-
-// 路径选择器状态（云盘 STRM）
-const cloudPathBreadcrumbs = ref<{name: string, path: string}[]>([])
-const cloudPathDropdown = ref<string[]>([])
-const cloudPendingPath = ref('')
+// STRM 路径选择器弹窗状态（分享/云盘共用）
+const showStrmPathPicker = ref(false)
+const strmPickerTarget = ref<'strm' | 'cloud'>('strm')
+const strmPickerBreadcrumbs = ref<{name: string, path: string}[]>([])
+const strmPickerDirs = ref<string[]>([])
+const strmPickerLoading = ref(false)
+const strmPickerCurrentPath = ref('')
 
 // STRM 确认对话框（替代原生 confirm）
 const strmConfirmVisible = ref(false)
@@ -1120,11 +1124,6 @@ function pathBasename(p: string): string {
   return p.split(/[\\/]/).filter(Boolean).pop() || p
 }
 
-/** 根据完整路径初始化面包屑（只显示最后一级名称） */
-function initBreadcrumbs(fullPath: string, crumbs: Ref<{name: string, path: string}[]>) {
-  crumbs.value = [{ name: pathBasename(fullPath), path: fullPath }]
-}
-
 async function loadStrmSettings() {
   try {
     const res = await strmApi.getSettings()
@@ -1133,15 +1132,6 @@ async function loadStrmSettings() {
       strmOutputPath.value = res.data.output_path || ''
       strmCloudOutputPath.value = res.data.cloud_output_path || ''
       strmVideoExtensions.value = res.data.video_extensions || ''
-      // 如果已保存路径，初始化面包屑显示
-      if (strmOutputPath.value) {
-        strmPendingPath.value = strmOutputPath.value
-        initBreadcrumbs(strmOutputPath.value, strmPathBreadcrumbs)
-      }
-      if (strmCloudOutputPath.value) {
-        cloudPendingPath.value = strmCloudOutputPath.value
-        initBreadcrumbs(strmCloudOutputPath.value, cloudPathBreadcrumbs)
-      }
     }
   } catch (e) {
     console.error('加载 STRM 配置失败:', e)
@@ -1153,9 +1143,6 @@ async function loadStrmAccessiblePaths() {
     const res = await strmApi.getAccessiblePaths()
     if (res.code === 0 && res.data) {
       strmAccessiblePaths.value = res.data.paths || []
-      // 初始化路径选择器的根目录列表
-      strmPathDropdown.value = strmAccessiblePaths.value
-      cloudPathDropdown.value = strmAccessiblePaths.value
     }
   } catch (e) {
     console.error('加载授权目录失败:', e)
@@ -1163,85 +1150,52 @@ async function loadStrmAccessiblePaths() {
   }
 }
 
-// ---- 路径选择器：分享 STRM ----
+// ---- STRM 路径选择器弹窗（分享/云盘共用） ----
+
+/** 打开路径选择器弹窗
+ *  初始显示授权目录列表，用户逐级浏览选择目标目录
+ */
+function openStrmPathPicker(target: 'strm' | 'cloud') {
+  strmPickerTarget.value = target
+  strmPickerBreadcrumbs.value = []
+  strmPickerCurrentPath.value = ''
+  strmPickerDirs.value = strmAccessiblePaths.value
+  showStrmPathPicker.value = true
+}
+
+/** 进入下一层目录
+ *  点击授权目录（顶层）时重置面包屑，点击子目录时追加到面包屑
+ */
+async function strmPickerEnterDir(dir: string) {
+  const dirName = pathBasename(dir)
+  // 点击的是授权目录（顶层）→ 重置面包屑
+  if (strmAccessiblePaths.value.includes(dir)) {
+    strmPickerBreadcrumbs.value = [{ name: dirName, path: dir }]
+  } else {
+    strmPickerBreadcrumbs.value.push({ name: dirName, path: dir })
+  }
+  strmPickerCurrentPath.value = dir
+  await loadStrmPickerSubDirs(dir)
+}
 
 /** 点击面包屑导航到指定层级 */
-async function browseStrmPath(idx: number) {
-  strmPathBreadcrumbs.value = strmPathBreadcrumbs.value.slice(0, idx + 1)
-  const currentPath = strmPathBreadcrumbs.value[idx].path
-  await loadStrmSubDirs(currentPath, 'strm')
+function strmPickerNavigateTo(idx: number) {
+  strmPickerBreadcrumbs.value = strmPickerBreadcrumbs.value.slice(0, idx + 1)
+  const currentPath = strmPickerBreadcrumbs.value[idx].path
+  strmPickerCurrentPath.value = currentPath
+  loadStrmPickerSubDirs(currentPath)
 }
 
-/** 选择一个子目录，进入下一层
- *  点击授权目录（顶层）时重置面包屑，避免重复追加导致路径显示成 /onefive/onefive
- *  点击子目录时追加到面包屑
- */
-async function selectStrmPathDir(dir: string) {
-  const dirName = pathBasename(dir)
-  // 点击的是授权目录（顶层）→ 重置面包屑
-  if (strmAccessiblePaths.value.includes(dir)) {
-    strmPathBreadcrumbs.value = [{ name: dirName, path: dir }]
-  } else {
-    // 点击的是子目录 → 追加到面包屑
-    strmPathBreadcrumbs.value.push({ name: dirName, path: dir })
-  }
-  strmPendingPath.value = dir
-  await loadStrmSubDirs(dir, 'strm')
-}
-
-/** 确认当前路径为最终选择 */
-function confirmStrmPath() {
-  if (strmPendingPath.value) {
-    strmOutputPath.value = strmPendingPath.value
-  }
-}
-
-// ---- 路径选择器：云盘 STRM ----
-
-async function browseCloudPath(idx: number) {
-  cloudPathBreadcrumbs.value = cloudPathBreadcrumbs.value.slice(0, idx + 1)
-  const currentPath = cloudPathBreadcrumbs.value[idx].path
-  await loadStrmSubDirs(currentPath, 'cloud')
-}
-
-/** 选择一个子目录，进入下一层（云盘 STRM）
- *  点击授权目录（顶层）时重置面包屑，避免重复追加
- *  点击子目录时追加到面包屑
- */
-async function selectCloudPathDir(dir: string) {
-  const dirName = pathBasename(dir)
-  // 点击的是授权目录（顶层）→ 重置面包屑
-  if (strmAccessiblePaths.value.includes(dir)) {
-    cloudPathBreadcrumbs.value = [{ name: dirName, path: dir }]
-  } else {
-    // 点击的是子目录 → 追加到面包屑
-    cloudPathBreadcrumbs.value.push({ name: dirName, path: dir })
-  }
-  cloudPendingPath.value = dir
-  await loadStrmSubDirs(dir, 'cloud')
-}
-
-function confirmCloudPath() {
-  if (cloudPendingPath.value) {
-    strmCloudOutputPath.value = cloudPendingPath.value
-  }
-}
-
-/** 加载子目录列表（通用，target 区分分享/云盘）
+/** 加载指定路径下的子目录列表
  *  后端可能返回 error 字段（如路径不在授权范围内），需要提示用户
  */
-async function loadStrmSubDirs(path: string, target: 'strm' | 'cloud') {
+async function loadStrmPickerSubDirs(path: string) {
+  strmPickerLoading.value = true
   try {
     const res = await strmApi.getAccessibleChildren(path)
     if (res.code === 0 && res.data) {
-      const dirs = res.data.dirs || []
+      strmPickerDirs.value = res.data.dirs || []
       const errorMsg = res.data.error || ''
-      if (target === 'strm') {
-        strmPathDropdown.value = dirs
-      } else {
-        cloudPathDropdown.value = dirs
-      }
-      // 后端返回了错误信息（如授权校验失败），提示用户
       if (errorMsg) {
         showToast(errorMsg, 'error')
       }
@@ -1249,7 +1203,21 @@ async function loadStrmSubDirs(path: string, target: 'strm' | 'cloud') {
   } catch (e) {
     console.error('加载子目录失败:', e)
     showToast('加载子目录失败，请查看日志', 'error')
+    strmPickerDirs.value = []
+  } finally {
+    strmPickerLoading.value = false
   }
+}
+
+/** 确认选择，将当前路径写回对应配置项 */
+function confirmStrmPathPick() {
+  if (!strmPickerCurrentPath.value) return
+  if (strmPickerTarget.value === 'strm') {
+    strmOutputPath.value = strmPickerCurrentPath.value
+  } else {
+    strmCloudOutputPath.value = strmPickerCurrentPath.value
+  }
+  showStrmPathPicker.value = false
 }
 
 async function saveStrmSettings() {
@@ -1361,67 +1329,6 @@ async function doGenerateStrm(isShare: boolean) {
   display: grid;
   grid-template-columns: 1fr 1fr;
   gap: 16px;
-}
-
-/* 路径选择器 */
-.path-picker {
-  position: relative;
-}
-.path-breadcrumb {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: 2px;
-  padding: 8px 10px;
-  background: var(--bg-input);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-sm);
-  min-height: 36px;
-  font-size: 13px;
-  cursor: pointer;
-}
-.path-crumb {
-  color: var(--text-primary);
-  cursor: pointer;
-  transition: color var(--transition-base);
-}
-.path-crumb:hover {
-  color: var(--accent);
-}
-.path-sep {
-  margin: 0 4px;
-  color: var(--text-tertiary);
-}
-.path-placeholder {
-  color: var(--text-tertiary);
-  font-size: 13px;
-}
-.path-dropdown {
-  position: absolute;
-  top: 100%;
-  left: 0;
-  right: 0;
-  max-height: 200px;
-  overflow-y: auto;
-  background: var(--bg-card);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-sm);
-  box-shadow: var(--shadow-md);
-  z-index: 100;
-  margin-top: 2px;
-}
-.path-option {
-  padding: 8px 12px;
-  font-size: 13px;
-  cursor: pointer;
-  transition: background var(--transition-base);
-}
-.path-option:hover {
-  background: var(--bg-hover);
-}
-.path-confirm-btn {
-  margin-top: 6px;
-  font-size: 12px;
 }
 
 /* 确认对话框 */
