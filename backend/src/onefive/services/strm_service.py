@@ -316,8 +316,17 @@ class StrmService:
     def _is_within_directory(full_path: Path, root: Path) -> bool:
         """二次校验：解析后的绝对路径是否位于 root 目录之下（含 root 自身）
 
-        用于在 _sanitize_segment 清洗之后再做一道 resolve 校验，
-        防止任何残留的路径穿越（如符号链接、未过滤干净的片段）写到授权目录之外。
+        用于在 _sanitize_segment 清洗之后再做一道绝对路径校验，
+        防止任何残留的路径穿越（如未过滤干净的片段）写到授权目录之外。
+
+        实现说明：
+        - 用 os.path.abspath 替代 Path.resolve()
+        - 原因：飞牛 Docker 容器 LANG=C 时，sys.getfilesystemencoding()=ascii，
+          Path.resolve() 内部调用 os.path.realpath → os.fsencode 编码中文路径失败
+          （UnicodeEncodeError），导致校验直接返回 False
+        - os.path.abspath 是纯字符串操作（normpath + 拼接 cwd），不调用 os.fsencode，
+          仍然处理 .. 等相对路径片段，满足路径穿越校验需求
+        - _sanitize_segment 已过滤 .. 危险片段，abspath 足够安全
 
         Args:
             full_path: 待校验的完整路径
@@ -327,8 +336,9 @@ class StrmService:
             True 表示安全（在 root 之下），False 表示越界
         """
         try:
-            full_resolved = full_path.resolve()
-            root_resolved = root.resolve()
+            # 用 os.path.abspath 替代 Path.resolve()，避免 ASCII 编码环境下中文路径失败
+            full_resolved = Path(os.path.abspath(full_path))
+            root_resolved = Path(os.path.abspath(root))
             is_safe = full_resolved == root_resolved or root_resolved in full_resolved.parents
             if not is_safe:
                 logger.warning(
