@@ -83,6 +83,7 @@ async def list_accessible_children(path: str = ""):
     # 校验 path 在授权范围内
     accessible = await asyncio.to_thread(service.get_accessible_paths)
     if not service._is_path_authorized(path, accessible):
+        logger.warning(f"[子目录] 路径不在授权范围内: path={path}, accessible={accessible}")
         return ApiResponse(code=0, message="success", data={"dirs": [], "error": "路径不在授权范围内"})
 
     # 列出子目录
@@ -92,11 +93,14 @@ async def list_accessible_children(path: str = ""):
             for entry in sorted(Path(p).iterdir(), key=lambda x: x.name.lower()):
                 if entry.is_dir():
                     result.append(str(entry))
-        except (PermissionError, FileNotFoundError, OSError):
-            pass
+        except (PermissionError, FileNotFoundError, OSError) as e:
+            logger.warning(f"[子目录] 列出子目录失败: path={p}, error={type(e).__name__}: {e}")
+        except Exception as e:
+            logger.error(f"[子目录] 列出子目录未知异常: path={p}, error={type(e).__name__}: {e}")
         return result
 
     dirs = await asyncio.to_thread(_list_subdirs, path)
+    logger.info(f"[子目录] path={path}, 找到 {len(dirs)} 个子目录")
     return ApiResponse(code=0, message="success", data={"dirs": dirs})
 
 

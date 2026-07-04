@@ -1227,20 +1227,28 @@ function confirmCloudPath() {
   }
 }
 
-/** 加载子目录列表（通用，target 区分分享/云盘） */
+/** 加载子目录列表（通用，target 区分分享/云盘）
+ *  后端可能返回 error 字段（如路径不在授权范围内），需要提示用户
+ */
 async function loadStrmSubDirs(path: string, target: 'strm' | 'cloud') {
   try {
     const res = await strmApi.getAccessibleChildren(path)
     if (res.code === 0 && res.data) {
       const dirs = res.data.dirs || []
+      const errorMsg = res.data.error || ''
       if (target === 'strm') {
         strmPathDropdown.value = dirs
       } else {
         cloudPathDropdown.value = dirs
       }
+      // 后端返回了错误信息（如授权校验失败），提示用户
+      if (errorMsg) {
+        showToast(errorMsg, 'error')
+      }
     }
   } catch (e) {
     console.error('加载子目录失败:', e)
+    showToast('加载子目录失败，请查看日志', 'error')
   }
 }
 
