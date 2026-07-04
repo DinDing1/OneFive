@@ -12,6 +12,7 @@ export interface ShareSource {
   file_count: number
   total_size: number
   status: string
+  link_valid: number  // 1=有效 0=无效 默认1
   error_msg: string
   created_at: string
   updated_at: string
@@ -74,6 +75,17 @@ export const shareApi = {
   /** 列出分享来源 */
   listShares(): Promise<ApiResult<{ shares: ShareSource[] }>> {
     return api.get('/share/list')
+  },
+
+  /** 检测单个分享链接有效性 */
+  checkLinkValid(sourceId: number): Promise<ApiResult<any>> {
+    return api.post(`/share/${sourceId}/check`)
+  },
+
+  /** 批量检测分享链接有效性（SSE 流式） */
+  checkAllLinksStream(): EventSource {
+    const baseURL = api.defaults.baseURL || '/app/onefive/api'
+    return new EventSource(`${baseURL}/share/check-stream`)
   },
 
   /** 删除分享 */

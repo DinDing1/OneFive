@@ -79,6 +79,73 @@ async def list_shares():
     return ApiResponse(code=0, message="success", data={"shares": shares})
 
 
+@router.post("/{source_id}/check", summary="检测单个分享链接有效性")
+async def check_link_valid(source_id: int):
+    """检测单个分享链接是否有效"""
+    service = get_share_service()
+    result = await asyncio.to_thread(service.check_link_valid, source_id)
+    return ApiResponse(code=0, message="检测完成", data=result)
+
+
+@router.get("/check-stream", summary="批量检测分享链接有效性（SSE 流式）")
+async def check_all_links_stream():
+    """批量检测所有分享链接有效性，SSE 流式返回每个检测结果
+
+    SSE 事件格式：
+    - {"type":"start","total":N}            开始检测
+    - {"type":"progress","current":i,"total":N,"source_id":id,"share_name":"...","valid":true/false,"error":"..."}
+    - {"type":"done","valid_count":X,"invalid_count":Y}  检测完成
+    """
+    service = get_share_service()
+
+    async def event_stream():
+        # 获取所有分享
+        shares = await asyncio.to_thread(service.get_all_shares_for_check)
+        total = len(shares)
+
+        yield f"data: {json.dumps({'type': 'start', 'total': total}, ensure_ascii=False)}\n\n"
+
+        valid_count = 0
+        invalid_count = 0
+
+        for i, share in enumerate(shares, 1):
+            source_id = share["id"]
+            # 逐个检测（同步方法放线程池）
+            result = await asyncio.to_thread(service.check_link_valid, source_id)
+
+            if result["valid"]:
+                valid_count += 1
+            else:
+                invalid_count += 1
+
+            # 推送进度
+            progress_data = {
+                "type": "progress",
+                "current": i,
+                "total": total,
+                "source_id": source_id,
+                "share_name": share.get("share_name", ""),
+                "valid": result["valid"],
+                "error": result.get("error", ""),
+            }
+            yield f"data: {json.dumps(progress_data, ensure_ascii=False)}\n\n"
+
+            # 限流：share_snap docstring 明确警告"过于频繁会封禁 IP"
+            # 每次检测后等 0.5 秒，避免触发 115 IP 封禁（最后一个不等）
+            if i < total:
+                await asyncio.sleep(0.5)
+
+        # 推送完成
+        done_data = {
+            "type": "done",
+            "valid_count": valid_count,
+            "invalid_count": invalid_count,
+        }
+        yield f"data: {json.dumps(done_data, ensure_ascii=False)}\n\n"
+
+    return StreamingResponse(event_stream(), media_type="text/event-stream")
+
+
 @router.delete("/{source_id}", summary="删除分享")
 async def delete_share(source_id: int):
     """删除分享来源及关联的所有文件"""

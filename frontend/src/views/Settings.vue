@@ -483,10 +483,10 @@
                   :key="dir"
                   class="path-option"
                   @click="selectStrmPathDir(dir)"
-                >📁 {{ dir.split('/').pop() || dir.split('\\').pop() || dir }}</div>
+                >📁 {{ pathBasename(dir) }}</div>
               </div>
+              <button class="btn-ghost-sm path-confirm-btn" v-if="strmPathBreadcrumbs.length > 0 && strmPendingPath !== strmOutputPath" @click="confirmStrmPath">确认选择</button>
             </div>
-            <button class="btn-ghost-sm path-confirm-btn" v-if="strmPathBreadcrumbs.length > 0 && strmPendingPath !== strmOutputPath" @click="confirmStrmPath">确认选择</button>
           </div>
 
           <!-- 云盘 STRM 路径选择器 -->
@@ -508,10 +508,10 @@
                   :key="dir"
                   class="path-option"
                   @click="selectCloudPathDir(dir)"
-                >📁 {{ dir.split('/').pop() || dir.split('\\').pop() || dir }}</div>
+                >📁 {{ pathBasename(dir) }}</div>
               </div>
+              <button class="btn-ghost-sm path-confirm-btn" v-if="cloudPathBreadcrumbs.length > 0 && cloudPendingPath !== strmCloudOutputPath" @click="confirmCloudPath">确认选择</button>
             </div>
-            <button class="btn-ghost-sm path-confirm-btn" v-if="cloudPathBreadcrumbs.length > 0 && cloudPendingPath !== strmCloudOutputPath" @click="confirmCloudPath">确认选择</button>
           </div>
         </div>
         <p v-if="strmAccessiblePaths.length === 0" class="strm-hint">
@@ -1113,11 +1113,16 @@ async function stopDirectLink() {
 
 // ==================== STRM 文件 ====================
 
+/** 从路径中提取最后一部分（目录名），兼容 Windows 反斜杠和 Linux 正斜杠
+ *  例：'D:\\a\\b' → 'b'，'/a/b' → 'b'，'a' → 'a'
+ */
+function pathBasename(p: string): string {
+  return p.split(/[\\/]/).filter(Boolean).pop() || p
+}
+
 /** 根据完整路径初始化面包屑（只显示最后一级名称） */
 function initBreadcrumbs(fullPath: string, crumbs: Ref<{name: string, path: string}[]>) {
-  // 简化：只放一级，显示完整路径
-  const name = fullPath.split('/').pop() || fullPath.split('\\').pop() || fullPath
-  crumbs.value = [{ name, path: fullPath }]
+  crumbs.value = [{ name: pathBasename(fullPath), path: fullPath }]
 }
 
 async function loadStrmSettings() {
@@ -1167,10 +1172,19 @@ async function browseStrmPath(idx: number) {
   await loadStrmSubDirs(currentPath, 'strm')
 }
 
-/** 选择一个子目录，进入下一层 */
+/** 选择一个子目录，进入下一层
+ *  点击授权目录（顶层）时重置面包屑，避免重复追加导致路径显示成 /onefive/onefive
+ *  点击子目录时追加到面包屑
+ */
 async function selectStrmPathDir(dir: string) {
-  const dirName = dir.split('/').pop() || dir.split('\\').pop() || dir
-  strmPathBreadcrumbs.value.push({ name: dirName, path: dir })
+  const dirName = pathBasename(dir)
+  // 点击的是授权目录（顶层）→ 重置面包屑
+  if (strmAccessiblePaths.value.includes(dir)) {
+    strmPathBreadcrumbs.value = [{ name: dirName, path: dir }]
+  } else {
+    // 点击的是子目录 → 追加到面包屑
+    strmPathBreadcrumbs.value.push({ name: dirName, path: dir })
+  }
   strmPendingPath.value = dir
   await loadStrmSubDirs(dir, 'strm')
 }
@@ -1190,9 +1204,19 @@ async function browseCloudPath(idx: number) {
   await loadStrmSubDirs(currentPath, 'cloud')
 }
 
+/** 选择一个子目录，进入下一层（云盘 STRM）
+ *  点击授权目录（顶层）时重置面包屑，避免重复追加
+ *  点击子目录时追加到面包屑
+ */
 async function selectCloudPathDir(dir: string) {
-  const dirName = dir.split('/').pop() || dir.split('\\').pop() || dir
-  cloudPathBreadcrumbs.value.push({ name: dirName, path: dir })
+  const dirName = pathBasename(dir)
+  // 点击的是授权目录（顶层）→ 重置面包屑
+  if (strmAccessiblePaths.value.includes(dir)) {
+    cloudPathBreadcrumbs.value = [{ name: dirName, path: dir }]
+  } else {
+    // 点击的是子目录 → 追加到面包屑
+    cloudPathBreadcrumbs.value.push({ name: dirName, path: dir })
+  }
   cloudPendingPath.value = dir
   await loadStrmSubDirs(dir, 'cloud')
 }

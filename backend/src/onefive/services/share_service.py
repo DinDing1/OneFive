@@ -200,6 +200,185 @@ class ShareService:
         )
         return [dict(r) for r in rows]
 
+    def check_link_valid(self, source_id: int) -> Dict[str, Any]:
+        """检测单个分享链接是否有效
+
+        判断逻辑：调用 share/snap 端点单次请求（limit=1），
+        通过返回的 state 和 errno 字段判断链接死活。
+
+        相比 share_iterdir 的优势：
+        - share_iterdir 会循环分页拉整个分享根目录所有文件，请求量大、易触发风控
+        - share/snap 单次调用，limit=1 只拉 1 条，请求量极小
+
+        客户端选择：始终用 P115Client(app='web') 走 webapi.115.com/share/snap 标准端点。
+        源码考证（p115client/client.py）：
+        - share_snap 方法（行 25263）内部用 get_request，不会带 cookies → 405
+        - 所以用 client.request(url, params=payload) 调用同一端点（和 fs_files 一致），
+          自动带上 self.cookies 和 self.headers
+
+        判定条件（全部满足才算有效）：
+        - resp.state == True（HTTP 请求成功）
+        - resp.errno == 0（业务层成功）
+
+        Args:
+            source_id: 分享来源 ID
+
+        Returns:
+            {"source_id": int, "share_code": str, "valid": bool, "error": str}
+        """
+        # 查询分享信息
+        row = self.db.fetchone(
+            "SELECT share_code, receive_code, share_name FROM share_source WHERE id = ?",
+            (source_id,)
+        )
+        if not row:
+            return {"source_id": source_id, "valid": False, "error": "分享记录不存在"}
+
+        share_code = row["share_code"]
+        receive_code = row["receive_code"]
+        share_name = row["share_name"]
+
+        try:
+            from .file_service import get_file_service
+            from ..exceptions import NotLoggedInError
+
+            file_svc = get_file_service()
+            # share_snap 的最小请求 payload：只拉 1 条根目录文件
+            # 注意：share_snap 的 count_folders/count_files 参数在源码中未声明，不传
+            payload = {
+                "share_code": share_code,
+                "receive_code": receive_code,
+                "cid": 0,                # 根目录
+                "offset": 0,
+                "limit": 1,              # 只要 1 条就够判断有效性
+            }
+
+            # 调用 share_snap：内部强制用 P115Client(app='web') 走标准端点，
+            # 外层 _retry_on_busy 处理 115 繁忙错误
+            resp = file_svc._retry_on_busy(
+                lambda: self._call_share_snap(file_svc, payload)
+            )
+
+            # 解析返回结果，按 state/errno 判定有效性
+            valid, error_msg = self._parse_share_snap_response(resp)
+
+        except NotLoggedInError as e:
+            valid = False
+            error_msg = str(e)
+        except Exception as e:
+            valid = False
+            error_msg = str(e)[:200]  # 截断过长的错误信息
+
+        # 更新数据库
+        self.db.execute(
+            """UPDATE share_source
+               SET link_valid = ?, error_msg = ?,
+                   updated_at = datetime('now', 'localtime')
+               WHERE id = ?""",
+            (1 if valid else 0, error_msg, source_id)
+        )
+        self.db.commit()
+
+        logger.info(f"检测分享链接: {share_name} ({share_code}) → {'有效' if valid else '无效: ' + error_msg}")
+
+        return {
+            "source_id": source_id,
+            "share_code": share_code,
+            "share_name": share_name,
+            "valid": valid,
+            "error": error_msg,
+        }
+
+    @staticmethod
+    def _call_share_snap(file_svc, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """调用 share/snap 端点检测分享有效性，强制使用 Web API（app='web'）并带 cookies
+
+        源码考证（p115client/client.py）：
+        - share_snap 方法（行 25324-25325）内部直接用 get_request，不会带上 self.cookies
+        - fs_files 方法（行 11508）用 self.request，会自动带上 self.cookies（行 730-732）
+        - 所以不能用 client.share_snap(payload)，否则请求不带 cookies 会 405
+        - 解决方案：用 client.request(url, params=payload) 调用同一端点，确保带上 cookies
+
+        端点：GET https://webapi.115.com/share/snap
+        参数：share_code, receive_code, cid=0, offset=0, limit=1
+
+        Args:
+            file_svc: FileService 实例（用于获取 cookies）
+            payload: share_snap 请求参数
+
+        Returns:
+            share_snap 返回的 dict
+        """
+        from p115client import P115Client
+        from ..exceptions import NotLoggedInError
+
+        cookies = file_svc.auth_service.get_cookies()
+        if not cookies:
+            raise NotLoggedInError("未登录，请先扫码登录")
+
+        # 强制 app='web'，走 webapi.115.com/share/snap 标准端点
+        web_client = P115Client(cookies, app='web')
+        # 关键：用 client.request 而非 client.share_snap
+        # client.request 会自动带上 self.cookies 和 self.headers（和 fs_files 一致）
+        # client.share_snap 内部用 get_request，不会带 cookies，导致 405
+        api = "https://webapi.115.com/share/snap"
+        return web_client.request(url=api, params=payload)
+
+    @staticmethod
+    def _parse_share_snap_response(resp: Dict[str, Any]) -> tuple:
+        """解析 share_snap 返回结果，判定分享是否有效
+
+        share_snap 返回结构（源码考证）：
+        {
+            "state": True | False,    # 顶层状态：True=请求成功
+            "errno": int,             # 错误码：0=成功，其它=失败
+            "error": str,             # 错误消息（失败时）
+            "data": {
+                "count": int,         # 目录内文件+子目录总数
+                "list": [...]         # 当前页文件/目录列表
+            }
+        }
+
+        注意：share_snap 返回中没有 shareinfo/sharestate 字段
+        （shareinfo 是另一个独立方法 share_info 的端点 /share/shareinfo）
+
+        判定逻辑：
+        1. resp.state == True（HTTP 请求成功）
+        2. resp.errno == 0（业务层成功）
+
+        常见错误码（来自 p115client check_response）：
+        - 10004: 错误的链接
+        - 50003: 提取码不存在
+        - 99: 请重新登录
+        - 911: 请验证账号
+        - 1001: 参数错误
+
+        Args:
+            resp: share_snap 返回的 dict
+
+        Returns:
+            (is_valid: bool, error_msg: str)
+        """
+        # 1. state 字段判定（HTTP 层）
+        if not resp.get("state", False):
+            return False, resp.get("error", "请求失败")
+
+        # 2. errno 字段判定（业务层）
+        errno = resp.get("errno", -1)
+        if errno != 0:
+            return False, f"errno={errno}: {resp.get('error', '分享失效')}"
+
+        # state==True 且 errno==0 即视为有效
+        # （share_snap 能正常返回数据说明链接可访问、提取码正确）
+        return True, ""
+
+    def get_all_shares_for_check(self) -> List[Dict]:
+        """获取所有分享记录（用于批量检测）"""
+        rows = self.db.fetchall(
+            "SELECT id, share_code, share_name FROM share_source ORDER BY created_at DESC"
+        )
+        return [dict(r) for r in rows]
+
     def delete_share(self, source_id: int) -> bool:
         """删除分享来源及其所有文件"""
         self.db.execute("DELETE FROM share_file WHERE source_id = ?", (source_id,))

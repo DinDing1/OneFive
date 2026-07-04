@@ -70,9 +70,48 @@
                 :class="{ active: fileFilter === 'unorganized' }"
                 @click="setFileFilter('unorganized')"
               >未整理<span class="filter-count">{{ unorganizedCount }}</span></button>
+              <button
+                class="filter-btn"
+                :class="{ active: fileFilter === 'valid' }"
+                @click="setFileFilter('valid')"
+              >有效<span class="filter-count">{{ validCount }}</span></button>
+              <button
+                class="filter-btn"
+                :class="{ active: fileFilter === 'invalid' }"
+                @click="setFileFilter('invalid')"
+              >失效<span class="filter-count">{{ invalidCount }}</span></button>
             </div>
 
             <div class="toolbar-spacer"></div>
+
+            <!-- 检测链接按钮 + 统计 -->
+            <div v-if="viewMode === 'original'" class="check-links-group">
+              <!-- 有效/无效统计（非检测中时显示，让用户一眼看到当前状态分布） -->
+              <div v-if="!checkingLinks" class="link-stats">
+                <span class="link-stat link-stat-valid" :title="`有效 ${validCountTotal} 个`">
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="20 6 9 17 4 12" /></svg>
+                  {{ validCountTotal }}
+                </span>
+                <span v-if="invalidCountTotal > 0" class="link-stat link-stat-invalid" :title="`无效 ${invalidCountTotal} 个`">
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><line x1="18" y1="6" x2="6" y2="18" /><line x1="6" y1="6" x2="18" y2="18" /></svg>
+                  {{ invalidCountTotal }}
+                </span>
+              </div>
+              <button
+                class="btn-check-links"
+                :disabled="checkingLinks"
+                @click="handleCheckLinks"
+              >
+                <svg v-if="!checkingLinks" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                  <path d="M9 12l2 2 4-4" />
+                  <circle cx="12" cy="12" r="10" />
+                </svg>
+                <svg v-else class="icon-spin" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                  <path d="M21 12a9 9 0 1 1-6.219-8.56" />
+                </svg>
+                <span>{{ checkingLinks ? `检测中 ${checkProgress}` : '检测链接' }}</span>
+              </button>
+            </div>
 
             <!-- 搜索框 -->
             <div class="search-box neu-inset">
@@ -159,6 +198,7 @@
               <div class="tbl-col tbl-col-organized">整理名称</div>
               <div class="tbl-col tbl-col-size">大小</div>
               <div class="tbl-col tbl-col-status">状态</div>
+              <div class="tbl-col tbl-col-link">有效期</div>
               <div class="tbl-col tbl-col-time">时间</div>
               <div class="col-action"></div>
             </div>
@@ -200,6 +240,11 @@
                 <div class="tbl-col tbl-col-status">
                   <span v-if="item.organized" class="status-tag status-yes">已整理</span>
                   <span v-else class="status-tag status-no">未整理</span>
+                </div>
+                <div class="tbl-col tbl-col-link">
+                  <!-- 数据库只存储两种状态：0=无效，其它均视为有效 -->
+                  <span v-if="linkValidMap.get(item.source_id) === 0" class="link-tag link-invalid">无效</span>
+                  <span v-else class="link-tag link-valid">有效</span>
                 </div>
                 <div class="tbl-col tbl-col-time">
                   <span class="file-time">{{ formatTime(item.updated_at) }}</span>
@@ -649,12 +694,20 @@ import type { RecognizeResult } from '@/api/organize'
 // ==================== 类型定义 ====================
 
 /** 筛选类型 */
-type FileFilter = 'all' | 'organized' | 'unorganized'
+type FileFilter = 'all' | 'organized' | 'unorganized' | 'valid' | 'invalid'
 
 // ==================== 状态 ====================
 
 // 分享来源列表
 const sources = ref<ShareSource[]>([])
+
+// 链接有效性状态：key=source_id, value=1(有效)/0(无效)
+const linkValidMap = ref<Map<number, number>>(new Map())
+const checkingLinks = ref(false)
+const checkProgress = ref('')
+// 有效/无效统计
+const validCountTotal = computed(() => sources.value.filter(s => (linkValidMap.value.get(s.id) ?? 1) === 1).length)
+const invalidCountTotal = computed(() => sources.value.filter(s => linkValidMap.value.get(s.id) === 0).length)
 const loadingShares = ref(false)
 
 // 视图模式：原始 / 整理
@@ -803,13 +856,18 @@ const allFilteredFiles = computed(() => {
   if (viewMode.value !== 'original') return allFiles.value
   if (fileFilter.value === 'all') return allFiles.value
   if (fileFilter.value === 'organized') return allFiles.value.filter(f => f.organized)
-  return allFiles.value.filter(f => !f.organized)
+  if (fileFilter.value === 'unorganized') return allFiles.value.filter(f => !f.organized)
+  if (fileFilter.value === 'valid') return allFiles.value.filter(f => (linkValidMap.value.get(f.source_id) ?? 1) === 1)
+  if (fileFilter.value === 'invalid') return allFiles.value.filter(f => linkValidMap.value.get(f.source_id) === 0)
+  return allFiles.value
 })
 
-/** Tab 计数：全部 / 已整理 / 未整理 */
+/** Tab 计数：全部 / 已整理 / 未整理 / 有效 / 失效 */
 const allCount = computed(() => allFiles.value.length)
 const organizedCount = computed(() => allFiles.value.filter(f => f.organized).length)
 const unorganizedCount = computed(() => allFiles.value.filter(f => !f.organized).length)
+const validCount = computed(() => allFiles.value.filter(f => (linkValidMap.value.get(f.source_id) ?? 1) === 1).length)
+const invalidCount = computed(() => allFiles.value.filter(f => linkValidMap.value.get(f.source_id) === 0).length)
 
 /** 总条数 */
 const totalItems = computed(() => allFilteredFiles.value.length)
@@ -873,6 +931,12 @@ async function loadShares() {
     const res = await shareApi.listShares()
     if (res.code === 0 && res.data) {
       sources.value = res.data.shares || []
+      // 初始化链接有效性 Map（从数据库已存储的 link_valid 字段读取）
+      const map = new Map<number, number>()
+      for (const s of sources.value) {
+        map.set(s.id, s.link_valid ?? 1)
+      }
+      linkValidMap.value = map
     } else {
       sources.value = []
     }
@@ -881,6 +945,48 @@ async function loadShares() {
     sources.value = []
   } finally {
     loadingShares.value = false
+  }
+}
+
+/** 批量检测分享链接有效性（SSE 流式）
+ * 说明：数据库只存储两种状态（1=有效 / 0=无效），不引入"检测中"中间态。
+ * 检测过程中保留上一次的有效/无效状态，逐个更新为最新结果。
+ */
+function handleCheckLinks() {
+  if (checkingLinks.value) return
+  checkingLinks.value = true
+  checkProgress.value = ''
+
+  const es = shareApi.checkAllLinksStream()
+
+  es.onmessage = (event) => {
+    try {
+      const data = JSON.parse(event.data)
+      if (data.type === 'start') {
+        checkProgress.value = `0/${data.total}`
+      } else if (data.type === 'progress') {
+        // 更新对应分享的有效性状态
+        const m = new Map(linkValidMap.value)
+        m.set(data.source_id, data.valid ? 1 : 0)
+        linkValidMap.value = m
+        checkProgress.value = `${data.current}/${data.total}`
+      } else if (data.type === 'done') {
+        checkingLinks.value = false
+        checkProgress.value = ''
+        es.close()
+        const msg = `检测完成：${data.valid_count} 个有效，${data.invalid_count} 个无效`
+        showToast(msg, data.invalid_count > 0 ? 'info' : 'success')
+      }
+    } catch (e) {
+      console.error('解析 SSE 数据失败:', e)
+    }
+  }
+
+  es.onerror = () => {
+    checkingLinks.value = false
+    checkProgress.value = ''
+    es.close()
+    showToast('检测中断，请重试', 'error')
   }
 }
 
@@ -2191,6 +2297,11 @@ function runOrganizeStream(
   text-align: left;
 }
 
+.tbl-col-link {
+  width: 80px;
+  text-align: left;
+}
+
 .tbl-col-time {
   width: 130px;
   text-align: left;
@@ -2221,6 +2332,95 @@ function runOrganizeStream(
 .status-no {
   background: var(--bg-hover);
   color: var(--text-tertiary);
+}
+
+/* 链接有效性标签（仅有效/无效两种状态，无中间态） */
+.link-tag {
+  display: inline-block;
+  font-size: 11px;
+  font-weight: 600;
+  padding: 2px 8px;
+  border-radius: var(--radius-full);
+}
+.link-valid {
+  background: var(--success-bg);
+  color: var(--success);
+}
+.link-invalid {
+  background: var(--danger-bg);
+  color: var(--danger);
+}
+
+/* 检测链接按钮 + 统计 组合容器 */
+.check-links-group {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+/* 有效/无效统计小徽章 */
+.link-stats {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+.link-stat {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  padding: 3px 8px;
+  font-size: 11px;
+  font-weight: 600;
+  border-radius: var(--radius-full);
+  line-height: 1;
+}
+.link-stat svg {
+  width: 11px;
+  height: 11px;
+}
+.link-stat-valid {
+  background: var(--success-bg);
+  color: var(--success);
+}
+.link-stat-invalid {
+  background: var(--danger-bg);
+  color: var(--danger);
+}
+
+/* 检测链接按钮 */
+.btn-check-links {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 14px;
+  font-size: 13px;
+  font-weight: 500;
+  border-radius: var(--radius-sm);
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  color: var(--text-primary);
+  cursor: pointer;
+  transition: all var(--transition-base);
+  white-space: nowrap;
+}
+.btn-check-links:hover:not(:disabled) {
+  background: var(--bg-hover);
+  border-color: var(--accent);
+  color: var(--accent);
+}
+.btn-check-links:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+.btn-check-links svg {
+  width: 16px;
+  height: 16px;
+}
+.icon-spin {
+  animation: spin 1s linear infinite;
+}
+@keyframes spin {
+  to { transform: rotate(360deg); }
 }
 
 .col-action {
