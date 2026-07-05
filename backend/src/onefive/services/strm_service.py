@@ -505,11 +505,10 @@ class StrmService:
 
         使用 file_service.iter_all_files（内部用 iter_fs_files 自动分页），
         替代手动 limit=5000 单页拉取，避免大目录文件遗漏。
-        自带 P115BusyOSError 自动重试。
+        自带 P115BusyOSError 自动重试和 401 重试。
 
-        不使用 p115client 的 iter_files_with_path_skim，因为后者内部
-        依赖 download_files_app 下载接口获取路径，该接口对部分 cookies
-        会返回"请重新登录"错误。fs_files 列表接口更稳定。
+        子目录遍历失败时记录警告并跳过，不中断整个遍历，
+        避免一个失效子目录导致所有文件无法生成。
 
         Args:
             cid: 起始目录 ID
@@ -522,7 +521,7 @@ class StrmService:
         try:
             items = file_service.iter_all_files(cid)
         except Exception as e:
-            logger.error(f"列出云盘目录失败: cid={cid}, {e}")
+            logger.error(f"列出云盘目录失败: cid={cid}, path={current_path}, {e}")
             return
 
         for item in items:
@@ -534,7 +533,12 @@ class StrmService:
                 # 递归处理子目录
                 child_cid = int(item["file_id"])
                 child_path = f"{current_path}/{name}" if current_path else name
-                yield from self._iter_cloud_files_with_path(child_cid, child_path)
+                try:
+                    yield from self._iter_cloud_files_with_path(child_cid, child_path)
+                except Exception as e:
+                    # 子目录遍历失败时跳过，不中断整个遍历
+                    logger.warning(f"跳过子目录: cid={child_cid}, path={child_path}, {e}")
+                    continue
             else:
                 # 文件：构建完整路径
                 file_path = f"{current_path}/{name}" if current_path else name
