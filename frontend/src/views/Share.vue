@@ -320,8 +320,8 @@
               <p>加载中...</p>
             </div>
             <div v-else-if="organizedEntries.length === 0" class="empty-state">
-              <p class="empty-title">此目录为空</p>
-              <p class="empty-desc">先在原始视图中识别文件</p>
+              <p class="empty-title">{{ isSearching ? '未找到匹配的文件' : '此目录为空' }}</p>
+              <p class="empty-desc">{{ isSearching ? '尝试其他关键词' : '先在原始视图中识别文件' }}</p>
             </div>
             <div v-else class="file-table">
               <div class="table-header">
@@ -1424,15 +1424,31 @@ async function handleSearch() {
   if (!keyword) return
 
   isSearching.value = true
-  loadingFiles.value = true
   selectedIds.value = new Set()
+  // 根据当前视图设置对应的 loading 状态
+  if (viewMode.value === 'organized') {
+    loadingOrganized.value = true
+  } else {
+    loadingFiles.value = true
+  }
   try {
     const res = await shareApi.searchFiles(keyword)
     if (res.code === 0 && res.data) {
-      allFiles.value = res.data.files || []
-      // 搜索结果切回原始视图
-      viewMode.value = 'original'
-      if (allFiles.value.length === 0) {
+      const files = res.data.files || []
+      if (viewMode.value === 'organized') {
+        // 整理视图搜索：只保留已整理文件，按整理结构展示
+        allOrganizedFiles.value = files.filter(f => f.organized)
+        // 计算匹配文件的公共父目录，直接跳转到该目录
+        // 场景：搜"同乐者"匹配到某剧的所有集，跳转到该剧目录而非从根目录开始
+        const targetPath = computeOrganizedSearchPath(allOrganizedFiles.value)
+        organizedCurrentPath.value = targetPath
+        buildOrganizedBreadcrumbs(targetPath)
+        buildOrganizedEntries(targetPath)
+      } else {
+        // 原始视图搜索：结果赋给 allFiles，目录优先（后端已排序）
+        allFiles.value = files
+      }
+      if (files.length === 0) {
         showToast('未找到匹配的文件', 'info')
       }
     } else {
@@ -1445,14 +1461,82 @@ async function handleSearch() {
     handleApiError(e, '搜索失败')
   } finally {
     loadingFiles.value = false
+    loadingOrganized.value = false
   }
+}
+
+/**
+ * 计算整理视图搜索结果的目标跳转路径
+ *
+ * 规则：
+ * - 收集所有匹配文件的完整目录路径（category/organized_dir）
+ * - 计算公共前缀
+ * - 如果所有文件在同一目录（公共前缀等于每个路径）：
+ *   - 电视剧：最后一段是 Season 目录（如 Season 01），跳转到父目录显示季目录列表
+ *   - 电影：最后一段是电影目录，跳转到该目录本身显示文件
+ * - 多个不同目录，跳转到公共前缀
+ */
+function computeOrganizedSearchPath(files: ShareFile[]): string {
+  // 拼接完整目录路径：category/organized_dir
+  const fullDirs = files.map(f => {
+    const cat = f.category || ''
+    const orgDir = f.organized_dir || ''
+    return cat && orgDir ? `${cat}/${orgDir}` : (cat || orgDir)
+  }).filter(Boolean)
+
+  if (fullDirs.length === 0) return ''
+
+  // 计算公共前缀
+  const splitPaths = fullDirs.map(p => p.split('/'))
+  const common: string[] = []
+  for (let i = 0; i < splitPaths[0].length; i++) {
+    const seg = splitPaths[0][i]
+    if (splitPaths.every(sp => sp[i] === seg)) {
+      common.push(seg)
+    } else {
+      break
+    }
+  }
+  const commonPath = common.join('/')
+
+  // 所有文件在同一目录
+  if (commonPath && fullDirs.every(p => p === commonPath)) {
+    const parts = commonPath.split('/')
+    const lastSeg = parts[parts.length - 1] || ''
+    // 电视剧：最后一段是 Season 目录，跳转到父目录显示季目录列表
+    if (/^season\s*\d+/i.test(lastSeg)) {
+      parts.pop()
+      return parts.join('/')
+    }
+    // 电影：跳转到该目录本身，直接显示文件
+    return commonPath
+  }
+  // 多个不同目录：跳转到公共前缀
+  return commonPath
+}
+
+/** 根据目标路径构建整理视图面包屑 */
+function buildOrganizedBreadcrumbs(targetPath: string) {
+  const crumbs = [{ path: '', name: '根目录' }]
+  if (targetPath) {
+    let current = ''
+    for (const part of targetPath.split('/').filter(Boolean)) {
+      current = current ? `${current}/${part}` : part
+      crumbs.push({ path: current, name: part })
+    }
+  }
+  organizedBreadcrumbs.value = crumbs
 }
 
 /** 清除搜索 */
 function clearSearch() {
   searchKeyword.value = ''
   isSearching.value = false
-  loadFiles()
+  if (viewMode.value === 'organized') {
+    loadOrganized()
+  } else {
+    loadFiles()
+  }
 }
 
 // ==================== 多选 ====================

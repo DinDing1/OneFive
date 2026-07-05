@@ -659,16 +659,33 @@ class ShareService:
         }
 
     def search_files(self, keyword: str) -> List[Dict]:
-        """搜索分享文件"""
-        rows = self.db.fetchall(
-            """SELECT f.*, s.share_code, s.share_name
-               FROM share_file f
-               JOIN share_source s ON f.source_id = s.id
-               WHERE f.name LIKE ?
-               ORDER BY f.updated_at DESC
-               LIMIT 100""",
-            (f"%{keyword}%",)
-        )
+        """搜索分享文件
+
+        匹配范围：
+        - 模糊匹配：原始文件名 name、识别后标题 title、整理后目录 organized_dir、整理后文件名 organized_name
+        - 精确匹配：TMDB ID（keyword 为数字时）
+        """
+        # 模糊匹配的名称字段
+        like_fields = ["f.name", "f.title", "f.organized_name", "f.organized_dir"]
+        like_pattern = f"%{keyword}%"
+        where_clauses = [f"{field} LIKE ?" for field in like_fields]
+        params: list = [like_pattern] * len(like_fields)
+
+        # keyword 是数字时，额外精确匹配 tmdb_id
+        try:
+            tmdb_id_val = int(keyword)
+            where_clauses.append("f.tmdb_id = ?")
+            params.append(tmdb_id_val)
+        except (ValueError, TypeError):
+            pass
+
+        sql = f"""SELECT f.*, s.share_code, s.share_name
+                  FROM share_file f
+                  JOIN share_source s ON f.source_id = s.id
+                  WHERE {' OR '.join(where_clauses)}
+                  ORDER BY f.is_dir DESC, f.updated_at DESC
+                  LIMIT 100"""
+        rows = self.db.fetchall(sql, tuple(params))
         return [dict(r) for r in rows]
 
     def get_share_info(self, source_id: int) -> Optional[Dict]:
