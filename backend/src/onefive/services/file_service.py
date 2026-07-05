@@ -398,9 +398,7 @@ class FileService:
           需要从 page["data"] 提取文件列表，而非把整页当作单个文件
         - 只返回当前目录直属文件，不递归子目录
         - 如需递归整个目录树，请用 iter_files 方法
-
-        遇到 HTTP 401 时重试一次（可能是 115 频率限制），
-        仍失败则抛出异常，由调用方决定跳过还是中断。
+        - 用 max_workers=0 强制串行拉取，避免并发请求触发 115 风控返回 401
 
         Args:
             cid: 目录 ID，0 表示根目录
@@ -409,24 +407,12 @@ class FileService:
             文件信息列表
         """
         client = self._get_client()
-
-        def _fetch_all() -> List[Dict[str, Any]]:
-            """内层函数：拉取全部分页数据，方便 401 重试时整体重新拉取"""
-            items = []
-            for page in iter_fs_files(client, cid, app=self._get_tool_app()):
-                for f in page.get("data", []):
-                    items.append(self._parse_file_item(f))
-            return items
-
-        try:
-            return _fetch_all()
-        except Exception as e:
-            # 401 可能是 115 频率限制，等待 1 秒后重试一次
-            if "401" in str(e):
-                logger.warning(f"列出目录返回 401，1秒后重试: cid={cid}")
-                time.sleep(1)
-                return _fetch_all()
-            raise
+        result = []
+        # max_workers=0 用串行版本 iter_fs_files_serialized，避免并发风控
+        for page in iter_fs_files(client, cid, app=self._get_tool_app(), max_workers=0):
+            for f in page.get("data", []):
+                result.append(self._parse_file_item(f))
+        return result
 
     def iter_files(self, cid: int = 0) -> List[Dict[str, Any]]:
         """递归遍历目录树，获取所有文件
