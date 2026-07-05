@@ -18,9 +18,14 @@ class NotificationManager:
         self._channels: Dict[str, NotificationChannel] = {}
 
     def register(self, channel: NotificationChannel) -> None:
-        """注册通知渠道"""
+        """注册通知渠道
+
+        注意：注册只是把渠道加入管理器，不代表启用。
+        实际发送通知时 send_all 会检查 is_enabled()，未启用的渠道会跳过。
+        用 debug 级别避免 info 日志误导用户以为通知已启用。
+        """
         self._channels[channel.name] = channel
-        logger.info(f"注册通知渠道: {channel.display_name}")
+        logger.debug(f"注册通知渠道: {channel.display_name}")
 
     def get_channel(self, name: str) -> Optional[NotificationChannel]:
         """获取指定渠道"""
