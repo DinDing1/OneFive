@@ -125,7 +125,12 @@ class TMDBService:
             resp = requests.get(url, params=p, timeout=API_TIMEOUT)
             if not resp.ok:
                 text = (resp.text or "")[:200].replace("\n", " ")
-                logger.warning(f"TMDB API 请求失败: {resp.status_code}, url={url}, body={text}")
+                # 404 是试错流程的正常部分（先按 movie 查，404 再回退查 tv，反之亦然），
+                # 用 debug 避免每次带 tmdb_id 的识别都出警告；其他错误码才是真正问题
+                if resp.status_code == 404:
+                    logger.debug(f"TMDB API 404（试错正常）: url={url}, body={text}")
+                else:
+                    logger.warning(f"TMDB API 请求失败: {resp.status_code}, url={url}, body={text}")
                 return None
 
             content_type = resp.headers.get("Content-Type", "")
@@ -191,12 +196,13 @@ class TMDBService:
         """获取电视剧某季信息"""
         return self._get(f"/tv/{tmdb_id}/season/{season}")
 
-    def get_chinese_title(self, details: Dict) -> str:
-        """获取中文标题（优先级：zh-CN > 原标题 > zh-TW > zh-HK）
+    def get_simplified_chinese_title(self, details: Dict) -> str:
+        """获取简体中文标题（仅 zh-CN translations 和 CN alternative_titles）
 
-        无任何可用标题时返回空字符串。
+        找不到返回空字符串。用于在标题优先级中区分简体/繁体：
+        简体中文优先于查询标题，查询标题（简体）优先于繁体中文。
         """
-        # 先检查 translations - 只优先简体中文
+        # 1. 检查 translations - 简体中文（zh-CN）
         translations = details.get("translations", {}).get("translations", [])
         for t in translations:
             if t.get("iso_639_1") == "zh" and t.get("iso_3166_1") == "CN":
@@ -205,18 +211,37 @@ class TMDBService:
                 if title:
                     return title
 
-        # 检查 alternative_titles - 只优先简体中文
+        # 2. 检查 alternative_titles - 简体中文（CN）
         alt_titles = details.get("alternative_titles", {}).get("titles", [])
         for t in alt_titles:
             if t.get("iso_3166_1") == "CN" and t.get("title"):
                 return t["title"]
 
-        # 返回原标题（英文或其他语言）
-        original_title = details.get("title") or details.get("name")
-        if original_title:
-            return original_title
+        return ""
 
-        # 最后才考虑繁体中文（避免简体环境显示繁体）
+    def get_chinese_title(self, details: Dict) -> str:
+        """获取中文标题，尽可能返回中文名称
+
+        优先级（高 → 低）：
+        1. zh-CN translations（简体翻译，最准确）
+        2. CN alternative_titles（简体别名）
+        3. zh-TW/HK translations（繁体翻译，优于英文）
+        4. zh-TW/HK alternative_titles（繁体别名）
+        5. 遍历所有 alternative_titles/translations，找含中文字符的标题
+           （兜底：部分中文别名国家标记非 CN/TW/HK，如 US）
+        6. 原始标题（最后兜底，可能是英文）
+
+        无任何可用标题时返回空字符串。
+        """
+        # 1-2. 先查简体中文
+        simplified = self.get_simplified_chinese_title(details)
+        if simplified:
+            return simplified
+
+        translations = details.get("translations", {}).get("translations", [])
+        alt_titles = details.get("alternative_titles", {}).get("titles", [])
+
+        # 3. 检查 translations - 繁体中文（zh-TW/HK，优于英文原始标题）
         for t in translations:
             if t.get("iso_639_1") == "zh" and t.get("iso_3166_1") in ["TW", "HK"]:
                 data = t.get("data", {})
@@ -224,11 +249,33 @@ class TMDBService:
                 if title:
                     return title
 
+        # 4. 检查 alternative_titles - 繁体中文（TW/HK）
         for t in alt_titles:
             if t.get("iso_3166_1") in ["TW", "HK"] and t.get("title"):
                 return t["title"]
 
+        # 5. 兜底：遍历所有别名/翻译，找含中文字符的标题
+        #    部分中文别名的国家标记不是 CN/TW/HK（如 US），需要通过内容判断
+        for t in alt_titles:
+            title = t.get("title") or ""
+            if title and self._contains_chinese(title):
+                return title
+        for t in translations:
+            data = t.get("data", {})
+            title = data.get("title") or data.get("name") or ""
+            if title and self._contains_chinese(title):
+                return title
+
+        # 6. 最后兜底：返回原始标题（可能是英文）
+        original_title = details.get("title") or details.get("name")
+        if original_title:
+            return original_title
+
         return ""
+
+    def _contains_chinese(self, text: str) -> bool:
+        """判断字符串是否包含中文字符"""
+        return bool(re.search(r"[\u4e00-\u9fff]", text or ""))
 
     def _get_result_year(self, result: Dict, media_type: str) -> str:
         """从搜索结果中提取年份"""

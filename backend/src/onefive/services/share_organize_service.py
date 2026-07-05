@@ -543,9 +543,20 @@ class ShareOrganizeService:
         if tmdb_details:
             tmdb_service = get_tmdb_service()
             tmdb_id = tmdb_details.get("id", tmdb_id)
-            tmdb_title = tmdb_service.get_chinese_title(tmdb_details) or tmdb_details.get("title") or tmdb_details.get("name")
-            if tmdb_title:
-                title = tmdb_title
+            # 标题优先级：TMDB简体中文 > 查询标题(中文) > TMDB繁体/英文
+            # - TMDB 有简体：用 TMDB 简体（官方简体译名最准确）
+            # - TMDB 无简体、查询标题是中文：保留查询标题（用户认可的简体名，优先于繁体）
+            # - TMDB 无简体、查询标题非中文：用 get_chinese_title（返回繁体或英文）
+            simplified = tmdb_service.get_simplified_chinese_title(tmdb_details)
+            if simplified:
+                title = simplified
+            else:
+                tmdb_title = tmdb_service.get_chinese_title(tmdb_details) or tmdb_details.get("title") or tmdb_details.get("name")
+                if tmdb_title:
+                    # 查询标题是中文时保留，避免繁体覆盖简体查询名
+                    query_is_chinese = bool(title) and tmdb_service._contains_chinese(title)
+                    if not query_is_chinese:
+                        title = tmdb_title
             release_date = tmdb_details.get("release_date") or tmdb_details.get("first_air_date") or ""
             if release_date and len(release_date) >= 4:
                 year = release_date[:4]
