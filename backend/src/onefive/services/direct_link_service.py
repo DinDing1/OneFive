@@ -148,6 +148,7 @@ class PathStripMiddleware:
 # 配置键名
 CONFIG_ENABLED = "direct_link_enabled"
 CONFIG_PORT = "direct_link_port"
+CONFIG_ALLOW_LAN = "direct_link_allow_lan"
 DEFAULT_PORT = 11581
 
 
@@ -169,14 +170,11 @@ class DirectLinkService:
         # 线程锁：保护 _server / _thread 的读写，避免多线程下竞态
         self._lock = threading.Lock()
 
-    def start(self, allow_lan: bool = False) -> bool:
+    def start(self) -> bool:
         """启动 302 直链服务
 
         在后台守护线程中运行 uvicorn，承载 p115nano302 的 ASGI 应用。
-
-        Args:
-            allow_lan: 是否允许局域网访问。默认 False 仅绑定 127.0.0.1（本机访问）；
-                       设为 True 时绑定 0.0.0.0，同局域网设备可访问。
+        allow_lan 从配置读取，允许局域网访问时绑定 0.0.0.0，否则仅本机 127.0.0.1。
 
         Returns:
             是否启动成功
@@ -197,8 +195,11 @@ class DirectLinkService:
 
         # 获取端口配置
         port = self._get_port()
-        # 绑定地址：默认仅本机访问，allow_lan=True 时允许局域网访问
+        # 从配置读取是否允许局域网访问
+        allow_lan = self.config_service.get(CONFIG_ALLOW_LAN) == "1"
+        # 绑定地址：允许局域网访问时绑定 0.0.0.0，否则仅本机访问
         host = "0.0.0.0" if allow_lan else "127.0.0.1"
+        logger.info(f"启动直链服务: host={host}, port={port}, allow_lan={allow_lan}")
 
         try:
             import p115nano302
@@ -302,21 +303,23 @@ class DirectLinkService:
         """获取直链服务设置
 
         Returns:
-            包含 enabled、port、running 的字典
+            包含 enabled、port、allow_lan、running 的字典
         """
         enabled_str = self.config_service.get(CONFIG_ENABLED)
         return {
             "enabled": enabled_str == "1",
             "port": self._get_port(),
+            "allow_lan": self.config_service.get(CONFIG_ALLOW_LAN) == "1",
             "running": self.is_running(),
         }
 
-    def save_settings(self, enabled: bool, port: int):
+    def save_settings(self, enabled: bool, port: int, allow_lan: bool = False):
         """保存直链服务配置到数据库
 
         Args:
             enabled: 是否启用
             port: 端口号
+            allow_lan: 是否允许局域网访问（True 绑定 0.0.0.0，False 绑定 127.0.0.1）
         """
         self.config_service.set(
             CONFIG_ENABLED,
@@ -327,6 +330,11 @@ class DirectLinkService:
             CONFIG_PORT,
             str(port),
             "直链服务端口"
+        )
+        self.config_service.set(
+            CONFIG_ALLOW_LAN,
+            "1" if allow_lan else "0",
+            "直链服务允许局域网访问"
         )
 
     def _get_port(self) -> int:

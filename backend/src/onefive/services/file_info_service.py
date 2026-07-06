@@ -430,8 +430,13 @@ def extract_key_info(filename: str, folder_files: Optional[List[str]] = None) ->
     year = str(g.get('year', '')) if g.get('year') else _extract_year(base)
 
     # 季集
+    # guessit 解析 "S01-S18" 等季度范围时返回 list（如 [1, 18]），取第一个
     season = g.get('season')
+    if isinstance(season, list):
+        season = season[0] if season else None
     episode = g.get('episode')
+    if isinstance(episode, list):
+        episode = episode[0] if episode else None
     if season is not None:
         season = int(season)
     if episode is not None:

@@ -4,6 +4,7 @@ import api, { type ApiResult } from './index'
 export interface DirectLinkSettings {
   enabled: boolean
   port: number
+  allow_lan: boolean
   running: boolean
 }
 
@@ -14,7 +15,7 @@ export const directLinkApi = {
   },
 
   /** 保存直链设置 */
-  saveSettings(settings: { enabled: boolean; port: number }): Promise<ApiResult<any>> {
+  saveSettings(settings: { enabled: boolean; port: number; allow_lan?: boolean }): Promise<ApiResult<any>> {
     return api.post('/direct-link/settings', settings)
   },
 

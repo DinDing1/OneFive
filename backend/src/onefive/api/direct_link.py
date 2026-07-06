@@ -14,6 +14,7 @@ class DirectLinkSettingsRequest(BaseModel):
     """直链服务配置请求"""
     enabled: bool
     port: int = 11581
+    allow_lan: bool = False
 
 
 @router.get("/settings", summary="获取直链服务设置")
@@ -26,23 +27,22 @@ async def get_settings():
 
 @router.post("/settings", summary="保存直链服务设置")
 async def save_settings(req: DirectLinkSettingsRequest):
-    """保存直链服务配置（开关、端口）"""
+    """保存直链服务配置（开关、端口、局域网访问）"""
     service = get_direct_link_service()
-    await asyncio.to_thread(service.save_settings, enabled=req.enabled, port=req.port)
+    await asyncio.to_thread(service.save_settings, enabled=req.enabled, port=req.port, allow_lan=req.allow_lan)
     settings = await asyncio.to_thread(service.get_settings)
     return ApiResponse(code=0, message="设置已保存", data=settings)
 
 
 @router.post("/start", summary="启动直链服务")
-async def start_service(allow_lan: bool = False):
+async def start_service():
     """启动 302 直链服务
 
-    Args:
-        allow_lan: 是否允许局域网访问，默认 False（仅本机 127.0.0.1 可访问）；
-                   设为 True 时绑定 0.0.0.0，同局域网设备可访问用户云盘文件，请谨慎开启。
+    allow_lan 从配置读取，允许局域网访问时绑定 0.0.0.0，否则仅本机 127.0.0.1 可访问。
+    如需允许局域网/公网访问，请先在设置中开启"允许局域网访问"。
     """
     service = get_direct_link_service()
-    success = await asyncio.to_thread(service.start, allow_lan=allow_lan)
+    success = await asyncio.to_thread(service.start)
     if success:
         return ApiResponse(code=0, message="直链服务已启动", data=await asyncio.to_thread(service.get_settings))
     return ApiResponse(code=-1, message="启动失败，请检查是否已登录", data=None)

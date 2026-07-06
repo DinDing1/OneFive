@@ -346,19 +346,23 @@ class ShareOrganizeService:
                         f"[子文件失败] name={result.get('name')}, file_id={result.get('file_id')}, error={result.get('error')}"
                     )
 
-        # 递归整理子目录
+        # 递归整理子目录（单个子目录失败不中断整体整理）
         for f in sub_dirs:
             fid = f["file_id"]
             fname = f["name"]
-            sub = self._organize_directory(
-                source_id, fid, share_service, tmdb_cache,
-                inherited_tmdb_id=folder_tmdb_id,
-                inherited_media_type=folder_media_type,
-                send_notify=False,
-                progress_cb=progress_cb,
-                loop=loop,
-                is_root=False,
-            )
+            try:
+                sub = self._organize_directory(
+                    source_id, fid, share_service, tmdb_cache,
+                    inherited_tmdb_id=folder_tmdb_id,
+                    inherited_media_type=folder_media_type,
+                    send_notify=False,
+                    progress_cb=progress_cb,
+                    loop=loop,
+                    is_root=False,
+                )
+            except Exception as e:
+                logger.error(f"[子目录整理失败] name={fname}, file_id={fid}, error={e}")
+                sub = {"success": False, "error": str(e), "name": fname, "file_id": fid}
             results.append(sub)
             if sub.get("success"):
                 success_count += 1
@@ -375,6 +379,10 @@ class ShareOrganizeService:
         )
         # 只有根目录整理完才 commit，子目录递归时由根目录统一提交，避免每层 commit 触发多次 fsync
         if is_root:
+            share_service.db.commit()
+            # 用户逐一整理子目录后，检查父目录是否所有子项都已整理，
+            # 如果是则自动标记父目录为已整理（递归向上）
+            self._mark_parent_organized_if_complete(source_id, dir_file_id, share_service)
             share_service.db.commit()
 
         total = len(files)
@@ -395,6 +403,42 @@ class ShareOrganizeService:
             "direct_children": total,
             "results": results,
         }
+
+    def _mark_parent_organized_if_complete(self, source_id: int, child_file_id: str,
+                                            share_service) -> None:
+        """检查父目录的所有子项是否都已整理，如果是则标记父目录为已整理（递归向上）
+
+        场景：用户逐一整理子目录后，父目录自动标记为已整理。
+        当父目录的所有子项（文件和子目录）organized=1 时，标记父目录 organized=1，
+        并继续向上检查父目录的父目录。
+        """
+        # 获取当前文件/目录信息，找到 parent_id
+        file_info = share_service.get_file(source_id, child_file_id)
+        if not file_info:
+            return
+        parent_id = file_info.get("parent_id")
+        # parent_id 为 "0" 或空表示已到根目录，无需继续
+        if not parent_id or parent_id == "0":
+            return
+
+        # 检查父目录的所有子项是否都已整理
+        siblings = share_service.db.fetchall(
+            "SELECT organized FROM share_file WHERE source_id = ? AND parent_id = ?",
+            (source_id, parent_id)
+        )
+        if not siblings:
+            return  # 父目录无子项（不应该发生，但防御性处理）
+
+        # 如果所有子项都已整理，标记父目录为已整理
+        if all(s["organized"] == 1 for s in siblings):
+            share_service.db.execute(
+                "UPDATE share_file SET organized = 1, updated_at = datetime('now', 'localtime') "
+                "WHERE source_id = ? AND file_id = ? AND organized = 0",
+                (source_id, parent_id)
+            )
+            logger.info(f"[父目录自动标记] source_id={source_id}, parent_id={parent_id}, 所有子项已整理")
+            # 递归检查父目录的父目录
+            self._mark_parent_organized_if_complete(source_id, parent_id, share_service)
 
     def _organize_batch_files(self, source_id: int, files: list, share_service,
                               tmdb_cache: Dict, forced_tmdb_id: int = 0,
@@ -543,19 +587,20 @@ class ShareOrganizeService:
         if tmdb_details:
             tmdb_service = get_tmdb_service()
             tmdb_id = tmdb_details.get("id", tmdb_id)
-            # 标题优先级：TMDB简体中文 > 查询标题(中文) > TMDB繁体/英文
-            # - TMDB 有简体：用 TMDB 简体（官方简体译名最准确）
-            # - TMDB 无简体、查询标题是中文：保留查询标题（用户认可的简体名，优先于繁体）
-            # - TMDB 无简体、查询标题非中文：用 get_chinese_title（返回繁体或英文）
-            simplified = tmdb_service.get_simplified_chinese_title(tmdb_details)
-            if simplified:
-                title = simplified
+            # 标题优先级：查询标题(中文) > details.title(中文) > 翻译/别名
+            # - 查询标题含中文：保留查询标题（用户输入的简体中文最准确，如"同乐者"）
+            # - details.title 含中文：用 details.title（TMDB 主标题，优于别名，避免"电影版"等后缀干扰）
+            # - 都不含中文：用 get_chinese_title 兜底（返回翻译/别名或原始标题）
+            query_is_chinese = bool(title) and tmdb_service._contains_chinese(title)
+            if query_is_chinese:
+                pass  # 保留查询标题
             else:
-                tmdb_title = tmdb_service.get_chinese_title(tmdb_details) or tmdb_details.get("title") or tmdb_details.get("name")
-                if tmdb_title:
-                    # 查询标题是中文时保留，避免繁体覆盖简体查询名
-                    query_is_chinese = bool(title) and tmdb_service._contains_chinese(title)
-                    if not query_is_chinese:
+                details_title = tmdb_details.get("title") or tmdb_details.get("name") or ""
+                if tmdb_service._contains_chinese(details_title):
+                    title = details_title
+                else:
+                    tmdb_title = tmdb_service.get_chinese_title(tmdb_details)
+                    if tmdb_title:
                         title = tmdb_title
             release_date = tmdb_details.get("release_date") or tmdb_details.get("first_air_date") or ""
             if release_date and len(release_date) >= 4:

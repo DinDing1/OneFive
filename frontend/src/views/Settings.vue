@@ -421,6 +421,14 @@
           <input type="text" v-model.number="dlPort" placeholder="默认 11581" @change="saveDirectLinkSettings" />
         </div>
         <div class="field field-row">
+          <label>允许局域网访问</label>
+          <label class="toggle">
+            <input type="checkbox" v-model="dlAllowLan" @change="saveDirectLinkSettings" />
+            <span class="slider"></span>
+          </label>
+        </div>
+        <p class="strm-hint" v-if="dlAllowLan">⚠️ 开启后同局域网/公网设备可通过 IP 访问你的云盘文件，请谨慎使用。</p>
+        <div class="field field-row">
           <label>服务状态</label>
           <div class="dl-status">
             <span class="status-dot" :class="dlRunning ? 'status-running' : 'status-stopped'"></span>
@@ -708,6 +716,7 @@ const tgTesting = ref(false)
 // 直链服务配置
 const dlEnabled = ref(false)
 const dlPort = ref(DEFAULT_DL_PORT)
+const dlAllowLan = ref(false)
 const dlRunning = ref(false)
 
 // STRM 配置
@@ -762,6 +771,7 @@ onMounted(() => {
     if (res.code === 0 && res.data) {
       dlEnabled.value = res.data.enabled
       dlPort.value = res.data.port || DEFAULT_DL_PORT
+      dlAllowLan.value = res.data.allow_lan || false
       dlRunning.value = res.data.running
     }
   }).catch(() => {})
@@ -1079,7 +1089,7 @@ async function testNotify() {
 
 async function saveDirectLinkSettings() {
   try {
-    const res = await directLinkApi.saveSettings({ enabled: dlEnabled.value, port: dlPort.value })
+    const res = await directLinkApi.saveSettings({ enabled: dlEnabled.value, port: dlPort.value, allow_lan: dlAllowLan.value })
     if (res.code === 0) {
       dlRunning.value = res.data?.running ?? dlRunning.value
       showToast('配置已保存', 'success')
