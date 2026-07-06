@@ -201,6 +201,9 @@ class TMDBService:
 
         找不到返回空字符串。用于在标题优先级中区分简体/繁体：
         简体中文优先于查询标题，查询标题（简体）优先于繁体中文。
+
+        注意：CN 标记的别名可能是拼音（如"Hu die lou: Jing hun"），
+        必须验证含中文字符才返回，避免拼音冒充中文。
         """
         # 1. 检查 translations - 简体中文（zh-CN）
         translations = details.get("translations", {}).get("translations", [])
@@ -208,14 +211,16 @@ class TMDBService:
             if t.get("iso_639_1") == "zh" and t.get("iso_3166_1") == "CN":
                 data = t.get("data", {})
                 title = data.get("title") or data.get("name")
-                if title:
+                if title and self._contains_chinese(title):
                     return title
 
         # 2. 检查 alternative_titles - 简体中文（CN）
         alt_titles = details.get("alternative_titles", {}).get("titles", [])
         for t in alt_titles:
             if t.get("iso_3166_1") == "CN" and t.get("title"):
-                return t["title"]
+                title = t["title"]
+                if self._contains_chinese(title):
+                    return title
 
         return ""
 
@@ -246,15 +251,25 @@ class TMDBService:
             if t.get("iso_639_1") == "zh" and t.get("iso_3166_1") in ["TW", "HK"]:
                 data = t.get("data", {})
                 title = data.get("title") or data.get("name")
-                if title:
+                if title and self._contains_chinese(title):
                     return title
 
         # 4. 检查 alternative_titles - 繁体中文（TW/HK）
         for t in alt_titles:
             if t.get("iso_3166_1") in ["TW", "HK"] and t.get("title"):
-                return t["title"]
+                title = t["title"]
+                if self._contains_chinese(title):
+                    return title
 
-        # 5. 兜底：遍历所有别名/翻译，找含中文字符的标题
+        # 5. 优先使用搜索结果的标题
+        #    搜索接口可能返回中文本地化标题（如"蝴蝶楼·惊魂"），
+        #    但详情接口的 title 字段可能是拼音（如"Hu die lou: Jing hun"）。
+        #    search_and_pick 会把搜索结果标题存到 _search_title 字段。
+        search_title = details.get("_search_title") or ""
+        if search_title and self._contains_chinese(search_title):
+            return search_title
+
+        # 6. 兜底：遍历所有别名/翻译，找含中文字符的标题
         #    部分中文别名的国家标记不是 CN/TW/HK（如 US），需要通过内容判断
         for t in alt_titles:
             title = t.get("title") or ""
@@ -266,7 +281,7 @@ class TMDBService:
             if title and self._contains_chinese(title):
                 return title
 
-        # 6. 最后兜底：返回原始标题（可能是英文）
+        # 7. 最后兜底：返回原始标题（可能是英文）
         original_title = details.get("title") or details.get("name")
         if original_title:
             return original_title
@@ -437,9 +452,17 @@ class TMDBService:
             return None
 
         if media_type == "movie":
-            return self.get_movie_details(tmdb_id)
+            details = self.get_movie_details(tmdb_id)
         else:
-            return self.get_tv_details(tmdb_id)
+            details = self.get_tv_details(tmdb_id)
+
+        # 保留搜索结果的标题到 _search_title 字段
+        # 搜索接口可能返回中文本地化标题（如"蝴蝶楼·惊魂"），
+        # 但详情接口的 title 字段可能是拼音（如"Hu die lou: Jing hun"）。
+        # get_chinese_title 兜底时会优先用 _search_title，避免拼音覆盖中文。
+        if details is not None and best.get("title"):
+            details["_search_title"] = best.get("title")
+        return details
 
     def search_with_validation(
         self,
