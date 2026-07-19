@@ -72,11 +72,14 @@ async def add_share(req: AddShareRequest):
 
 
 @router.get("/list", summary="列出分享来源")
-async def list_shares():
-    """列出所有已添加的分享来源"""
+async def list_shares(limit: int = 50, offset: int = 0):
+    """列出已添加的分享来源（强制分页，默认 50，最大 500）。"""
     service = get_share_service()
-    shares = await asyncio.to_thread(service.list_shares)
-    return ApiResponse(code=0, message="success", data={"shares": shares})
+    lim = 50 if (limit is None or limit <= 0) else min(int(limit), 500)
+    result = await asyncio.to_thread(service.list_shares, lim, offset)
+    if isinstance(result, list):
+        result = {"shares": result, "total": len(result)}
+    return ApiResponse(code=0, message="success", data=result)
 
 
 @router.post("/{source_id}/check", summary="检测单个分享链接有效性")
@@ -167,18 +170,84 @@ async def delete_shares_batch(req: DeleteBatchRequest):
 
 
 @router.get("/all-files", summary="获取所有分享的根目录文件")
-async def get_all_files(organized_only: bool = False, unorganized_only: bool = False):
-    """获取所有分享来源的根目录文件，附带来源信息"""
+async def get_all_files(
+    filter: str = "all",
+    limit: int = 50,
+    offset: int = 0,
+    include_counts: bool = True,
+):
+    """分页获取所有分享源的根目录文件。
+
+    - filter: all | organized | unorganized | valid | invalid
+    - limit/offset: 服务端分页（3 万+ 目录时必须分页，禁止全量拉取）
+    - include_counts: 是否返回各筛选角标计数
+    """
+    if limit is None or limit <= 0:
+        limit = 50
+    limit = min(int(limit), 200)
+    offset = max(0, int(offset))
+
     service = get_share_service()
-    files = await asyncio.to_thread(service.get_all_root_files, organized_only, unorganized_only)
-    return ApiResponse(code=0, message="success", data={"files": files})
+    result = await asyncio.to_thread(
+        service.get_all_root_files,
+        filter,
+        limit,
+        offset,
+        include_counts,
+    )
+    if isinstance(result, list):
+        result = {"files": result, "total": len(result), "limit": limit, "offset": offset}
+    return ApiResponse(code=0, message="success", data=result)
 
 
-@router.get("/all-organized", summary="获取所有已整理的文件")
-async def get_all_organized():
-    """获取所有分享来源的已整理文件，用于构建统一虚拟目录树"""
+@router.get("/organized-browse", summary="分页浏览整理视图虚拟目录")
+async def organized_browse(path: str = "", limit: int = 50, offset: int = 0):
+    """服务端浏览整理目录树，不加载全量已整理文件。
+
+    - path: 虚拟路径（category/organized_dir 前缀），空=根
+    - limit/offset: 当前层目录+文件的统一分页（目录在前）
+    """
+    if limit is None or limit <= 0:
+        limit = 50
+    limit = min(int(limit), 200)
+    offset = max(0, int(offset))
     service = get_share_service()
-    result = await asyncio.to_thread(service.get_all_organized_files)
+    result = await asyncio.to_thread(
+        service.list_organized_entries, path, limit, offset
+    )
+    return ApiResponse(code=0, message="success", data=result)
+
+
+@router.get("/search", summary="搜索分享文件")
+async def search_files(
+    keyword: str = "",
+    limit: int = 50,
+    offset: int = 0,
+    scope: str = "all",
+):
+    """分页搜索分享文件。
+
+    - scope: all | organized | original
+    - limit 最大 200
+    """
+    if limit is None or limit <= 0:
+        limit = 50
+    limit = min(int(limit), 200)
+    offset = max(0, int(offset))
+    service = get_share_service()
+    result = await asyncio.to_thread(
+        service.search_files, keyword, limit, offset, scope
+    )
+    # 兼容：底层若仍返回 list
+    if isinstance(result, list):
+        result = {
+            "files": result,
+            "total": len(result),
+            "limit": limit,
+            "offset": offset,
+            "keyword": keyword,
+            "scope": scope,
+        }
     return ApiResponse(code=0, message="success", data=result)
 
 
@@ -189,22 +258,6 @@ async def list_files(source_id: int, parent_id: str = "0",
     service = get_share_service()
     result = await asyncio.to_thread(service.list_files, source_id, parent_id, limit, offset)
     return ApiResponse(code=0, message="success", data=result)
-
-
-@router.get("/{source_id}/organized", summary="获取整理后的分类目录")
-async def get_organized(source_id: int):
-    """获取整理后的虚拟分类目录结构"""
-    service = get_share_service()
-    result = await asyncio.to_thread(service.get_organized_files, source_id)
-    return ApiResponse(code=0, message="success", data=result)
-
-
-@router.get("/search", summary="搜索分享文件")
-async def search_files(keyword: str):
-    """搜索所有分享中的文件"""
-    service = get_share_service()
-    results = await asyncio.to_thread(service.search_files, keyword)
-    return ApiResponse(code=0, message="success", data={"files": results})
 
 
 @router.post("/recognize", summary="识别文件（只识别不写入数据库）")
@@ -268,6 +321,20 @@ async def manual_organize_file(req: ManualFileActionRequest):
     if result.get("success"):
         return ApiResponse(code=0, message="整理完成", data=result)
     return ApiResponse(code=-1, message=result.get("error", "整理失败"))
+
+
+
+@router.post("/recompute-organized", summary="重算目录已整理标记（修复脏数据）")
+async def recompute_organized(source_id: Optional[int] = None):
+    """自底向上重算目录 organized 标记。
+
+    规则：目录下所有子目录 + 视频文件均为已整理时，目录才为已整理；
+    附属非视频文件（nfo/srt/海报等）不参与判定。
+    不传 source_id 时处理全库。
+    """
+    service = get_share_organize_service()
+    result = await asyncio.to_thread(service.recompute_directory_organized, source_id)
+    return ApiResponse(data=result)
 
 
 @router.post("/organize", summary="整理单个文件")

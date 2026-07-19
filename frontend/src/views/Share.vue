@@ -3,13 +3,13 @@
     <!-- 文件视图区域 -->
     <div class="file-area">
       <!-- 全局 loading -->
-      <div v-if="loadingShares && sources.length === 0" class="loading-state glass-card">
+      <div v-if="(loadingShares || loadingFiles) && !hasAnyShare && allFiles.length === 0" class="loading-state glass-card">
         <div class="loading-spinner"></div>
         <p>加载中...</p>
       </div>
 
       <!-- 无分享时的空态 -->
-      <div v-else-if="sources.length === 0" class="empty-prompt glass-card">
+      <div v-else-if="!hasAnyShare && allFiles.length === 0 && !isSearching" class="empty-prompt glass-card">
         <div class="empty-icon">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
             <circle cx="18" cy="5" r="3" /><circle cx="6" cy="12" r="3" /><circle cx="18" cy="19" r="3" />
@@ -53,8 +53,8 @@
               </button>
             </div>
 
-            <!-- 筛选按钮组（仅原始视图显示） -->
-            <div v-if="viewMode === 'original'" class="filter-group">
+            <!-- 筛选按钮组：仅原始视图根目录（子目录/搜索时服务端筛选不适用） -->
+            <div v-if="viewMode === 'original' && !isInSubDir && !isSearching" class="filter-group">
               <button
                 class="filter-btn"
                 :class="{ active: fileFilter === 'all' }"
@@ -99,6 +99,24 @@
                 <path d="M21 12a9 9 0 1 1-6.219-8.56" />
               </svg>
               <span>{{ checkingLinks ? `检测中 ${checkProgress}` : '检测链接' }}</span>
+            </button>
+
+            <!-- 重算已整理标记（修复部分整理成功/失败导致的脏标记） -->
+            <button
+              v-if="viewMode === 'original'"
+              class="btn-check-links"
+              :disabled="recomputingOrganized || checkingLinks"
+              title="自底向上重算目录已整理标记"
+              @click="handleRecomputeOrganized"
+            >
+              <svg v-if="!recomputingOrganized" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <polyline points="23 4 23 10 17 10" />
+                <path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10" />
+              </svg>
+              <svg v-else class="icon-spin" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <path d="M21 12a9 9 0 1 1-6.219-8.56" />
+              </svg>
+              <span>{{ recomputingOrganized ? '重算中...' : '重算标记' }}</span>
             </button>
 
             <!-- 搜索框 -->
@@ -231,7 +249,7 @@
                 </div>
                 <div class="tbl-col tbl-col-link">
                   <!-- 数据库只存储两种状态：0=无效，其它均视为有效 -->
-                  <span v-if="linkValidMap.get(item.source_id) === 0" class="link-tag link-invalid">无效</span>
+                  <span v-if="(item.link_valid ?? linkValidMap.get(item.source_id) ?? 1) === 0" class="link-tag link-invalid">无效</span>
                   <span v-else class="link-tag link-valid">有效</span>
                 </div>
                 <div class="tbl-col tbl-col-time">
@@ -248,18 +266,18 @@
           
           <!-- 分页器 -->
           <div v-if="totalItems > pageSize" class="pagination">
-            <button class="page-btn" :disabled="currentPage <= 1" @click="currentPage--">
+            <button class="page-btn" :disabled="currentPage <= 1 || loadingFiles" @click="goPage(currentPage - 1)">
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                 <polyline points="15 18 9 12 15 6" />
               </svg>
             </button>
             <template v-for="p in visiblePages" :key="p">
               <span v-if="p === -1" class="page-ellipsis">...</span>
-              <button v-else class="page-btn" :class="{ active: p === currentPage }" @click="currentPage = p">
+              <button v-else class="page-btn" :class="{ active: p === currentPage }" :disabled="loadingFiles" @click="goPage(p)">
                 {{ p }}
               </button>
             </template>
-            <button class="page-btn" :disabled="currentPage >= totalPages" @click="currentPage++">
+            <button class="page-btn" :disabled="currentPage >= totalPages || loadingFiles" @click="goPage(currentPage + 1)">
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                 <polyline points="9 18 15 12 9 6" />
               </svg>
@@ -362,18 +380,18 @@
             
             <!-- 整理视图分页器 -->
             <div v-if="organizedTotalItems > organizedPageSize" class="pagination">
-              <button class="page-btn" :disabled="organizedCurrentPage <= 1" @click="organizedCurrentPage--">
+              <button class="page-btn" :disabled="organizedCurrentPage <= 1 || loadingOrganized" @click="goOrganizedPage(organizedCurrentPage - 1)">
                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                   <polyline points="15 18 9 12 15 6" />
                 </svg>
               </button>
               <template v-for="p in organizedVisiblePages" :key="p">
                 <span v-if="p === -1" class="page-ellipsis">...</span>
-                <button v-else class="page-btn" :class="{ active: p === organizedCurrentPage }" @click="organizedCurrentPage = p">
+                <button v-else class="page-btn" :class="{ active: p === organizedCurrentPage }" :disabled="loadingOrganized" @click="goOrganizedPage(p)">
                   {{ p }}
                 </button>
               </template>
-              <button class="page-btn" :disabled="organizedCurrentPage >= organizedTotalPages" @click="organizedCurrentPage++">
+              <button class="page-btn" :disabled="organizedCurrentPage >= organizedTotalPages || loadingOrganized" @click="goOrganizedPage(organizedCurrentPage + 1)">
                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                   <polyline points="9 18 15 12 9 6" />
                 </svg>
@@ -672,7 +690,7 @@
 
 <script setup lang="ts">
 import { ref, computed, onMounted } from 'vue'
-import { shareApi, type ShareSource, type ShareFile } from '@/api/share'
+import { shareApi, type ShareFile } from '@/api/share'
 import { showToast } from '@/composables/useToast'
 import { handleApiError } from '@/utils/error'
 import { useVisiblePages } from '@/composables/usePagination'
@@ -686,14 +704,12 @@ type FileFilter = 'all' | 'organized' | 'unorganized' | 'valid' | 'invalid'
 
 // ==================== 状态 ====================
 
-// 分享来源列表
-const sources = ref<ShareSource[]>([])
-
 // 链接有效性状态：key=source_id, value=1(有效)/0(无效)
 const linkValidMap = ref<Map<number, number>>(new Map())
 const checkingLinks = ref(false)
 const checkProgress = ref('')
 const loadingShares = ref(false)
+const recomputingOrganized = ref(false)
 
 // 视图模式：原始 / 整理
 const viewMode = ref<'original' | 'organized'>('original')
@@ -701,6 +717,15 @@ const viewMode = ref<'original' | 'organized'>('original')
 // 原始视图 - 文件列表
 const allFiles = ref<ShareFile[]>([])
 const loadingFiles = ref(false)
+const serverTotal = ref(0)
+const serverCounts = ref({
+  all_count: 0,
+  organized_count: 0,
+  unorganized_count: 0,
+  valid_count: 0,
+  invalid_count: 0,
+})
+const hasAnyShare = ref(false)
 
 // 原始视图 - 目录导航
 interface DirBreadcrumb {
@@ -720,26 +745,17 @@ interface OrganizedEntry {
   totalSize?: number
   file?: ShareFile  // 叶子节点的文件数据
 }
-const allOrganizedEntries = ref<OrganizedEntry[]>([])
 const organizedBreadcrumbs = ref<{ path: string; name: string }[]>([{ path: '', name: '根目录' }])
 const organizedCurrentPath = ref('')
 const loadingOrganized = ref(false)
-// 存储所有已整理的文件，用于按路径筛选
-const allOrganizedFiles = ref<ShareFile[]>([])
+/** 服务端分页：当前页条目（目录在前、文件在后） */
+const organizedEntries = ref<OrganizedEntry[]>([])
+/** 服务端分页：当前路径下总条数 */
+const organizedTotalItems = ref(0)
 
 // 整理视图分页
 const organizedCurrentPage = ref(1)
 const organizedPageSize = ref(30)
-
-/** 整理视图当前页条目（分页后） */
-const organizedEntries = computed(() => {
-  const start = (organizedCurrentPage.value - 1) * organizedPageSize.value
-  const end = start + organizedPageSize.value
-  return allOrganizedEntries.value.slice(start, end)
-})
-
-/** 整理视图总条数 */
-const organizedTotalItems = computed(() => allOrganizedEntries.value.length)
 
 /** 整理视图总页数 */
 const organizedTotalPages = computed(() => {
@@ -758,9 +774,13 @@ const isSearching = ref(false)
 const fileFilter = ref<FileFilter>('all')
 
 /** 切换筛选标签时重置分页到第 1 页 */
-function setFileFilter(filter: FileFilter) {
+async function setFileFilter(filter: FileFilter) {
+  if (fileFilter.value === filter) return
   fileFilter.value = filter
   currentPage.value = 1
+  selectedIds.value = new Set()
+  if (isSearching.value || isInSubDir.value) return
+  await fetchRootPage({ keepPage: true, includeCounts: false })
 }
 
 // 多选
@@ -836,42 +856,24 @@ const organizeProgressPercent = computed(() => {
   return Math.round((organizeProgressIndex.value / organizeProgressTotal.value) * 100)
 })
 
-/** 筛选后的所有文件列表（不分页） */
-const allFilteredFiles = computed(() => {
-  if (viewMode.value !== 'original') return allFiles.value
-  if (fileFilter.value === 'all') return allFiles.value
-  if (fileFilter.value === 'organized') return allFiles.value.filter(f => f.organized)
-  if (fileFilter.value === 'unorganized') return allFiles.value.filter(f => !f.organized)
-  if (fileFilter.value === 'valid') return allFiles.value.filter(f => (linkValidMap.value.get(f.source_id) ?? 1) === 1)
-  if (fileFilter.value === 'invalid') return allFiles.value.filter(f => linkValidMap.value.get(f.source_id) === 0)
-  return allFiles.value
-})
+/** 角标计数：仅根目录服务端 counts 有意义；子目录/搜索不展示筛选按钮 */
+const allCount = computed(() => serverCounts.value.all_count)
+const organizedCount = computed(() => serverCounts.value.organized_count)
+const unorganizedCount = computed(() => serverCounts.value.unorganized_count)
+const validCount = computed(() => serverCounts.value.valid_count)
+const invalidCount = computed(() => serverCounts.value.invalid_count)
 
-/** Tab 计数：全部 / 已整理 / 未整理 / 有效 / 失效 */
-const allCount = computed(() => allFiles.value.length)
-const organizedCount = computed(() => allFiles.value.filter(f => f.organized).length)
-const unorganizedCount = computed(() => allFiles.value.filter(f => !f.organized).length)
-const validCount = computed(() => allFiles.value.filter(f => (linkValidMap.value.get(f.source_id) ?? 1) === 1).length)
-const invalidCount = computed(() => allFiles.value.filter(f => linkValidMap.value.get(f.source_id) === 0).length)
+const totalItems = computed(() => serverTotal.value)
 
-/** 总条数 */
-const totalItems = computed(() => allFilteredFiles.value.length)
-
-/** 总页数 */
 const totalPages = computed(() => {
   const total = Math.ceil(totalItems.value / pageSize.value)
-  return total > 0 ? total : 1 // 至少1页
+  return total > 0 ? total : 1
 })
 
-/** 可见页码列表（-1 表示省略号，逻辑见 usePagination） */
 const visiblePages = useVisiblePages(totalPages, currentPage)
 
-/** 当前页的文件列表（分页后） */
-const filteredFiles = computed(() => {
-  const start = (currentPage.value - 1) * pageSize.value
-  const end = start + pageSize.value
-  return allFilteredFiles.value.slice(start, end)
-})
+/** 当前页文件（始终由服务端分页结果驱动） */
+const filteredFiles = computed(() => allFiles.value)
 
 /** 空状态描述文本 */
 const emptyDescText = computed(() => {
@@ -909,27 +911,55 @@ onMounted(async () => {
 
 // ==================== 分享来源 ====================
 
-/** 加载分享列表 */
+/** 仅探测是否存在分享（空态用，不拉全量列表） */
 async function loadShares() {
   loadingShares.value = true
   try {
-    const res = await shareApi.listShares()
+    const res = await shareApi.listShares({ limit: 1, offset: 0 })
     if (res.code === 0 && res.data) {
-      sources.value = res.data.shares || []
-      // 初始化链接有效性 Map（从数据库已存储的 link_valid 字段读取）
-      const map = new Map<number, number>()
-      for (const s of sources.value) {
-        map.set(s.id, s.link_valid ?? 1)
-      }
-      linkValidMap.value = map
+      const total = res.data.total ?? (res.data.shares || []).length
+      hasAnyShare.value = total > 0
     } else {
-      sources.value = []
+      hasAnyShare.value = false
     }
   } catch (e) {
-    console.error('加载分享列表失败:', e)
-    sources.value = []
+    console.error('loadShares failed:', e)
+    hasAnyShare.value = false
   } finally {
     loadingShares.value = false
+  }
+}
+
+/** 从当前页文件解析分享名（不依赖全量 sources 列表） */
+function resolveShareName(sourceId: number): string {
+  return allFiles.value.find(f => f.source_id === sourceId)?.share_name || '未命名分享'
+}
+
+/** 全库重算目录 organized 标记 */
+async function handleRecomputeOrganized() {
+  if (recomputingOrganized.value) return
+  recomputingOrganized.value = true
+  try {
+    const res = await shareApi.recomputeOrganized()
+    if (res.code === 0 && res.data) {
+      const d = res.data
+      showToast(
+        `重算完成：${d.sources} 个分享，检查 ${d.checked_dirs} 个目录，修正 ${d.changed_dirs} 个`,
+        'success'
+      )
+      if (!isInSubDir.value && !isSearching.value) {
+        await fetchRootPage({ keepPage: true, includeCounts: true })
+      } else if (isInSubDir.value) {
+        const last = currentDirBreadcrumbs.value[currentDirBreadcrumbs.value.length - 1]
+        await loadSubDirFiles(last.sourceId, last.parentId, { keepPage: true })
+      }
+    } else {
+      showToast(res.message || '重算失败', 'error')
+    }
+  } catch (e: any) {
+    handleApiError(e, '重算失败')
+  } finally {
+    recomputingOrganized.value = false
   }
 }
 
@@ -961,6 +991,14 @@ function handleCheckLinks() {
         es.close()
         const msg = `检测完成：${data.valid_count} 个有效，${data.invalid_count} 个无效`
         showToast(msg, data.invalid_count > 0 ? 'info' : 'success')
+        if (!isSearching.value) {
+          if (isInSubDir.value) {
+            const last = currentDirBreadcrumbs.value[currentDirBreadcrumbs.value.length - 1]
+            loadSubDirFiles(last.sourceId, last.parentId, { keepPage: true })
+          } else {
+            fetchRootPage({ keepPage: true, includeCounts: true })
+          }
+        }
       }
     } catch (e) {
       console.error('解析 SSE 数据失败:', e)
@@ -977,10 +1015,9 @@ function handleCheckLinks() {
 
 /** 点击删除按钮（弹出确认框） */
 function handleDeleteShare(sourceId: number) {
-  const src = sources.value.find(s => s.id === sourceId)
   deletingShareId.value = sourceId
   deletingBatchIds.value = []
-  deletingShareName.value = src?.share_name || '未命名分享'
+  deletingShareName.value = resolveShareName(sourceId)
   showDeleteConfirm.value = true
 }
 
@@ -1161,9 +1198,13 @@ function closePropertiesModal() {
 
 /** 刷新当前视图（保留面包屑导航位置） */
 async function refreshCurrentView() {
-  // 整理视图：重新加载整理数据
+  // 整理视图：刷新当前虚拟路径（服务端分页）
   if (viewMode.value === 'organized') {
-    await loadOrganized()
+    if (isSearching.value && searchKeyword.value.trim()) {
+      await searchOrganized(searchKeyword.value.trim())
+    } else {
+      await loadOrganizedEntries(organizedCurrentPath.value, { keepPage: true })
+    }
     return
   }
   // 原始视图：根据面包屑判断是根目录还是子目录
@@ -1184,21 +1225,13 @@ async function reloadCurrentFiles() {
   try {
     const crumbs = currentDirBreadcrumbs.value
     if (crumbs.length <= 1) {
-      // 根目录：重新加载所有分享的根目录文件
-      const res = await shareApi.getAllFiles()
-      if (res.code === 0 && res.data) {
-        allFiles.value = res.data.files || []
-      }
+      await fetchRootPage({ keepPage: true, includeCounts: true })
     } else {
-      // 子目录：重新加载当前子目录文件
       const last = crumbs[crumbs.length - 1]
-      const res = await shareApi.listFiles(last.sourceId, last.parentId)
-      if (res.code === 0 && res.data) {
-        allFiles.value = res.data.items || []
-      }
+      await loadSubDirFiles(last.sourceId, last.parentId, { keepPage: true })
     }
   } catch (e) {
-    console.error('刷新文件列表失败:', e)
+    console.error('reloadCurrentFiles failed:', e)
   }
 }
 
@@ -1217,45 +1250,111 @@ function switchView(mode: 'original' | 'organized') {
 // ==================== 原始视图：文件列表 ====================
 
 /** 加载所有分享的根目录文件 */
-async function loadFiles() {
+async function fetchRootPage(options: { keepPage?: boolean; includeCounts?: boolean } = {}) {
+  const includeCounts = options.includeCounts !== false
+  if (!options.keepPage) currentPage.value = 1
   loadingFiles.value = true
+  try {
+    const offset = (currentPage.value - 1) * pageSize.value
+    const res = await shareApi.getAllFiles({
+      filter: fileFilter.value,
+      limit: pageSize.value,
+      offset,
+      includeCounts,
+    })
+    if (res.code === 0 && res.data) {
+      allFiles.value = res.data.files || []
+      serverTotal.value = res.data.total ?? 0
+      if (res.data.counts) {
+        serverCounts.value = {
+          all_count: res.data.counts.all_count ?? 0,
+          organized_count: res.data.counts.organized_count ?? 0,
+          unorganized_count: res.data.counts.unorganized_count ?? 0,
+          valid_count: res.data.counts.valid_count ?? 0,
+          invalid_count: res.data.counts.invalid_count ?? 0,
+        }
+        if (serverCounts.value.all_count > 0) hasAnyShare.value = true
+      } else if (serverTotal.value > 0) {
+        hasAnyShare.value = true
+      }
+      const m = new Map(linkValidMap.value)
+      for (const f of allFiles.value) {
+        if (f.link_valid !== undefined && f.link_valid !== null) {
+          m.set(f.source_id, f.link_valid)
+        }
+      }
+      linkValidMap.value = m
+    } else {
+      allFiles.value = []
+      serverTotal.value = 0
+    }
+  } catch (e) {
+    console.error('fetchRootPage failed:', e)
+    allFiles.value = []
+    serverTotal.value = 0
+  } finally {
+    loadingFiles.value = false
+  }
+}
+
+async function loadFiles() {
   selectedIds.value = new Set()
   isSearching.value = false
   searchKeyword.value = ''
   fileFilter.value = 'all'
   currentPage.value = 1
   currentDirBreadcrumbs.value = [{ sourceId: 0, parentId: '0', name: '全部' }]
-  try {
-    const res = await shareApi.getAllFiles()
-    if (res.code === 0 && res.data) {
-      allFiles.value = res.data.files || []
-    } else {
-      allFiles.value = []
-    }
-  } catch (e) {
-    console.error('加载文件列表失败:', e)
-    allFiles.value = []
-  } finally {
-    loadingFiles.value = false
+  await fetchRootPage({ keepPage: true, includeCounts: true })
+}
+
+async function goPage(page: number) {
+  if (page < 1 || page > totalPages.value || page === currentPage.value) return
+  if (loadingFiles.value) return
+  currentPage.value = page
+  selectedIds.value = new Set()
+  // 搜索结果翻页
+  if (isSearching.value) {
+    await fetchSearchPage({ keepPage: true })
+    return
+  }
+  if (isInSubDir.value) {
+    const last = currentDirBreadcrumbs.value[currentDirBreadcrumbs.value.length - 1]
+    await loadSubDirFiles(last.sourceId, last.parentId, { keepPage: true })
+  } else {
+    await fetchRootPage({ keepPage: true, includeCounts: false })
   }
 }
 
-/** 加载子目录文件 */
-async function loadSubDirFiles(sourceId: number, parentId: string) {
+async function loadSubDirFiles(
+  sourceId: number,
+  parentId: string,
+  options: { keepPage?: boolean } = {}
+) {
   loadingFiles.value = true
   selectedIds.value = new Set()
   fileFilter.value = 'all'
-  currentPage.value = 1
+  if (!options.keepPage) currentPage.value = 1
   try {
-    const res = await shareApi.listFiles(sourceId, parentId)
+    const offset = (currentPage.value - 1) * pageSize.value
+    const res = await shareApi.listFiles(sourceId, parentId, pageSize.value, offset)
     if (res.code === 0 && res.data) {
       allFiles.value = res.data.items || []
+      serverTotal.value = res.data.total ?? allFiles.value.length
+      const m = new Map(linkValidMap.value)
+      for (const f of allFiles.value) {
+        if (f.link_valid !== undefined && f.link_valid !== null) {
+          m.set(f.source_id, f.link_valid)
+        }
+      }
+      linkValidMap.value = m
     } else {
       allFiles.value = []
+      serverTotal.value = 0
     }
   } catch (e) {
-    console.error('加载子目录失败:', e)
+    console.error('loadSubDirFiles failed:', e)
     allFiles.value = []
+    serverTotal.value = 0
   } finally {
     loadingFiles.value = false
   }
@@ -1303,164 +1402,183 @@ function handleRowClick(item: ShareFile, event: MouseEvent) {
 
 // ==================== 整理视图 ====================
 
-/** 加载所有已整理文件并构建文件管理器视图（只显示已整理的文件） */
+/** 加载整理视图根目录（服务端分页，不拉全量） */
 async function loadOrganized() {
+  isSearching.value = false
+  searchKeyword.value = ''
+  organizedCurrentPath.value = ''
+  organizedBreadcrumbs.value = [{ path: '', name: '根目录' }]
+  organizedCurrentPage.value = 1
+  await loadOrganizedEntries('', { keepPage: true })
+}
+
+/**
+ * 服务端分页浏览整理视图虚拟目录
+ * 虚拟路径 = category/organized_dir（与后端 list_organized_entries 一致）
+ */
+async function loadOrganizedEntries(
+  path: string,
+  options: { keepPage?: boolean } = {}
+) {
+  if (!options.keepPage) organizedCurrentPage.value = 1
   loadingOrganized.value = true
   try {
-    const res = await shareApi.getAllOrganized()
+    const offset = (organizedCurrentPage.value - 1) * organizedPageSize.value
+    const res = await shareApi.browseOrganized({
+      path: path || '',
+      limit: organizedPageSize.value,
+      offset,
+    })
     if (res.code === 0 && res.data) {
-      allOrganizedFiles.value = res.data.organized || []
-      // 重置到根目录
-      organizedCurrentPath.value = ''
-      organizedBreadcrumbs.value = [{ path: '', name: '根目录' }]
-      buildOrganizedEntries('')
+      const raw = res.data.entries || []
+      organizedEntries.value = raw.map((e: any) => ({
+        name: e.name,
+        path: e.path,
+        isDir: !!(e.is_dir ?? e.isDir),
+        fileCount: e.file_count ?? e.fileCount ?? 0,
+        totalSize: e.total_size ?? e.totalSize ?? 0,
+        file: e.file,
+      }))
+      organizedTotalItems.value = res.data.total ?? 0
+      organizedCurrentPath.value = res.data.path ?? path ?? ''
     } else {
-      allOrganizedFiles.value = []
-      allOrganizedEntries.value = []
+      organizedEntries.value = []
+      organizedTotalItems.value = 0
     }
   } catch (e) {
     console.error('加载整理视图失败:', e)
-    allOrganizedFiles.value = []
-    allOrganizedEntries.value = []
+    organizedEntries.value = []
+    organizedTotalItems.value = 0
   } finally {
     loadingOrganized.value = false
   }
 }
 
-/**
- * 根据当前路径，从 allOrganizedFiles 中提取当前层级的目录和文件
- * 完整路径 = category/organized_dir/organized_name
- * 目录排前面，文件排后面
- */
-function buildOrganizedEntries(currentPath: string) {
-  const dirs = new Map<string, { fileCount: number; totalSize: number }>()
-  const files: OrganizedEntry[] = []
-
-  for (const file of allOrganizedFiles.value) {
-    // 拼接完整目录路径：category/organized_dir
-    const cat = file.category || ''
-    const orgDir = file.organized_dir || ''
-    const fullDir = cat && orgDir ? `${cat}/${orgDir}` : (cat || orgDir)
-
-    if (!currentPath) {
-      // 根目录：取第一层目录名
-      const parts = fullDir.split('/').filter(Boolean)
-      if (parts.length > 0) {
-        const dirName = parts[0]
-        const existing = dirs.get(dirName) || { fileCount: 0, totalSize: 0 }
-        existing.fileCount++
-        existing.totalSize += file.size || 0
-        dirs.set(dirName, existing)
-      }
-    } else if (fullDir === currentPath) {
-      // 当前目录直属文件（非子目录）：fullDir 与 currentPath 完全相等
-      files.push({
-        name: file.organized_name || file.name,
-        path: fullDir + '/' + (file.organized_name || file.name),
-        isDir: false,
-        file,
-      })
-    } else if (fullDir.startsWith(currentPath + '/')) {
-      // 子目录：取下一层
-      const remaining = fullDir.slice(currentPath.length + 1)
-      const parts = remaining.split('/').filter(Boolean)
-      if (parts.length > 0) {
-        // 还有子目录
-        const dirName = parts[0]
-        const fullPath = currentPath + '/' + dirName
-        const existing = dirs.get(fullPath) || { fileCount: 0, totalSize: 0 }
-        existing.fileCount++
-        existing.totalSize += file.size || 0
-        dirs.set(fullPath, existing)
-      }
-    }
-  }
-
-  // 构建目录条目
-  const entries: OrganizedEntry[] = []
-  for (const [path, info] of dirs) {
-    const name = path.split('/').pop() || path
-    entries.push({
-      name,
-      path,
-      isDir: true,
-      fileCount: info.fileCount,
-      totalSize: info.totalSize,
-    })
-  }
-
-  // 目录排前面，文件排后面
-  entries.sort((a, b) => a.name.localeCompare(b.name))
-  files.sort((a, b) => a.name.localeCompare(b.name))
-  allOrganizedEntries.value = [...entries, ...files]
-  organizedCurrentPage.value = 1 // 重置到第一页
+/** 整理视图翻页（服务端） */
+async function goOrganizedPage(page: number) {
+  if (page < 1 || page > organizedTotalPages.value || page === organizedCurrentPage.value) return
+  if (loadingOrganized.value) return
+  organizedCurrentPage.value = page
+  await loadOrganizedEntries(organizedCurrentPath.value, { keepPage: true })
 }
 
 /** 进入子目录 */
 function enterOrganizedDir(entry: OrganizedEntry) {
   if (!entry.isDir) return
+  isSearching.value = false
   organizedCurrentPath.value = entry.path
   organizedBreadcrumbs.value.push({ path: entry.path, name: entry.name })
-  buildOrganizedEntries(entry.path)
+  loadOrganizedEntries(entry.path)
 }
 
-/** 面包屑点击导航 */
+/** 面包屑点击 */
 function navigateOrganizedTo(targetPath: string) {
   if (targetPath === organizedCurrentPath.value) return
+  isSearching.value = false
   organizedCurrentPath.value = targetPath
-  // 截断面包屑到目标位置
   const idx = organizedBreadcrumbs.value.findIndex(b => b.path === targetPath)
   if (idx >= 0) {
     organizedBreadcrumbs.value = organizedBreadcrumbs.value.slice(0, idx + 1)
+  } else {
+    buildOrganizedBreadcrumbs(targetPath)
   }
-  buildOrganizedEntries(targetPath)
+  loadOrganizedEntries(targetPath)
 }
 
 // ==================== 搜索 ====================
 
-/** 搜索文件 */
+/** 搜索文件（服务端分页） */
 async function handleSearch() {
   const keyword = searchKeyword.value.trim()
-  if (!keyword) return
-
-  isSearching.value = true
-  selectedIds.value = new Set()
-  // 根据当前视图设置对应的 loading 状态
-  if (viewMode.value === 'organized') {
-    loadingOrganized.value = true
-  } else {
-    loadingFiles.value = true
+  if (!keyword) {
+    clearSearch()
+    return
   }
+  isSearching.value = true
+  currentPage.value = 1
+  selectedIds.value = new Set()
+
+  if (viewMode.value === 'organized') {
+    await searchOrganized(keyword)
+  } else {
+    await fetchSearchPage({ keepPage: true })
+  }
+}
+
+/** 原始视图：服务端分页搜索 */
+async function fetchSearchPage(options: { keepPage?: boolean } = {}) {
+  const keyword = searchKeyword.value.trim()
+  if (!keyword) return
+  if (!options.keepPage) currentPage.value = 1
+  loadingFiles.value = true
   try {
-    const res = await shareApi.searchFiles(keyword)
+    const offset = (currentPage.value - 1) * pageSize.value
+    const res = await shareApi.searchFiles(keyword, {
+      limit: pageSize.value,
+      offset,
+      scope: 'all',
+    })
     if (res.code === 0 && res.data) {
       const files = res.data.files || []
-      if (viewMode.value === 'organized') {
-        // 整理视图搜索：只保留已整理文件，按整理结构展示
-        allOrganizedFiles.value = files.filter(f => f.organized)
-        // 计算匹配文件的公共父目录，直接跳转到该目录
-        // 场景：搜"同乐者"匹配到某剧的所有集，跳转到该剧目录而非从根目录开始
-        const targetPath = computeOrganizedSearchPath(allOrganizedFiles.value)
-        organizedCurrentPath.value = targetPath
-        buildOrganizedBreadcrumbs(targetPath)
-        buildOrganizedEntries(targetPath)
-      } else {
-        // 原始视图搜索：结果赋给 allFiles，目录优先（后端已排序）
-        allFiles.value = files
-      }
-      if (files.length === 0) {
+      allFiles.value = files
+      serverTotal.value = res.data.total ?? files.length
+      if (files.length === 0 && currentPage.value === 1) {
         showToast('未找到匹配的文件', 'info')
       }
     } else {
       allFiles.value = []
+      serverTotal.value = 0
       showToast(res.message || '搜索失败', 'error')
     }
   } catch (e: any) {
     console.error('搜索失败:', e)
     allFiles.value = []
+    serverTotal.value = 0
     handleApiError(e, '搜索失败')
   } finally {
     loadingFiles.value = false
+  }
+}
+
+/**
+ * 整理视图搜索：
+ * 1) 取最多 100 条匹配用于计算公共父目录并跳转
+ * 2) 跳转后用服务端 browse 加载该目录（不拉全量）
+ */
+async function searchOrganized(keyword: string) {
+  loadingOrganized.value = true
+  try {
+    const res = await shareApi.searchFiles(keyword, {
+      limit: 100,
+      offset: 0,
+      scope: 'organized',
+    })
+    if (res.code === 0 && res.data) {
+      const files = (res.data.files || []).filter((f: ShareFile) => f.organized)
+      if (files.length === 0) {
+        organizedEntries.value = []
+        organizedTotalItems.value = 0
+        organizedCurrentPath.value = ''
+        organizedBreadcrumbs.value = [{ path: '', name: '根目录' }]
+        showToast('未找到匹配的文件', 'info')
+        return
+      }
+      const targetPath = computeOrganizedSearchPath(files)
+      organizedCurrentPath.value = targetPath
+      buildOrganizedBreadcrumbs(targetPath)
+      // 跳转后按目录浏览（服务端分页）
+      await loadOrganizedEntries(targetPath)
+    } else {
+      organizedEntries.value = []
+      organizedTotalItems.value = 0
+      showToast(res.message || '搜索失败', 'error')
+    }
+  } catch (e: any) {
+    console.error('搜索失败:', e)
+    organizedEntries.value = []
+    organizedTotalItems.value = 0
+    handleApiError(e, '搜索失败')
+  } finally {
     loadingOrganized.value = false
   }
 }
@@ -1511,7 +1629,7 @@ function computeOrganizedSearchPath(files: ShareFile[]): string {
     // 电影：跳转到该目录本身，直接显示文件
     return commonPath
   }
-  // 多个不同目录：跳转到公共前缀
+  // 多个不同目录，跳转到公共前缀
   return commonPath
 }
 
@@ -1597,7 +1715,7 @@ function handleBatchDelete() {
   deletingShareId.value = null
   deletingBatchIds.value = Array.from(sourceIdSet)
   deletingShareName.value = sourceIdSet.size === 1
-    ? (sources.value.find(s => s.id === sourceIdSet.values().next().value)?.share_name || '未命名分享')
+    ? resolveShareName(sourceIdSet.values().next().value as number)
     : `选中的 ${sourceIdSet.size} 个分享`
   showDeleteConfirm.value = true
 }

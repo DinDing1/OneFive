@@ -556,7 +556,7 @@ class OrganizeService:
     def _list_all_files_paged(self, cid: int, page_size: int = 200) -> List[Dict]:
         """拉取目录下全部文件（自动分页，不丢数据）
 
-        使用 file_service.iter_all_files（内部用 iter_fs_files），
+        使用 file_service.iter_all_files（内部用 fs_files_iter），
         自动分页、自带 P115BusyOSError 重试，替代手动 limit+offset。
 
         Args:

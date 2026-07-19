@@ -678,6 +678,7 @@ const showPassword = ref(false)
 const organizeMode = ref('move')
 const sourcePath = ref('')
 const mediaLibraryPath = ref('')
+const mediaLibraryCid = ref('')
 const movieTemplate = ref('')
 const tvTemplate = ref('')
 const mediaSaving = ref(false)
@@ -813,6 +814,7 @@ async function loadOrganizeSettings() {
       tmdbApiUrl.value = res.data.tmdb_api_url || ''
       tmdbLanguage.value = res.data.tmdb_language || 'zh-CN'
       mediaLibraryPath.value = res.data.media_library_path || ''
+      mediaLibraryCid.value = res.data.media_library_cid || ''
       movieTemplate.value = res.data.movie_template || ''
       tvTemplate.value = res.data.tv_template || ''
       organizeMode.value = res.data.organize_mode || 'move'
@@ -851,6 +853,7 @@ async function saveMediaSettings() {
       organize_mode: organizeMode.value,
       source_path: sourcePath.value,
       media_library_path: mediaLibraryPath.value,
+      media_library_cid: mediaLibraryCid.value,
       movie_template: movieTemplate.value,
       tv_template: tvTemplate.value,
       classify_rules: JSON.stringify(rules),
@@ -903,6 +906,7 @@ function confirmPathPick() {
     sourcePath.value = value
   } else {
     mediaLibraryPath.value = value
+    mediaLibraryCid.value = pickerCid.value
   }
   showPathPicker.value = false
 }

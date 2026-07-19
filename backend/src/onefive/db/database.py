@@ -43,15 +43,31 @@ class Database:
         # 建立连接并初始化表结构
         self._conn = sqlite3.connect(str(self.db_path), check_same_thread=False)
         self._conn.row_factory = sqlite3.Row  # 返回字典形式的结果
+
+        # Performance PRAGMAs for concurrent reads and large queries
+        # WAL: readers don't block writers as much as delete journal
+        # synchronous=NORMAL: safe enough with WAL, faster than FULL
+        # cache_size=-64000: ~64MB page cache
+        # temp_store=MEMORY: temp tables/sorts in memory
+        # mmap_size: memory-map large tables
+        # busy_timeout: reduce transient database is locked errors
+        self._conn.execute("PRAGMA journal_mode=WAL")
+        self._conn.execute("PRAGMA synchronous=NORMAL")
+        self._conn.execute("PRAGMA cache_size=-64000")
+        self._conn.execute("PRAGMA temp_store=MEMORY")
+        self._conn.execute("PRAGMA mmap_size=268435456")
+        self._conn.execute("PRAGMA busy_timeout=10000")
+        self._conn.execute("PRAGMA foreign_keys=ON")
         self._init_tables()
 
     def _init_tables(self):
         """初始化数据库表结构
 
-        创建三张表：
+        创建四张表：
         - setting: 配置变量存储（name/value/description + 时间戳）
         - share_source: 分享链接来源（含 share_code、receive_code、link_valid 等）
         - share_file: 分享文件（含目录和文件，支持整理状态追踪）
+        - direct_link_cache: 115 下载直链缓存（有效期内复用，降低风控）
 
         字段含义详见下方 CREATE TABLE 语句的行内注释。
         """
@@ -116,6 +132,146 @@ class Database:
         self._conn.execute("CREATE INDEX IF NOT EXISTS idx_share_file_organized ON share_file(organized, is_dir)")
         # 直链服务按 share_code + file_id 查询
         self._conn.execute("CREATE INDEX IF NOT EXISTS idx_share_file_share_code ON share_file(share_code, file_id)")
+
+        # Cross-share root listing: WHERE parent_id='0' (was full table SCAN)
+        self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_share_file_parent_id ON share_file(parent_id, is_dir)"
+        )
+        # 根目录分页排序：parent_id + is_dir + name
+        self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_share_file_root_list "
+            "ON share_file(parent_id, is_dir, name)"
+        )
+        # Per-source organize status filters
+        self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_share_file_src_org "
+            "ON share_file(source_id, organized, is_dir)"
+        )
+        # COUNT WHERE source_id=? AND is_dir=0
+        self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_share_file_src_isdir "
+            "ON share_file(source_id, is_dir)"
+        )
+        # Global organized list: organized=1 AND organized_dir!=''
+        self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_share_file_org_dir "
+            "ON share_file(organized, organized_dir)"
+        )
+        # Share list ORDER BY created_at DESC
+        self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_share_source_created "
+            "ON share_source(created_at DESC)"
+        )
+        # Link validity filter
+        self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_share_source_link_valid "
+            "ON share_source(link_valid)"
+        )
+
+
+
+        # 整理视图浏览：organized + is_dir + category/organized_dir 前缀匹配
+        self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_share_file_org_path "
+            "ON share_file(organized, is_dir, category, organized_dir)"
+        )
+        # 搜索辅助
+        self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_share_file_title ON share_file(title)"
+        )
+        self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_share_file_org_name ON share_file(organized_name)"
+        )
+
+        
+
+        # 清理历史调试产生的临时重复索引
+        for _tmp_idx in ("tmp_parent", "tmp_src_org", "tmp_src_isdir"):
+            self._conn.execute(f"DROP INDEX IF EXISTS {_tmp_idx}")
+
+        # FTS5 全文索引（独立表，搜索加速；不可用则回退 LIKE）
+        try:
+            self._conn.execute(
+                """CREATE VIRTUAL TABLE IF NOT EXISTS share_file_fts USING fts5(
+                    name,
+                    title,
+                    organized_name,
+                    organized_dir,
+                    tokenize='unicode61'
+                )"""
+            )
+            self._conn.execute(
+                """CREATE TRIGGER IF NOT EXISTS trg_share_file_fts_ai
+                   AFTER INSERT ON share_file BEGIN
+                     INSERT INTO share_file_fts(rowid, name, title, organized_name, organized_dir)
+                     VALUES (new.id, new.name, new.title, new.organized_name, new.organized_dir);
+                   END"""
+            )
+            self._conn.execute(
+                """CREATE TRIGGER IF NOT EXISTS trg_share_file_fts_ad
+                   AFTER DELETE ON share_file BEGIN
+                     DELETE FROM share_file_fts WHERE rowid = old.id;
+                   END"""
+            )
+            self._conn.execute(
+                """CREATE TRIGGER IF NOT EXISTS trg_share_file_fts_au
+                   AFTER UPDATE OF name, title, organized_name, organized_dir ON share_file BEGIN
+                     DELETE FROM share_file_fts WHERE rowid = old.id;
+                     INSERT INTO share_file_fts(rowid, name, title, organized_name, organized_dir)
+                     VALUES (new.id, new.name, new.title, new.organized_name, new.organized_dir);
+                   END"""
+            )
+            cnt = self._conn.execute("SELECT COUNT(*) FROM share_file_fts").fetchone()[0]
+            base = self._conn.execute("SELECT COUNT(*) FROM share_file").fetchone()[0]
+            if base > 0 and (cnt == 0 or abs(cnt - base) > max(100, base // 10)):
+                self._conn.execute("DELETE FROM share_file_fts")
+                self._conn.execute(
+                    """INSERT INTO share_file_fts(rowid, name, title, organized_name, organized_dir)
+                       SELECT id, IFNULL(name,''), IFNULL(title,''), IFNULL(organized_name,''), IFNULL(organized_dir,'')
+                       FROM share_file"""
+                )
+        except Exception:
+            pass
+
+# 直链 URL 持久化缓存：有效期内命中则不再请求 115
+        # 兼容旧表结构（早期仅 pickcode 主键），缺 cache_key 时重建
+        cols = {
+            row[1]
+            for row in self._conn.execute("PRAGMA table_info(direct_link_cache)").fetchall()
+        }
+        if cols and "cache_key" not in cols:
+            self._conn.execute("DROP TABLE IF EXISTS direct_link_cache")
+            cols = set()
+        if not cols:
+            self._conn.execute(
+                """
+                CREATE TABLE direct_link_cache (
+                    cache_key   TEXT PRIMARY KEY,
+                    pickcode    TEXT DEFAULT '',
+                    file_id     TEXT DEFAULT '',
+                    share_code  TEXT DEFAULT '',
+                    sha1        TEXT DEFAULT '',
+                    user_agent  TEXT DEFAULT '',
+                    url         TEXT NOT NULL,
+                    expires_at  REAL NOT NULL,
+                    created_at  TIMESTAMP DEFAULT (datetime('now', 'localtime')),
+                    updated_at  TIMESTAMP DEFAULT (datetime('now', 'localtime'))
+                )
+                """
+            )
+        self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_dl_cache_expires ON direct_link_cache(expires_at)"
+        )
+        self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_dl_cache_file_id ON direct_link_cache(file_id)"
+        )
+        self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_dl_cache_pickcode ON direct_link_cache(pickcode)"
+        )
+        self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_dl_cache_share ON direct_link_cache(share_code, file_id)"
+        )
+
         self._conn.commit()
 
     def execute(self, sql: str, params: tuple = ()) -> sqlite3.Cursor:
@@ -135,6 +291,16 @@ class Database:
         """提交事务（线程安全）"""
         with self._lock:
             self._conn.commit()
+
+    def rollback(self):
+        """Rollback transaction (thread-safe)"""
+        with self._lock:
+            self._conn.rollback()
+
+    def executescript(self, sql: str) -> None:
+        """Execute multiple SQL statements (thread-safe)"""
+        with self._lock:
+            self._conn.executescript(sql)
 
     def fetchone(self, sql: str, params: tuple = ()) -> Optional[sqlite3.Row]:
         """查询单条记录（线程安全）"""

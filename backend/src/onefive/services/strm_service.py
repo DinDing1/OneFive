@@ -23,11 +23,11 @@ from pathlib import Path
 from typing import List, Dict, Optional
 from urllib.parse import urlencode
 
-from p115client import P115Client
+from ..services.p115_client_factory import get_p115_client_factory
 
 from ..db.database import get_db
 from ..paths import ACCESSIBLE_PATHS_FILE, TRIM_PKGVAR, split_accessible_paths
-from ..services.auth_service import get_auth_service
+
 from ..services.config_service import get_config_service
 from ..services.file_info_service import get_video_extensions, invalidate_video_extensions_cache
 from ..services.file_service import get_file_service
@@ -501,111 +501,77 @@ class StrmService:
     # ==================== 云盘 STRM 生成 ====================
 
     def _iter_cloud_files_with_path(self, cid: int, current_path: str):
-        """递归遍历云盘目录，生成带完整路径的文件信息
+        """遍历云盘目录，生成带完整路径的文件信息
 
-        使用 file_service.iter_all_files（内部用 iter_fs_files 自动分页），
-        替代手动 limit=5000 单页拉取，避免大目录文件遗漏。
-        自带 P115BusyOSError 自动重试和 401 重试。
-
-        子目录遍历失败时记录警告并跳过，不中断整个遍历，
-        避免一个失效子目录导致所有文件无法生成。
-
-        Args:
-            cid: 起始目录 ID
-            current_path: 起始目录对应的路径（用于拼接子文件路径）
-
-        Yields:
-            dict: 包含 name、pick_code、file_id、path 字段的文件信息
+        FileService.iter_all_files_strm 使用 iter_files_with_path_skim 获取
+        name/pickcode/path，本方法只负责透传字段。
         """
-        file_service = get_file_service()
         try:
-            items = file_service.iter_all_files(cid)
-        except Exception as e:
-            logger.error(f"列出云盘目录失败: cid={cid}, path={current_path}, {e}")
-            return
-
-        for item in items:
-            name = item.get("name", "")
-            if not name:
-                continue
-
-            if item.get("is_dir"):
-                # 递归处理子目录
-                child_cid = int(item["file_id"])
-                child_path = f"{current_path}/{name}" if current_path else name
-                try:
-                    yield from self._iter_cloud_files_with_path(child_cid, child_path)
-                except Exception as e:
-                    # 子目录遍历失败时跳过，不中断整个遍历
-                    logger.warning(f"跳过子目录: cid={child_cid}, path={child_path}, {e}")
+            file_service = get_file_service()
+            items = file_service.iter_all_files_strm(cid)
+            logger.info(f"云盘 STRM 扁平扫描结果: cid={cid}, path={current_path}, files={len(items)}")
+            for item in items:
+                name = item.get("name", "")
+                pick_code = item.get("pick_code", "")
+                rel_path = item.get("path") or name
+                if not name or not pick_code or not rel_path:
+                    logger.warning(f"云盘 STRM 跳过无效文件: root_cid={cid}, root_path={current_path}, raw={item}")
                     continue
-            else:
-                # 文件：构建完整路径
-                file_path = f"{current_path}/{name}" if current_path else name
                 yield {
                     "name": name,
-                    "pick_code": item.get("pick_code", ""),
+                    "pick_code": pick_code,
                     "file_id": item.get("file_id", ""),
-                    "path": file_path,
+                    "path": rel_path,
                 }
+        except Exception as e:
+            logger.error(f"云盘目录遍历失败: cid={cid}, path={current_path}, {e}")
 
     def _resolve_cid_by_path(self, path: str) -> Optional[int]:
         """将云盘路径字符串转为 cid
 
-        逐级用 file_service.iter_all_files 查找子目录（仅查找不创建）。
-        区别于 organize_service._ensure_directory 的创建逻辑。
+        使用 115 的路径转目录 ID 接口，不再通过列根目录逐级查找。
+        这样可以避开 fs_files 在根目录/大目录下容易出现的 405/风控问题。
 
         Args:
             path: 云盘内路径，如 "/媒体库" 或 "媒体库/电影"
 
         Returns:
-            目录 cid；空路径或 "/" 返回 0（根目录）；找不到返回 None
+            目录 cid；空路径或 "/" 返回 0；找不到返回 None
         """
         if not path or not path.strip() or path.strip() == "/":
             return 0
 
-        # 拆分路径片段，过滤空段和 "根目录"
         parts = [p.strip() for p in path.split("/") if p.strip() and p.strip() not in ("根目录", "/")]
         if not parts:
             return 0
 
-        file_service = get_file_service()
-        current_cid = 0
-        for part in parts:
-            found_cid = None
-            try:
-                # 用 iter_all_files 自动分页，避免大目录 limit=200 找不到目标
-                items = file_service.iter_all_files(current_cid)
-                for item in items:
-                    if item.get("is_dir") and item.get("name") == part:
-                        found_cid = int(item["file_id"])
-                        break
-            except Exception as e:
-                logger.warning(f"查找子目录失败: {current_cid}/{part}, {e}")
-                return None
+        normalized_path = "/" + "/".join(parts)
+        try:
+            client = get_p115_client_factory().create_web_client()
+        except NotLoggedInError:
+            raise
+        except Exception as e:
+            logger.warning(f"创建 115 Web 客户端失败: {e}")
+            return None
 
-            if found_cid is None:
-                logger.warning(f"云盘路径不存在: {path}（在 {part} 处中断）")
-                return None
-            current_cid = found_cid
+        try:
+            # fs_dir_getid_app 是专门的“路径 -> 目录 ID”接口，避免用 fs_files 枚举根目录。
+            resp = client.fs_dir_getid_app(normalized_path, app="chrome")
+        except Exception as e:
+            logger.warning(f"云盘路径解析失败: path={normalized_path}, {e}")
+            return None
 
-        return current_cid
+        cid = resp.get("id") or resp.get("cid") or resp.get("file_id") or resp.get("category_id")
+        if cid:
+            return int(cid)
+
+        logger.warning(f"云盘路径不存在: {path}，响应={resp}")
+        return None
 
     def _build_cloud_strm_url(self, base_url: str, filename: str, pick_code: str) -> str:
         """构建云盘 STRM 的直链 URL（pickcode 模式）
 
         格式：{base_url}/d115/{filename}?pickcode={pick_code}
-
-        文件名保持原始不编码：直链服务通过 pickcode 参数定位文件，
-        路径中的文件名仅供 Emby 识别媒体信息。
-
-        Args:
-            base_url: 直链基地址
-            filename: 文件名（保持原始，不编码）
-            pick_code: 115 文件的 pickcode
-
-        Returns:
-            完整直链 URL
         """
         return f"{base_url.rstrip('/')}/d115/{filename}?pickcode={pick_code}"
 
@@ -670,7 +636,7 @@ class StrmService:
         1. 读取并校验 cloud_output_path 配置
         2. 读取 media_library_path 配置
         3. 解析 media_library_path 为 cid
-        4. 递归遍历云盘目录（用 fs_files 列表 API，不依赖下载接口）
+        4. 通过 export_dir 遍历云盘目录（带完整路径）
         5. 对每个视频文件生成 STRM 文件
 
         Returns:
@@ -699,13 +665,20 @@ class StrmService:
         if not accessible or not self._is_path_authorized(cloud_output_path, accessible):
             raise PathNotAuthorizedError(cloud_output_path, "云盘 STRM 输出")
 
-        # 读取媒体库路径
+        # 读取媒体库路径和选择目录时保存的 cid。
+        # 不再优先用路径反查 cid，因为 115 的 getid/fs_files 接口在部分账号下会 405。
         media_library_path = self.config_service.get("media_library_path") or ""
+        media_library_cid = (self.config_service.get("media_library_cid") or "").strip()
 
-        # 解析 media_library_path 为 cid
-        root_cid = self._resolve_cid_by_path(media_library_path)
-        if root_cid is None:
-            raise ConfigError(f"云盘媒体库路径不存在: {media_library_path}，请先在设置页配置媒体库路径")
+        if media_library_cid:
+            try:
+                root_cid = int(media_library_cid)
+            except ValueError:
+                raise ConfigError(f"云盘媒体库 CID 无效：{media_library_cid}，请在设置页重新选择一次媒体库路径")
+        else:
+            root_cid = self._resolve_cid_by_path(media_library_path)
+            if root_cid is None:
+                raise ConfigError(f"云盘媒体库路径缺少目录 CID：{media_library_path}，请在设置页重新选择一次媒体库路径")
 
         output_root = Path(cloud_output_path)
 
@@ -723,12 +696,13 @@ class StrmService:
         skipped = 0
         errors: List[Dict] = []
 
-        # 递归遍历云盘目录（用 fs_files 列表 API，不依赖 download_files_app）
+        # 遍历云盘目录（iter_files_with_path_skim 一次拉取 name/pickcode/path）
         for file_row in self._iter_cloud_files_with_path(root_cid, media_library_path):
             name = file_row.get("name", "")
             pick_code = file_row.get("pick_code", "")
             file_path = file_row.get("path", "")
 
+            # pickcode 必须有，直链用它定位文件
             if not name or not pick_code or not file_path:
                 skipped += 1
                 continue

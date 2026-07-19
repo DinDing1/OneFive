@@ -271,6 +271,10 @@ class TelegramChannel(NotificationChannel):
 
     async def send_message(self, message: str, image_url: Optional[str] = None) -> bool:
         """发送消息（Bot 发给管理员，User 发给通知目标）"""
+        if not await self.is_enabled():
+            logger.info("Telegram 未启用，跳过发送")
+            return False
+
         await self._ensure_all()
         sent = False
 
@@ -335,6 +339,15 @@ class TelegramChannel(NotificationChannel):
         return self._cfg(CFG_ENABLED) in ("true", "1", "True")
 
     async def connect(self) -> bool:
+        """手动连接 Telegram
+
+        总开关未启用时直接拒绝连接，避免用户只是查看状态或误点连接时，
+        触发 Telethon 连接代理、注册 Bot 事件等副作用。
+        """
+        if not await self.is_enabled():
+            logger.info("Telegram 未启用，跳过连接")
+            return False
+
         self._bot_client = None
         self._user_client = None
         self._bot_connected = False
@@ -432,6 +445,9 @@ class TelegramChannel(NotificationChannel):
             return {"success": False, "message": f"登录失败: {str(e)}"}
 
     async def check_login(self) -> Dict[str, Any]:
+        if not await self.is_enabled():
+            return {"logged_in": False, "message": "Telegram 未启用"}
+
         session_string = self._cfg(CFG_SESSION)
         api_id = self._cfg(CFG_API_ID)
         api_hash = self._cfg(CFG_API_HASH)
@@ -502,15 +518,21 @@ class TelegramChannel(NotificationChannel):
         }
         credential_keys = {CFG_BOT_TOKEN, CFG_API_ID, CFG_API_HASH, CFG_SESSION, CFG_PROXY_ENABLED, CFG_PROXY_URL}
         need_reconnect = False
+        disabled = False
         for key, value in settings.items():
             if key in labels:
                 old_val = cfg.get(key) or ""
                 new_val = str(value)
                 if old_val != new_val:
                     cfg.set(key, new_val, labels[key])
+                    if key == CFG_ENABLED and new_val not in ("true", "1", "True"):
+                        disabled = True
                     if key in credential_keys:
                         need_reconnect = True
-        if need_reconnect:
+        if disabled:
+            logger.info("Telegram 已关闭，断开现有连接")
+            await self.disconnect()
+        elif need_reconnect:
             logger.info("凭据变更，断开连接以便重连")
             await self.disconnect()
 
@@ -538,9 +560,20 @@ class TelegramChannel(NotificationChannel):
         }
 
     async def get_connection_info(self) -> Dict[str, Any]:
+        """获取连接详情
+
+        状态查询必须是只读操作。未启用 Telegram 时直接返回 get_status()，
+        不能调用 _ensure_all()，否则会在打开页面/刷新状态时偷偷连接代理和 Bot。
+        """
         status = self.get_status()
         bot_name = ""
         user_name = ""
+
+        if not await self.is_enabled():
+            status["bot_name"] = bot_name
+            status["user_name"] = user_name
+            return status
+
         try:
             await self._ensure_all()
             if self._bot_client and self._bot_connected:

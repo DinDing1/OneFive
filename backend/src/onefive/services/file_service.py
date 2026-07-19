@@ -8,7 +8,7 @@
 使用 p115client.tool 工具函数而非直接调用 client 方法，因为：
 - tool 函数内部处理了批量、错误重试等逻辑
 - batch_move/batch_copy/batch_delete 自动按 batch_size=1000 分批执行
-- iter_files/iter_dirs 支持目录树遍历
+- fs_files_iter 支持自动分页目录列表
 - list_files 例外：直接调用 client.fs_files 原生 API 以保证分页语义准确
 """
 import time
@@ -17,9 +17,7 @@ from typing import Optional, Dict, Any, List
 from p115client import P115Client, P115OpenClient
 from p115client.exception import P115BusyOSError
 from p115client.tool import (
-    iter_files,
-    iter_dirs,
-    iter_fs_files,
+    fs_files_iter,
     get_info,
     get_path,
     batch_move,
@@ -28,10 +26,9 @@ from p115client.tool import (
     makedir,
     update_name,
 )
+from p115client.tool.iterdir import iter_files_with_path_skim
 
-from .auth_service import get_auth_service
-from .token_service import get_token_service
-from ..exceptions import NotLoggedInError
+from .p115_client_factory import get_p115_client_factory
 from ..logger import get_logger
 
 logger = get_logger(__name__)
@@ -45,33 +42,13 @@ class FileService:
     """
 
     def __init__(self):
-        self.auth_service = get_auth_service()
-        self.token_service = get_token_service()
-
-    def _get_client_app(self) -> str:
-        """根据登录设备类型返回 P115Client 初始化的 app 参数
-
-        app 值必须与扫码登录时选择的设备类型一致，否则会报 errno:99 "请重新登录"。
-        仅用于 P115Client(cookies, app=...) 的初始化，决定请求头和身份标识。
-
-        映射规则：
-        - android 系设备（android/115android/qandroid/tv/harmony）→ "android"
-        - ios 系设备（ios/115ios/115ipad/wechatmini/alipaymini）→ "ios"
-        - web 及其他 → "web"
-        """
-        from .config_service import get_config_service
-        login_device = get_config_service().get("login_device") or "web"
-        if login_device in ("android", "115android", "qandroid", "tv", "harmony"):
-            return "android"
-        if login_device in ("ios", "115ios", "115ipad", "wechatmini", "alipaymini"):
-            return "ios"
-        return "web"
+        self.client_factory = get_p115_client_factory()
 
     @staticmethod
     def _get_tool_app() -> str:
         """返回 p115client tool 函数的 app 参数
 
-        p115client tool 函数（iter_fs_files/makedir/update_name 等）的 app 参数
+        p115client tool 函数（fs_files_iter/makedir/update_name 等）的 app 参数
         决定走哪个 API 端点：
         - app="web" → 标准端点 fs_files/fs_mkdir/fs_rename（稳定可靠）
         - app="android" → 专用端点 fs_files_app(app="android")（部分返回 405）
@@ -94,21 +71,7 @@ class FileService:
 
         app 参数根据登录设备动态选择，保证与 cookie 身份一致。
         """
-        # 优先尝试 Open API（必须同时满足：开关启用 + token 有效）
-        if self.token_service.is_open_api_enabled():
-            access_token = self.token_service.get_access_token()
-            if access_token:
-                app_id = self.token_service.get_app_id()
-                return P115OpenClient(
-                    access_token=access_token,
-                    app_id=int(app_id) if app_id else 0,
-                )
-
-        # 回退 Web API：app 值必须与登录设备匹配，否则报 errno:99
-        cookies = self.auth_service.get_cookies()
-        if not cookies:
-            raise NotLoggedInError("未登录，请先扫码登录")
-        return P115Client(cookies, app=self._get_client_app())
+        return self.client_factory.create_client()
 
     def _call_with_fallback(self, method_name: str, client, *args, **kwargs):
         """调用 client 方法，Open API 失败时自动回退 Web API
@@ -135,10 +98,7 @@ class FileService:
         except Exception as e:
             if isinstance(client, P115OpenClient):
                 logger.warning(f"Open API {method_name} 调用失败，回退 Web API: {e}")
-                cookies = self.auth_service.get_cookies()
-                if not cookies:
-                    raise NotLoggedInError("未登录，请先扫码登录") from e
-                web_client = P115Client(cookies, app=self._get_client_app())
+                web_client = self.client_factory.create_web_client()
                 return getattr(web_client, method_name)(*args, **kwargs)
             raise
 
@@ -390,14 +350,13 @@ class FileService:
     def iter_all_files(self, cid: int = 0) -> List[Dict[str, Any]]:
         """自动分页遍历目录下全部文件（含子目录中的文件）
 
-        使用 p115client.tool.iter_fs_files，自动分页、自带 P115BusyOSError 重试。
+        使用 p115client.tool.fs_files_iter，自动分页、自带 P115BusyOSError 重试。
         替代手动 limit+offset 分页，避免大目录文件遗漏。
 
         注意：
-        - iter_fs_files 每次迭代返回一整页响应（含 data/count/cid 等），
+        - fs_files_iter 每次迭代返回一整页响应（含 data/count/cid 等），
           需要从 page["data"] 提取文件列表，而非把整页当作单个文件
         - 只返回当前目录直属文件，不递归子目录
-        - 如需递归整个目录树，请用 iter_files 方法
         - 用 max_workers=0 强制串行拉取，避免并发请求触发 115 风控返回 401
 
         Args:
@@ -408,45 +367,54 @@ class FileService:
         """
         client = self._get_client()
         result = []
-        # max_workers=0 用串行版本 iter_fs_files_serialized，避免并发风控
-        for page in iter_fs_files(client, cid, app=self._get_tool_app(), max_workers=0):
+        # max_workers=0 强制串行拉取，避免并发请求触发 115 风控
+        for page in fs_files_iter(client, cid, app=self._get_tool_app(), max_workers=0):
             for f in page.get("data", []):
                 result.append(self._parse_file_item(f))
         return result
 
-    def iter_files(self, cid: int = 0) -> List[Dict[str, Any]]:
-        """递归遍历目录树，获取所有文件
+    def iter_all_files_strm(self, cid: int = 0) -> List[Dict[str, Any]]:
+        """使用 p115client.tool.iterdir.iter_files_with_path_skim 遍历云盘 STRM 文件
 
-        使用 p115client.tool.iter_files。
-        注意：大目录可能耗时较长。
-
-        Args:
-            cid: 目录 ID，0 表示根目录
-
-        Returns:
-            文件信息列表
+        该函数通过下载清单接口一次返回 name/pickcode/path，适合生成云盘 STRM。
+        需要 P115Client（Web Cookie），OpenAPI 客户端不支持。
         """
         client = self._get_client()
-        result = []
-        for f in iter_files(client, cid):
-            result.append(self._parse_file_item(f))
-        return result
+        if not isinstance(client, P115Client):
+            raise RuntimeError("iter_files_with_path_skim 需要 P115Client，请关闭 OpenAPI 后重试")
 
-    def iter_dirs(self, cid: int = 0) -> List[Dict[str, Any]]:
-        """递归遍历目录树，获取所有目录
-
-        使用 p115client.tool.iter_dirs。
-
-        Args:
-            cid: 目录 ID，0 表示根目录
-
-        Returns:
-            目录信息列表
-        """
-        client = self._get_client()
-        result = []
-        for d in iter_dirs(client, cid):
-            result.append(self._parse_file_item(d))
+        result: List[Dict[str, Any]] = []
+        # max_workers=0 强制串行，降低并发风控概率
+        app = "chrome"
+        logger.info(
+            f"云盘 STRM 使用 iter_files_with_path_skim: cid={cid}, "
+            f"client={type(client).__name__}, app={app}"
+        )
+        for item in iter_files_with_path_skim(
+            client,
+            cid,
+            escape=None,
+            max_workers=0,
+            app=app,
+        ):
+            name = item.get("name", "") or item.get("file_name", "")
+            pick_code = item.get("pickcode", "") or item.get("pick_code", "")
+            path = str(item.get("path") or item.get("relpath") or name).strip("/")
+            if not name or not pick_code or not path:
+                continue
+            result.append({
+                "file_id": str(item.get("id") or item.get("file_id") or ""),
+                "name": name,
+                "is_dir": False,
+                "size": int(item.get("size") or item.get("file_size") or 0),
+                "file_type": item.get("file_type") or 0,
+                "pick_code": pick_code,
+                "parent_id": str(item.get("parent_id") or "0"),
+                "created_at": str(item.get("created_at") or ""),
+                "updated_at": str(item.get("updated_at") or ""),
+                "path": path,
+            })
+        logger.info(f"云盘 STRM iter_files_with_path_skim 完成: cid={cid}, files={len(result)}")
         return result
 
     # ==================== 批量操作 ====================

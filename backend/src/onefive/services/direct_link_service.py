@@ -59,11 +59,13 @@
 - receive_code（提取码）可省略，p115nano302 会自动获取
 - 文件名中的特殊字符（如中文、冒号）会被浏览器自动 URL 编码
 - 302 重定向目标为 115 CDN，有有效期（通常 2-4 小时）
-- p115nano302 内置 URL 缓存（cache_url=True），相同请求不会重复调用 API
+- p115nano302 内置内存 URL 缓存（cache_url=True，进程内 L1）
+- OneFive 额外提供 SQLite 持久化缓存（L2）：有效期内直接 302，跨重启复用，降低 115 风控风险
 ============================================================================
 """
 import threading
-from typing import Optional
+from typing import Optional, Dict, Any
+from urllib.parse import parse_qs
 
 import uvicorn
 
@@ -73,6 +75,166 @@ from time import time as _time
 from ..logger import get_logger
 
 logger = get_logger(__name__)
+
+
+class DirectLinkDbCacheMiddleware:
+    """ASGI 中间件：直链 URL 的 SQLite 持久化缓存（L2）
+
+    流程：
+    1. 解析请求中的 pickcode / id / share_code / sha1
+    2. 若缓存命中且未过期 → 直接 302 到 CDN，不请求 115
+    3. 未命中 → 交给 p115nano302；若响应 302，将 Location 写入数据库
+
+    放在 PathStripMiddleware 内侧，看到的是剥离 /d115 后的路径。
+    """
+
+    def __init__(self, app):
+        self.app = app
+
+    @staticmethod
+    def _header_value(headers, name: bytes) -> str:
+        name_l = name.lower()
+        for k, v in headers or []:
+            if k.lower() == name_l:
+                try:
+                    return v.decode("latin-1")
+                except Exception:
+                    return v.decode("utf-8", errors="ignore")
+        return ""
+
+    @staticmethod
+    def _parse_request(scope) -> Dict[str, Any]:
+        """从 ASGI scope 提取缓存相关参数"""
+        qs = scope.get("query_string", b"") or b""
+        try:
+            q = parse_qs(qs.decode("latin-1"), keep_blank_values=True)
+        except Exception:
+            q = {}
+
+        def first(key: str) -> str:
+            vals = q.get(key) or []
+            return (vals[0] if vals else "").strip()
+
+        pickcode = first("pickcode")
+        file_id = first("id")
+        share_code = first("share_code")
+        sha1 = first("sha1")
+        refresh = first("refresh") in ("1", "true", "True", "yes")
+
+        # 兼容 ?2691590992858971545 这种纯 id 查询
+        if not any((pickcode, file_id, share_code, sha1)):
+            raw = qs.decode("latin-1", errors="ignore")
+            # 取第一个非空 token（去掉 =value）
+            token = raw.split("&")[0].split("=")[0].strip()
+            if token.isdigit():
+                file_id = token
+
+        # User-Agent
+        headers = scope.get("headers") or []
+        user_agent = ""
+        for k, v in headers:
+            if k.lower() == b"user-agent":
+                try:
+                    user_agent = v.decode("latin-1")
+                except Exception:
+                    user_agent = v.decode("utf-8", errors="ignore")
+                break
+
+        return {
+            "pickcode": pickcode,
+            "file_id": file_id,
+            "share_code": share_code,
+            "sha1": sha1,
+            "refresh": refresh,
+            "user_agent": user_agent,
+            "path": scope.get("path", ""),
+        }
+
+    @staticmethod
+    async def _send_redirect(send, url: str, cache_status: str = "HIT"):
+        # CDN URL 一般为 ASCII；兜底用 utf-8 + latin-1 兼容
+        try:
+            loc = url.encode("latin-1")
+        except UnicodeEncodeError:
+            loc = url.encode("utf-8")
+        await send({
+            "type": "http.response.start",
+            "status": 302,
+            "headers": [
+                (b"location", loc),
+                (b"content-length", b"0"),
+                (b"cache-control", b"no-store"),
+                (b"x-onefive-cache", cache_status.encode("ascii")),
+            ],
+        })
+        await send({"type": "http.response.body", "body": b"", "more_body": False})
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        from .direct_link_cache_service import get_direct_link_cache_service
+
+        cache = get_direct_link_cache_service()
+        req = self._parse_request(scope)
+        base_params = {
+            "pickcode": req["pickcode"],
+            "file_id": req["file_id"],
+            "share_code": req["share_code"],
+            "sha1": req["sha1"],
+        }
+
+        # 有可识别键且非 refresh 时尝试命中缓存
+        can_cache = any(base_params.values()) and not req["refresh"]
+        if can_cache:
+            cached_url = cache.get_valid_url(
+                user_agent=req["user_agent"],
+                **base_params,
+            )
+            if cached_url:
+                logger.info(
+                    f"[直链缓存 HIT] path={req['path']} "
+                    f"pickcode={req['pickcode'] or '-'} id={req['file_id'] or '-'} "
+                    f"share={req['share_code'] or '-'}"
+                )
+                await self._send_redirect(send, cached_url, "HIT")
+                return
+
+        # 未命中：透传并捕获 302 Location
+        captured: Dict[str, Any] = {"status": 0, "location": ""}
+
+        async def send_wrapper(message):
+            if message["type"] == "http.response.start":
+                captured["status"] = message.get("status", 0)
+                if captured["status"] in (301, 302, 303, 307, 308):
+                    headers = list(message.get("headers") or [])
+                    loc = self._header_value(headers, b"location")
+                    if loc:
+                        captured["location"] = loc
+                        # 附加缓存标记，便于排查
+                        headers.append((b"x-onefive-cache", b"MISS"))
+                        message = {**message, "headers": headers}
+            await send(message)
+
+        await self.app(scope, receive, send_wrapper)
+
+        # 将新直链写入数据库
+        location = captured.get("location") or ""
+        if can_cache and captured.get("status") in (301, 302, 303, 307, 308) and location:
+            # Location 可能是相对路径，忽略非 http(s)
+            if location.startswith("http://") or location.startswith("https://"):
+                ok = cache.set_url(
+                    url=location,
+                    user_agent=req["user_agent"],
+                    **base_params,
+                )
+                if ok:
+                    logger.info(
+                        f"[直链缓存 STORE] path={req['path']} "
+                        f"pickcode={req['pickcode'] or '-'} id={req['file_id'] or '-'} "
+                        f"share={req['share_code'] or '-'}"
+                    )
 
 
 class PathStripMiddleware:
@@ -204,11 +366,27 @@ class DirectLinkService:
         try:
             import p115nano302
 
-            # 创建 ASGI 应用（启用 URL 缓存）
+            # 创建 ASGI 应用（启用内存 URL 缓存 L1）
             nano_app = p115nano302.make_application(cookies, cache_url=True)
 
-            # 包裹路径前缀中间件，剥离 /d115 前缀
-            app = PathStripMiddleware(nano_app, prefix="/d115")
+            # 启动时清理过期 DB 缓存
+            try:
+                from .direct_link_cache_service import get_direct_link_cache_service
+                cleaned = get_direct_link_cache_service().cleanup_expired()
+                stats = get_direct_link_cache_service().stats()
+                logger.info(
+                    f"直链 DB 缓存就绪: 清理过期 {cleaned} 条, "
+                    f"有效 {stats.get('valid', 0)}/{stats.get('total', 0)}"
+                )
+            except Exception as e:
+                logger.warning(f"直链 DB 缓存初始化失败（不影响服务启动）: {e}")
+
+            # 中间件由内到外：
+            # p115nano302 → DB 缓存(L2) → 路径前缀剥离/日志
+            app = PathStripMiddleware(
+                DirectLinkDbCacheMiddleware(nano_app),
+                prefix="/d115",
+            )
 
             # 清除停止标志
             self._stopping.clear()

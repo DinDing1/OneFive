@@ -42,6 +42,7 @@ class SettingsRequest(BaseModel):
     tmdb_api_url: Optional[str] = None
     tmdb_language: Optional[str] = None
     media_library_path: Optional[str] = None
+    media_library_cid: Optional[str] = None
     source_path: Optional[str] = None
     movie_template: Optional[str] = None
     tv_template: Optional[str] = None
@@ -168,6 +169,7 @@ async def get_settings():
             "tmdb_api_url": config_service.get("tmdb_api_url") or "https://api.themoviedb.org/3",
             "tmdb_language": config_service.get("tmdb_language") or "zh-CN",
             "media_library_path": config_service.get("media_library_path") or "/媒体库",
+            "media_library_cid": config_service.get("media_library_cid") or "",
             "source_path": config_service.get("source_path") or "",
             "movie_template": movie_tpl,
             "tv_template": tv_tpl,
@@ -195,6 +197,8 @@ async def update_settings(req: SettingsRequest):
         config_service.set("tmdb_language", req.tmdb_language, "TMDB 语言")
     if req.media_library_path is not None:
         config_service.set("media_library_path", req.media_library_path, "媒体库根目录")
+    if req.media_library_cid is not None:
+        config_service.set("media_library_cid", req.media_library_cid, "媒体库根目录 CID")
     if req.source_path is not None:
         config_service.set("source_path", req.source_path, "保存路径")
     if req.movie_template is not None:

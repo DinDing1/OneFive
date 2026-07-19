@@ -43,12 +43,16 @@ export interface ShareFile {
   // 联表查询时附带的信息
   file_count?: number
   share_name?: string
+  link_valid?: number
 }
 
 /** 分享文件列表响应（listFiles 专用：含 items + count） */
 export interface ShareFileListResponse {
   items: ShareFile[]
-  count: number
+  total: number
+  count?: number
+  limit?: number
+  offset?: number
 }
 
 export const shareApi = {
@@ -73,8 +77,19 @@ export const shareApi = {
   },
 
   /** 列出分享来源 */
-  listShares(): Promise<ApiResult<{ shares: ShareSource[] }>> {
-    return api.get('/share/list')
+  listShares(params: { limit?: number; offset?: number } = {}): Promise<ApiResult<{
+    shares: ShareSource[]
+    total: number
+    limit?: number
+    offset?: number
+  }>> {
+    const { limit, offset = 0 } = params
+    return api.get('/share/list', {
+      params: {
+        ...(limit != null ? { limit } : {}),
+        offset,
+      },
+    })
   },
 
   /** 检测单个分享链接有效性 */
@@ -113,9 +128,40 @@ export const shareApi = {
     return api.put(`/share/${sourceId}/files/${fileId}/category`, { category })
   },
 
-  /** 获取所有分享的根目录文件 */
-  getAllFiles(organizedOnly: boolean = false, unorganizedOnly: boolean = false): Promise<ApiResult<{ files: ShareFile[] }>> {
-    return api.get('/share/all-files', { params: { organized_only: organizedOnly, unorganized_only: unorganizedOnly } })
+  /** 分页获取所有分享根目录文件（3 万+ 规模必须分页） */
+  getAllFiles(params: {
+    filter?: 'all' | 'organized' | 'unorganized' | 'valid' | 'invalid'
+    limit?: number
+    offset?: number
+    includeCounts?: boolean
+  } = {}): Promise<ApiResult<{
+    files: ShareFile[]
+    total: number
+    limit: number
+    offset: number
+    filter?: string
+    counts?: {
+      all_count: number
+      organized_count: number
+      unorganized_count: number
+      valid_count: number
+      invalid_count: number
+    }
+  }>> {
+    const {
+      filter = 'all',
+      limit = 50,
+      offset = 0,
+      includeCounts = true,
+    } = params
+    return api.get('/share/all-files', {
+      params: {
+        filter,
+        limit,
+        offset,
+        include_counts: includeCounts,
+      },
+    })
   },
 
   /** 获取指定分享目录下的文件 */
@@ -123,14 +169,74 @@ export const shareApi = {
     return api.get(`/share/${sourceId}/files`, { params: { parent_id: parentId, limit, offset } })
   },
 
-  /** 获取所有分享的已整理文件（构建虚拟目录树用） */
-  getAllOrganized(): Promise<ApiResult<any>> {
-    return api.get('/share/all-organized')
+  /**
+   * 服务端分页浏览整理视图虚拟目录
+   * path: category/organized_dir 前缀，空=根
+   */
+  browseOrganized(params: {
+    path?: string
+    limit?: number
+    offset?: number
+  } = {}): Promise<ApiResult<{
+    path: string
+    entries: Array<{
+      name: string
+      path: string
+      is_dir: number
+      file_count?: number
+      total_size?: number
+      file?: ShareFile
+    }>
+    total: number
+    dir_count: number
+    file_count: number
+    limit: number
+    offset: number
+  }>> {
+    return api.get('/share/organized-browse', {
+      params: {
+        path: params.path ?? '',
+        limit: params.limit ?? 50,
+        offset: params.offset ?? 0,
+      },
+    })
   },
 
-  /** 搜索分享文件 */
-  searchFiles(keyword: string): Promise<ApiResult<{ files: ShareFile[] }>> {
-    return api.get('/share/search', { params: { keyword } })
+  /**
+   * 分页搜索分享文件
+   * scope: all | organized | original
+   */
+  searchFiles(
+    keyword: string,
+    options: { limit?: number; offset?: number; scope?: 'all' | 'organized' | 'original' } = {}
+  ): Promise<ApiResult<{
+    files: ShareFile[]
+    total: number
+    limit: number
+    offset: number
+    keyword: string
+    scope: string
+    engine?: string
+  }>> {
+    return api.get('/share/search', {
+      params: {
+        keyword,
+        limit: options.limit ?? 50,
+        offset: options.offset ?? 0,
+        scope: options.scope ?? 'all',
+      },
+    })
+  },
+
+  /** 自底向上重算目录已整理标记（修复脏数据） */
+  recomputeOrganized(sourceId?: number): Promise<ApiResult<{
+    sources: number
+    checked_dirs: number
+    changed_dirs: number
+  }>> {
+    return api.post('/share/recompute-organized', null, {
+      params: sourceId != null ? { source_id: sourceId } : {},
+    })
   },
 
   /** 批量整理 */

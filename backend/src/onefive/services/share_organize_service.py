@@ -270,8 +270,11 @@ class ShareOrganizeService:
                 progress_cb=progress_cb, loop=loop
             )
 
-        # 单文件：整理并发送通知
+        # 单文件：整理并发送通知；成功后同步祖先目录 organized 状态
         result = self._organize_single_file(source_id, file_id, file_info["name"], share_service, tmdb_cache, file_info.get("size", 0))
+        if result.get("success"):
+            self._sync_parent_organized_state(source_id, file_id, share_service)
+            share_service.db.commit()
         self._send_single_file_notify(file_info["name"], result, loop=loop)
         return result
 
@@ -283,14 +286,14 @@ class ShareOrganizeService:
                            progress_cb: Optional[Callable[[str, Dict[str, Any]], None]] = None,
                            loop: Optional[asyncio.AbstractEventLoop] = None,
                            is_root: bool = True) -> Dict[str, Any]:
-        """递归整理目录内的所有文件，并标记目录为已整理
+        """递归整理目录内的所有文件，并按完整度更新目录 organized 状态
 
         仅在最顶层目录整理完成后发送一条汇总通知（包含集数范围）。
         子目录递归时 send_notify=False，避免嵌套目录发送多条通知。
         progress_cb：每整理完一个子文件（非子目录）时回调，用于流式进度推送。
         loop: 主线程事件循环，透传给 _send_directory_notify，支持子线程通知。
-        is_root: 是否为最外层目录整理调用。True 时在标记目录 organized=1 后
-            统一 commit；False（递归子目录）时不 commit，由根目录统一提交，
+        is_root: 是否为最外层目录整理调用。True 时在更新目录 organized 状态后
+            统一 commit，并同步祖先目录；False（递归子目录）时不 commit，由根目录统一提交，
             避免嵌套目录每层都 commit 触发多次 fsync。
         """
         dir_info = share_service.get_file(source_id, dir_file_id)
@@ -319,15 +322,26 @@ class ShareOrganizeService:
         results = []
         success_count = 0
 
-        # 分离子目录和视频文件
+        # 分离子目录 / 视频文件 / 非视频附属文件
+        # 目录“是否已整理”只由子目录 + 视频文件决定；nfo/srt/jpg 等附属文件不参与判定，
+        # 避免附属文件识别失败或永远 organized=0 把整棵树卡在未整理/误标已整理。
         sub_dirs = []
         video_files = []
+        other_files = []
         for file_row in files:
             file_row = dict(file_row)
             if file_row["is_dir"]:
                 sub_dirs.append(file_row)
-            else:
+            elif self._is_video_file(file_row["name"]):
                 video_files.append(file_row)
+            else:
+                other_files.append(file_row)
+
+        if other_files:
+            logger.debug(
+                f"[跳过非视频文件] dir={dir_name}, count={len(other_files)}, "
+                f"samples={[f['name'] for f in other_files[:5]]}"
+            )
 
         # 批量整理视频文件（同一部剧只查询一次 TMDB，优化整理速度）
         if video_files:
@@ -362,7 +376,10 @@ class ShareOrganizeService:
                 )
             except Exception as e:
                 logger.error(f"[子目录整理失败] name={fname}, file_id={fid}, error={e}")
-                sub = {"success": False, "error": str(e), "name": fname, "file_id": fid}
+                sub = {
+                    "success": False, "error": str(e), "name": fname, "file_id": fid,
+                    "is_directory": True, "total": 0, "organized_count": 0, "failed_count": 1,
+                }
             results.append(sub)
             if sub.get("success"):
                 success_count += 1
@@ -372,23 +389,34 @@ class ShareOrganizeService:
                 f"failed_count={sub.get('failed_count')}"
             )
 
-        # 标记当前目录为已整理
+        # 仅统计需要整理的子项：视频 + 子目录（nfo/srt 等不计入）
+        required_total = len(video_files) + len(sub_dirs)
+        failed_count = max(0, required_total - success_count)
+        # 空目录 / 仅附属文件：无 required 子项视为空完成（organized=1）
+        # 有 required 子项时：全部成功才为 1。
+        if required_total == 0:
+            dir_fully_organized = True
+        else:
+            dir_fully_organized = failed_count == 0
+
         share_service.db.execute(
-            "UPDATE share_file SET organized = 1, updated_at = datetime('now', 'localtime') WHERE source_id = ? AND file_id = ?",
-            (source_id, dir_file_id)
+            "UPDATE share_file SET organized = ?, updated_at = datetime('now', 'localtime') "
+            "WHERE source_id = ? AND file_id = ?",
+            (1 if dir_fully_organized else 0, source_id, dir_file_id)
         )
         # 只有根目录整理完才 commit，子目录递归时由根目录统一提交，避免每层 commit 触发多次 fsync
         if is_root:
             share_service.db.commit()
-            # 用户逐一整理子目录后，检查父目录是否所有子项都已整理，
-            # 如果是则自动标记父目录为已整理（递归向上）
-            self._mark_parent_organized_if_complete(source_id, dir_file_id, share_service)
+            # 根据当前子树完整度同步祖先目录 organized 状态（可置 1 也可回退为 0）
+            self._sync_parent_organized_state(source_id, dir_file_id, share_service)
             share_service.db.commit()
 
-        total = len(files)
+        total = required_total
         logger.info(
-            f"[目录整理完成] dir_name={dir_name}, total={total}, "
-            f"success_count={success_count}, failed_count={max(0, total - success_count)}"
+            f"[目录整理完成] dir_name={dir_name}, required_total={required_total}, "
+            f"videos={len(video_files)}, sub_dirs={len(sub_dirs)}, skipped_other={len(other_files)}, "
+            f"success_count={success_count}, failed_count={failed_count}, "
+            f"dir_organized={dir_fully_organized}"
         )
 
         # 仅在顶层目录发送一条汇总通知，子目录递归时不发通知
@@ -396,49 +424,161 @@ class ShareOrganizeService:
             self._send_directory_notify(dir_name, results, success_count, loop=loop)
 
         return {
-            "success": True, "is_directory": True,
+            "success": dir_fully_organized,
+            "is_directory": True,
             "total": total,
             "organized_count": success_count,
-            "failed_count": max(0, total - success_count),
-            "direct_children": total,
+            "failed_count": failed_count,
+            "direct_children": len(files),
+            "skipped_other": len(other_files),
+            "dir_organized": dir_fully_organized,
             "results": results,
         }
 
-    def _mark_parent_organized_if_complete(self, source_id: int, child_file_id: str,
-                                            share_service) -> None:
-        """检查父目录的所有子项是否都已整理，如果是则标记父目录为已整理（递归向上）
 
-        场景：用户逐一整理子目录后，父目录自动标记为已整理。
-        当父目录的所有子项（文件和子目录）organized=1 时，标记父目录 organized=1，
-        并继续向上检查父目录的父目录。
+    def _sync_parent_organized_state(self, source_id: int, child_file_id: str,
+                                       share_service) -> None:
+        """根据子项完整度同步父目录 organized 状态，并递归向上。
+
+        判定规则（与 _organize_directory 一致）：
+        - 只关心子目录 + 视频文件（nfo/srt/海报等附属文件忽略）
+        - 全部 required 子项 organized=1 → 父目录 organized=1
+        - 任一 required 子项未整理 → 父目录 organized=0（回退误标）
+        - 无 required 子项时不改父目录状态
+
         """
-        # 获取当前文件/目录信息，找到 parent_id
         file_info = share_service.get_file(source_id, child_file_id)
         if not file_info:
             return
         parent_id = file_info.get("parent_id")
-        # parent_id 为 "0" 或空表示已到根目录，无需继续
         if not parent_id or parent_id == "0":
             return
 
-        # 检查父目录的所有子项是否都已整理
         siblings = share_service.db.fetchall(
-            "SELECT organized FROM share_file WHERE source_id = ? AND parent_id = ?",
+            "SELECT file_id, name, is_dir, organized FROM share_file "
+            "WHERE source_id = ? AND parent_id = ?",
             (source_id, parent_id)
         )
         if not siblings:
-            return  # 父目录无子项（不应该发生，但防御性处理）
+            return
 
-        # 如果所有子项都已整理，标记父目录为已整理
-        if all(s["organized"] == 1 for s in siblings):
+        required = []
+        for s in siblings:
+            s = dict(s)
+            if s.get("is_dir") or self._is_video_file(s.get("name") or ""):
+                required.append(s)
+
+        if not required:
+            return
+
+        fully = all(int(s.get("organized") or 0) == 1 for s in required)
+        parent_row = share_service.db.fetchone(
+            "SELECT organized FROM share_file WHERE source_id = ? AND file_id = ?",
+            (source_id, parent_id)
+        )
+        parent_org = int(parent_row["organized"] or 0) if parent_row else 0
+        target = 1 if fully else 0
+
+        if parent_org != target:
             share_service.db.execute(
-                "UPDATE share_file SET organized = 1, updated_at = datetime('now', 'localtime') "
-                "WHERE source_id = ? AND file_id = ? AND organized = 0",
-                (source_id, parent_id)
+                "UPDATE share_file SET organized = ?, updated_at = datetime('now', 'localtime') "
+                "WHERE source_id = ? AND file_id = ?",
+                (target, source_id, parent_id)
             )
-            logger.info(f"[父目录自动标记] source_id={source_id}, parent_id={parent_id}, 所有子项已整理")
-            # 递归检查父目录的父目录
-            self._mark_parent_organized_if_complete(source_id, parent_id, share_service)
+            logger.info(
+                f"[父目录状态同步] source_id={source_id}, parent_id={parent_id}, "
+                f"organized {parent_org} -> {target}, required={len(required)}, fully={fully}"
+            )
+
+        # 无论置 1 还是置 0，都继续向上，保证祖先目录与子树一致
+        self._sync_parent_organized_state(source_id, parent_id, share_service)
+
+    def recompute_directory_organized(self, source_id: Optional[int] = None) -> Dict[str, Any]:
+        """自底向上重算目录 organized 标记（修复历史脏数据）。
+
+        规则与整理时一致：目录下所有子目录 + 视频文件都 organized=1 时，
+        目录才为 1；否则为 0。附属非视频文件不参与判定。
+
+        Args:
+            source_id: 指定分享源；None 表示全库所有源。
+
+        Returns:
+            统计信息：checked_dirs / changed_dirs / sources
+        """
+        share_service = get_share_service()
+        if source_id is not None:
+            source_ids = [int(source_id)]
+        else:
+            rows = share_service.db.fetchall("SELECT DISTINCT source_id FROM share_file")
+            source_ids = [int(r["source_id"]) for r in rows]
+
+        checked = 0
+        changed = 0
+
+        for sid in source_ids:
+            # 深度优先：先处理深层目录
+            dirs = share_service.db.fetchall(
+                """
+                WITH RECURSIVE tree(file_id, depth) AS (
+                    SELECT file_id, 0 FROM share_file
+                    WHERE source_id = ? AND parent_id = '0' AND is_dir = 1
+                    UNION ALL
+                    SELECT f.file_id, t.depth + 1
+                    FROM share_file f
+                    JOIN tree t ON f.parent_id = t.file_id
+                    WHERE f.source_id = ? AND f.is_dir = 1
+                )
+                SELECT file_id, depth FROM tree ORDER BY depth DESC
+                """,
+                (sid, sid)
+            )
+            for d in dirs:
+                checked += 1
+                dir_id = d["file_id"]
+                children = share_service.db.fetchall(
+                    "SELECT name, is_dir, organized FROM share_file "
+                    "WHERE source_id = ? AND parent_id = ?",
+                    (sid, dir_id)
+                )
+                required = []
+                for c in children:
+                    c = dict(c)
+                    if c.get("is_dir") or self._is_video_file(c.get("name") or ""):
+                        required.append(c)
+
+                if required:
+                    fully = all(int(c.get("organized") or 0) == 1 for c in required)
+                    new_val = 1 if fully else 0
+                else:
+                    # 无视频也无子目录（空目录或仅附属文件）：空完成
+                    new_val = 1
+
+                cur = share_service.db.fetchone(
+                    "SELECT organized FROM share_file WHERE source_id = ? AND file_id = ?",
+                    (sid, dir_id)
+                )
+                cur_val = int(cur["organized"] or 0) if cur else 0
+                if cur_val != new_val:
+                    share_service.db.execute(
+                        "UPDATE share_file SET organized = ?, updated_at = datetime('now', 'localtime') "
+                        "WHERE source_id = ? AND file_id = ?",
+                        (new_val, sid, dir_id)
+                    )
+                    changed += 1
+
+            share_service.db.commit()
+            logger.info(
+                f"[重算 organized] source_id={sid}, dirs_checked={len(dirs)}"
+            )
+
+        logger.info(
+            f"[重算 organized 完成] sources={len(source_ids)}, checked_dirs={checked}, changed_dirs={changed}"
+        )
+        return {
+            "sources": len(source_ids),
+            "checked_dirs": checked,
+            "changed_dirs": changed,
+        }
 
     def _organize_batch_files(self, source_id: int, files: list, share_service,
                               tmdb_cache: Dict, forced_tmdb_id: int = 0,
@@ -760,26 +900,24 @@ class ShareOrganizeService:
             return {"success": False, "error": str(e), "size": file_size, "name": name, "file_id": file_id}
 
     def _count_dir_files(self, source_id: int, dir_file_id: str, share_service) -> int:
-        """统计目录下所有文件数（不含目录本身，含子目录内文件，单条 SQL）
+        """统计目录下视频文件数（不含目录本身，含子目录，单次递归查询）
 
-        用于流式整理时计算真实进度总数，避免文件夹只算 1 导致进度永远卡在 1/1。
-
-        优化：用 WITH RECURSIVE 一次查出所有后代文件数，避免递归 N+1 查询。
+        用于流式整理时计算真实进度总数。只计视频扩展名，与整理逻辑一致
+        （nfo/srt/海报等附属文件不参与整理进度）。
         """
-        row = share_service.db.fetchone(
-            """WITH RECURSIVE descendants(file_id) AS (
-                   SELECT file_id FROM share_file
+        rows = share_service.db.fetchall(
+            """WITH RECURSIVE descendants(file_id, name, is_dir) AS (
+                   SELECT file_id, name, is_dir FROM share_file
                    WHERE source_id = ? AND parent_id = ?
                    UNION ALL
-                   SELECT f.file_id FROM share_file f
+                   SELECT f.file_id, f.name, f.is_dir FROM share_file f
                    JOIN descendants d ON f.parent_id = d.file_id
                    WHERE f.source_id = ?
                )
-               SELECT COUNT(*) as cnt FROM share_file
-               WHERE file_id IN (SELECT file_id FROM descendants) AND is_dir = 0""",
+               SELECT name FROM descendants WHERE is_dir = 0""",
             (source_id, dir_file_id, source_id)
         )
-        return row["cnt"] if row else 0
+        return sum(1 for r in rows if self._is_video_file(r["name"] or ""))
 
     def manual_organize_file(self, source_id: int, file_id: str,
                              tmdb_id: int, media_type: str) -> Dict[str, Any]:
@@ -801,6 +939,9 @@ class ShareOrganizeService:
             file_info.get("size", 0), forced_tmdb_id=tmdb_id,
             forced_media_type=media_type
         )
+        if result.get("success"):
+            self._sync_parent_organized_state(source_id, file_id, share_service)
+            share_service.db.commit()
         self._send_single_file_notify(file_info["name"], result)
         return result
 

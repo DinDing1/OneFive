@@ -52,9 +52,8 @@ class ShareService:
 
         1. 解析 URL 提取 share_code 和 receive_code
         2. 调用 p115client share_iterdir 获取文件列表
-        3. 写入 share_source 和 share_file 表
+        3. 写入 share_source 和 share_file 表（单事务：成功才 commit，失败 rollback 全清）
         """
-        # 解析 URL
         info = parse_share_url(share_url)
         if not info:
             return {"success": False, "error": "不是有效的 115 分享链接"}
@@ -63,54 +62,49 @@ class ShareService:
         if not receive_code:
             receive_code = info.get("receive_code", "")
 
-        # 检查是否已存在
         existing = self.db.fetchone(
             "SELECT id FROM share_source WHERE share_code = ?", (share_code,)
         )
         if existing:
-            # 不暴露内部 source_id，避免泄漏内部 ID
             return {"success": False, "error": f"分享 {share_code} 已存在"}
 
-        # 调用 p115client 获取文件列表
         try:
             from p115client.tool import share_iterdir
-
-            # 复用 file_service._get_client()（统一 Open API 优先 + 动态 app）
             from .file_service import get_file_service
             client = get_file_service()._get_client()
 
-            # 获取根目录
             root_files = list(share_iterdir(client, share_code=share_code, receive_code=receive_code))
             if not root_files:
                 return {"success": False, "error": "分享链接无文件"}
 
-            # 写入 share_source
             root = root_files[0]
             share_name = root.get("name", "")
 
-            self.db.execute(
+            # 整棵树同一事务：不在中途 commit，避免半截孤儿数据
+            cursor = self.db.execute(
                 """INSERT INTO share_source (share_code, receive_code, share_name, share_url, source_type, status)
                    VALUES (?, ?, ?, ?, ?, 'parsed')""",
                 (share_code, receive_code, share_name, share_url, source_type)
             )
-            self.db.commit()
+            source_id = int(cursor.lastrowid or 0)
+            if not source_id:
+                row = self.db.fetchone(
+                    "SELECT id FROM share_source WHERE share_code = ?", (share_code,)
+                )
+                source_id = int(row["id"]) if row else 0
+            if not source_id:
+                raise RuntimeError("写入 share_source 后无法获取 source_id")
 
-            # 获取 source_id
-            source_row = self.db.fetchone("SELECT id FROM share_source WHERE share_code = ?", (share_code,))
-            source_id = source_row["id"]
-
-            # 写入根目录文件
+            # 子目录拉取失败会抛错，触发整体回滚
             self._insert_files(source_id, "0", root_files, share_code, receive_code, client)
 
-            # 统计文件数和总大小（仅统计文件，不包含目录）
             count_row = self.db.fetchone(
                 "SELECT COUNT(*) as cnt, COALESCE(SUM(size), 0) as total FROM share_file WHERE source_id = ? AND is_dir = 0",
                 (source_id,)
             )
-            file_count = count_row["cnt"]
-            total_size = count_row["total"]
+            file_count = count_row["cnt"] if count_row else 0
+            total_size = count_row["total"] if count_row else 0
 
-            # 更新 share_source 统计
             self.db.execute(
                 "UPDATE share_source SET file_count = ?, total_size = ? WHERE id = ?",
                 (file_count, total_size, source_id)
@@ -118,7 +112,6 @@ class ShareService:
             self.db.commit()
 
             logger.info(f"分享添加成功: {share_code} → source_id={source_id}, {file_count} 个文件")
-
             return {
                 "success": True,
                 "source_id": source_id,
@@ -130,32 +123,36 @@ class ShareService:
 
         except Exception as e:
             logger.error(f"解析分享链接失败: {e}")
-            # 清理可能的部分数据：同时清理 share_file 和 share_source，避免孤儿记录
+            try:
+                self.db.rollback()
+            except Exception:
+                pass
+            # 兜底：若曾被部分提交，按 share_code 清掉孤儿
             try:
                 row = self.db.fetchone(
                     "SELECT id FROM share_source WHERE share_code = ?", (share_code,)
                 )
                 if row:
-                    source_id = row["id"]
-                    self.db.execute("DELETE FROM share_file WHERE source_id = ?", (source_id,))
-                    self.db.execute("DELETE FROM share_source WHERE id = ?", (source_id,))
+                    sid = row["id"]
+                    self.db.execute("DELETE FROM share_file WHERE source_id = ?", (sid,))
+                    self.db.execute("DELETE FROM share_source WHERE id = ?", (sid,))
                     self.db.commit()
             except Exception as cleanup_err:
                 logger.warning(f"清理分享数据失败: {cleanup_err}")
-                self.db.rollback()
+                try:
+                    self.db.rollback()
+                except Exception:
+                    pass
             return {"success": False, "error": str(e)}
 
     def _insert_files(self, source_id: int, parent_id: str, files: list,
                       share_code: str, receive_code: str, client):
-        """递归写入目录和文件（当前层级用 executemany 批量插入，减少数据库往返）
+        """递归写入目录和文件（当前层级 executemany 批量插入）。
 
-        保留递归结构：目录需要在线获取子文件后递归处理。
-        每个层级内：先把所有文件收集到 batch 列表，用一次 executemany 插入，
-        再遍历目录递归获取子文件。
+        不在此 commit：由 add_share 统一提交。
+        任一子目录在线拉取失败会抛出异常，保证不会静默写入残缺树。
         """
-        # 收集当前层级的所有文件记录，准备批量插入
         batch = []
-        # 同时记录目录项，用于后续递归获取子文件
         dirs_to_recurse = []
         for f in files:
             file_id = str(f.get("id"))
@@ -169,7 +166,6 @@ class ShareService:
             if is_dir:
                 dirs_to_recurse.append((file_id, name))
 
-        # 当前层级批量插入（INSERT OR IGNORE 保证重复时不报错）
         if batch:
             self.db.executemany(
                 """INSERT OR IGNORE INTO share_file
@@ -178,7 +174,7 @@ class ShareService:
                 batch
             )
 
-        # 递归处理子目录：在线获取子文件后递归写入
+        errors: List[str] = []
         for file_id, name in dirs_to_recurse:
             try:
                 from p115client.tool import share_iterdir
@@ -189,16 +185,45 @@ class ShareService:
                 if children:
                     self._insert_files(source_id, file_id, children, share_code, receive_code, client)
             except Exception as e:
+                msg = f"{name}: {e}"
+                errors.append(msg)
                 logger.warning(f"获取子目录失败 ({name}): {e}")
 
-        # 不在此处 commit，由顶层 add_share 统一提交，避免每层递归多次 commit 影响性能
+        if errors:
+            preview = "; ".join(errors[:3])
+            more = f" 等{len(errors)}处" if len(errors) > 3 else ""
+            raise RuntimeError(f"获取子目录失败: {preview}{more}")
 
-    def list_shares(self) -> List[Dict]:
-        """列出所有分享来源"""
+    def list_shares(self, limit: Optional[int] = None, offset: int = 0) -> Dict:
+        """列出分享源（强制分页，默认 50/页）。
+
+        正式环境分享数可达数千，禁止 limit<=0 全量返回。
+        """
+        count_row = self.db.fetchone("SELECT COUNT(*) AS cnt FROM share_source")
+        total = int(count_row["cnt"]) if count_row else 0
+
+        lim = 50 if (limit is None or int(limit) <= 0) else min(int(limit), 500)
+        off = max(0, int(offset or 0))
         rows = self.db.fetchall(
-            "SELECT * FROM share_source ORDER BY created_at DESC"
+            """SELECT id, share_code, receive_code, share_name, share_url,
+                      source_type, file_count, total_size, status, link_valid,
+                      error_msg, created_at, updated_at
+               FROM share_source
+               ORDER BY created_at DESC
+               LIMIT ? OFFSET ?""",
+            (lim, off),
         )
-        return [dict(r) for r in rows]
+        return {
+            "shares": [dict(r) for r in rows],
+            "total": total,
+            "limit": lim,
+            "offset": off,
+        }
+
+    def has_any_share(self) -> bool:
+        """是否存在至少一个分享源（空态判断，O(1)）"""
+        row = self.db.fetchone("SELECT 1 AS ok FROM share_source LIMIT 1")
+        return bool(row)
 
     def check_link_valid(self, source_id: int) -> Dict[str, Any]:
         """检测单个分享链接是否有效
@@ -479,8 +504,7 @@ class ShareService:
                     WHERE source_id = ? AND parent_id = ?
                     UNION ALL
                     SELECT f.file_id FROM share_file f
-                    JOIN children c ON f.parent_id = c.file_id
-                    WHERE f.source_id = ?
+                    JOIN children c ON f.parent_id = c.file_id AND f.source_id = ?
                 )
                 UPDATE share_file SET
                    category = ?, updated_at = datetime('now', 'localtime')
@@ -514,19 +538,25 @@ class ShareService:
 
     def list_files(self, source_id: int, parent_id: str = "0",
                    limit: int = 100, offset: int = 0) -> Dict:
-        """列出分享目录内容"""
+        """列出分享目录内容（分页，JOIN 附带 share_name / link_valid）"""
         count_row = self.db.fetchone(
             "SELECT COUNT(*) as cnt FROM share_file WHERE source_id = ? AND parent_id = ?",
             (source_id, parent_id)
         )
-        total = count_row["cnt"]
+        total = int(count_row["cnt"]) if count_row else 0
 
         rows = self.db.fetchall(
-            """SELECT * FROM share_file
-               WHERE source_id = ? AND parent_id = ?
-               ORDER BY is_dir DESC, name ASC
+            """SELECT f.id, f.source_id, f.share_code, f.receive_code, f.file_id, f.parent_id,
+                      f.name, f.is_dir, f.size, f.sha1, f.media_type, f.title, f.year, f.tmdb_id,
+                      f.category, f.organized_dir, f.organized_name, f.organized,
+                      f.created_at, f.updated_at,
+                      s.share_name, s.file_count, s.link_valid
+               FROM share_file f
+               JOIN share_source s ON f.source_id = s.id
+               WHERE f.source_id = ? AND f.parent_id = ?
+               ORDER BY f.is_dir DESC, f.name ASC
                LIMIT ? OFFSET ?""",
-            (source_id, parent_id, limit, offset)
+            (source_id, parent_id, int(limit), max(0, int(offset)))
         )
 
         return {
@@ -536,142 +566,454 @@ class ShareService:
             "offset": offset,
         }
 
-    def get_organized_files(self, source_id: int) -> Dict:
-        """获取整理后的分类目录（仅文件，不包含目录）"""
-        # 已整理的文件，按 category 分组
-        rows = self.db.fetchall(
-            """SELECT * FROM share_file
-               WHERE source_id = ? AND organized = 1 AND category != '' AND is_dir = 0
-               ORDER BY category, name""",
-            (source_id,)
+    def get_root_file_counts(self) -> Dict[str, int]:
+        """根目录各筛选维度计数（单次聚合，O(根目录行数)）。
+
+        正式环境根目录可达数万，前端筛选角标不能再依赖全量列表本地 count。
+        """
+        row = self.db.fetchone(
+            """SELECT
+                   COUNT(*) AS all_count,
+                   COALESCE(SUM(CASE WHEN f.organized = 1 THEN 1 ELSE 0 END), 0) AS organized_count,
+                   COALESCE(SUM(CASE WHEN f.organized = 0 THEN 1 ELSE 0 END), 0) AS unorganized_count,
+                   COALESCE(SUM(CASE WHEN s.link_valid = 1 THEN 1 ELSE 0 END), 0) AS valid_count,
+                   COALESCE(SUM(CASE WHEN s.link_valid = 0 THEN 1 ELSE 0 END), 0) AS invalid_count
+               FROM share_file f
+               JOIN share_source s ON f.source_id = s.id
+               WHERE f.parent_id = '0'"""
         )
-
-        # 按 category 分组
-        categories = {}
-        for r in rows:
-            cat = r["category"]
-            if cat not in categories:
-                categories[cat] = {
-                    "path": cat,
-                    "name": cat.split("/")[-1] if "/" in cat else cat,
-                    "files": [],
-                }
-            categories[cat]["files"].append(dict(r))
-
-        # 未整理的文件（排除目录）
-        unorganized_rows = self.db.fetchall(
-            """SELECT * FROM share_file
-               WHERE source_id = ? AND (organized = 0 OR category = '') AND is_dir = 0
-               ORDER BY name""",
-            (source_id,)
-        )
-
+        if not row:
+            return {
+                "all_count": 0,
+                "organized_count": 0,
+                "unorganized_count": 0,
+                "valid_count": 0,
+                "invalid_count": 0,
+            }
         return {
-            "categories": list(categories.values()),
-            "unorganized": [dict(r) for r in unorganized_rows],
+            "all_count": int(row["all_count"] or 0),
+            "organized_count": int(row["organized_count"] or 0),
+            "unorganized_count": int(row["unorganized_count"] or 0),
+            "valid_count": int(row["valid_count"] or 0),
+            "invalid_count": int(row["invalid_count"] or 0),
         }
 
-    def get_all_root_files(self, organized_only: bool = False, unorganized_only: bool = False) -> List[Dict]:
-        """获取所有分享来源的根目录文件（目录排前面）
+    def get_all_root_files(
+        self,
+        filter_type: str = "all",
+        limit: int = 50,
+        offset: int = 0,
+        include_counts: bool = True,
+    ) -> Dict:
+        """分页获取所有分享源的根目录文件（目录在前）。
 
-        对于目录，递归查找后代文件中第一个已整理的，提取其 title/year/tmdb_id。
-        这样即使目录结构含季子目录（如 剧名/Season 01/第一集.mp4）也能正确显示整理名称。
+        Args:
+            filter_type: all | organized | unorganized | valid | invalid
+            limit: 每页条数（强制分页，最大 200）
+            offset: 偏移
+            include_counts: 是否附带各筛选维度总数（角标用）
+
+        Returns:
+            { files, total, limit, offset, filter, counts? }
         """
-        condition = "f.parent_id = '0'"
-        if organized_only:
-            condition += " AND f.organized = 1"
-        elif unorganized_only:
-            condition += " AND f.organized = 0"
+        ft = (filter_type or "all").lower()
 
-        rows = self.db.fetchall(
-            f"""SELECT f.*, s.share_name,
-                (SELECT COUNT(*) FROM share_file WHERE source_id = s.id AND is_dir = 0) as file_count
+        condition = "f.parent_id = '0'"
+        if ft == "organized":
+            condition += " AND f.organized = 1"
+        elif ft == "unorganized":
+            condition += " AND f.organized = 0"
+        elif ft == "valid":
+            condition += " AND s.link_valid = 1"
+        elif ft == "invalid":
+            condition += " AND s.link_valid = 0"
+
+        count_row = self.db.fetchone(
+            f"""SELECT COUNT(*) AS cnt
                 FROM share_file f
                 JOIN share_source s ON f.source_id = s.id
-                WHERE {condition}
-                ORDER BY f.is_dir DESC, f.name ASC"""
+                WHERE {condition}"""
         )
+        total = int(count_row["cnt"]) if count_row else 0
 
-        result = []
-        for r in rows:
-            d = dict(r)
-            # 目录：递归查找后代中第一个已整理文件，补充整理信息
-            if d.get("is_dir") and d.get("organized") and not d.get("title"):
-                child = self._get_first_organized_descendant(d["source_id"], d["file_id"])
+        lim = 50 if (limit is None or int(limit) <= 0) else min(int(limit), 200)
+        off = max(0, int(offset or 0))
+
+        sql = f"""SELECT f.id, f.source_id, f.share_code, f.receive_code, f.file_id,
+                         f.parent_id, f.name, f.is_dir, f.size, f.sha1,
+                         f.media_type, f.title, f.year, f.tmdb_id, f.category,
+                         f.organized_dir, f.organized_name, f.organized,
+                         f.created_at, f.updated_at,
+                         s.share_name, s.file_count, s.link_valid
+                  FROM share_file f
+                  JOIN share_source s ON f.source_id = s.id
+                  WHERE {condition}
+                  ORDER BY f.is_dir DESC, f.name ASC
+                  LIMIT ? OFFSET ?"""
+        rows = self.db.fetchall(sql, (lim, off))
+        result = [dict(r) for r in rows]
+
+        need_ids = [
+            (d["source_id"], d["file_id"])
+            for d in result
+            if d.get("is_dir") and d.get("organized") and not d.get("title")
+        ]
+        if need_ids:
+            media_map = self._batch_first_organized_descendants(need_ids)
+            for d in result:
+                if not (d.get("is_dir") and d.get("organized") and not d.get("title")):
+                    continue
+                child = media_map.get((d["source_id"], d["file_id"]))
                 if child:
                     d["title"] = child.get("title", "") or ""
                     d["year"] = child.get("year", "") or ""
                     d["tmdb_id"] = child.get("tmdb_id", 0) or 0
-            result.append(d)
-        return result
+                    if not d.get("media_type"):
+                        d["media_type"] = child.get("media_type", "") or ""
+                    if not d.get("category"):
+                        d["category"] = child.get("category", "") or ""
 
-    def _get_first_organized_descendant(self, source_id: int, dir_file_id: str) -> Optional[Dict]:
-        """递归查找目录下第一个已整理且有 title 的后代文件（不限层级，单条 SQL）
+        out: Dict = {
+            "files": result,
+            "total": total,
+            "limit": lim,
+            "offset": off,
+            "filter": ft,
+        }
+        if include_counts:
+            out["counts"] = self.get_root_file_counts()
+        return out
 
-        用于目录整理名称显示：当目录含季子目录时，直接子项是目录无 title，
-        需要深入到叶子文件层才能取到整理信息。
+    def _batch_first_organized_descendants(
+        self, roots: List[tuple]
+    ) -> Dict[tuple, Dict]:
+        """一次递归 CTE 批量查找多个根目录下第一个已整理文件的媒体信息。"""
+        if not roots:
+            return {}
 
-        优化：用 WITH RECURSIVE 一次查出所有后代，避免深层目录触发 N+1 查询。
+        values_sql = " UNION ALL ".join(
+            "SELECT %d AS source_id, '%s' AS root_id"
+            % (int(sid), str(fid).replace("'", "''"))
+            for sid, fid in roots
+        )
+
+        rows = self.db.fetchall(
+            f"""WITH RECURSIVE
+                roots(source_id, root_id) AS (
+                    {values_sql}
+                ),
+                tree AS (
+                    SELECT r.source_id, r.root_id, sf.file_id, sf.parent_id,
+                           sf.is_dir, sf.organized, sf.title, sf.year, sf.tmdb_id,
+                           sf.media_type, sf.category, sf.organized_name, sf.name,
+                           0 AS depth
+                    FROM roots r
+                    JOIN share_file sf
+                      ON sf.source_id = r.source_id AND sf.parent_id = r.root_id
+                    UNION ALL
+                    SELECT t.source_id, t.root_id, sf.file_id, sf.parent_id,
+                           sf.is_dir, sf.organized, sf.title, sf.year, sf.tmdb_id,
+                           sf.media_type, sf.category, sf.organized_name, sf.name,
+                           t.depth + 1
+                    FROM share_file sf
+                    JOIN tree t
+                      ON sf.source_id = t.source_id AND sf.parent_id = t.file_id
+                    WHERE t.depth < 32
+                ),
+                ranked AS (
+                    SELECT source_id, root_id, title, year, tmdb_id, media_type,
+                           category, organized_name, name, depth,
+                           ROW_NUMBER() OVER (
+                               PARTITION BY source_id, root_id
+                               ORDER BY depth, name
+                           ) AS rn
+                    FROM tree
+                    WHERE organized = 1 AND is_dir = 0 AND title != ''
+                )
+                SELECT source_id, root_id, title, year, tmdb_id, media_type,
+                       category, organized_name, name
+                FROM ranked
+                WHERE rn = 1"""
+        )
+
+        out: Dict[tuple, Dict] = {}
+        for r in rows:
+            out[(r["source_id"], r["root_id"])] = dict(r)
+        return out
+
+    @staticmethod
+    def _organized_full_dir_sql(alias: str = "f") -> str:
+        """SQL expression: category/organized_dir virtual path."""
+        return (
+            f"CASE "
+            f"WHEN {alias}.category != '' AND {alias}.organized_dir != '' "
+            f"THEN {alias}.category || '/' || {alias}.organized_dir "
+            f"WHEN {alias}.category != '' THEN {alias}.category "
+            f"ELSE {alias}.organized_dir END"
+        )
+
+    def list_organized_entries(
+        self,
+        path: str = "",
+        limit: int = 50,
+        offset: int = 0,
+    ) -> Dict:
+        """服务端浏览整理视图虚拟目录（不加载全量已整理文件）。
+
+        虚拟路径 = category + '/' + organized_dir（与前端 buildOrganizedEntries 一致）。
+        返回当前层：子目录聚合 + 当前层文件，目录在前、文件在后，统一 limit/offset 分页。
+
+        Returns:
+            {
+              path, entries: [{name, path, is_dir, file_count?, total_size?, file?}],
+              total, dir_count, file_count, limit, offset
+            }
         """
-        row = self.db.fetchone(
-            """WITH RECURSIVE descendants(file_id, depth) AS (
-                   SELECT file_id, 0 FROM share_file
-                   WHERE source_id = ? AND parent_id = ?
-                   UNION ALL
-                   SELECT f.file_id, d.depth + 1 FROM share_file f
-                   JOIN descendants d ON f.parent_id = d.file_id
-                   WHERE f.source_id = ?
-               )
-               SELECT sf.file_id, sf.title, sf.year, sf.tmdb_id, sf.media_type,
-                      sf.category, sf.organized_dir, sf.organized_name
-               FROM share_file sf
-               JOIN descendants d ON sf.file_id = d.file_id
-               WHERE sf.organized = 1 AND sf.title != '' AND sf.is_dir = 0
-               ORDER BY d.depth, sf.name
-               LIMIT 1""",
-            (source_id, dir_file_id, source_id)
-        )
-        return dict(row) if row else None
+        path = (path or "").strip().strip("/")
+        limit = 50 if (limit is None or int(limit) <= 0) else min(int(limit), 200)
+        offset = max(0, int(offset or 0))
+        fd = self._organized_full_dir_sql("f")
 
-    def get_all_organized_files(self) -> Dict:
-        """获取所有分享来源的已整理文件，用于构建统一的虚拟目录树"""
-        # 已整理文件，附带来源信息
-        organized_rows = self.db.fetchall(
-            """SELECT f.*, s.share_code, s.share_name
-               FROM share_file f
-               JOIN share_source s ON f.source_id = s.id
-               WHERE f.organized = 1 AND f.organized_dir != ''
-               ORDER BY f.organized_dir, f.name"""
-        )
+        # ---- child directories (GROUP BY next path segment) ----
+        if not path:
+            dir_rows = self.db.fetchall(
+                f"""
+                SELECT seg AS name,
+                       COUNT(*) AS file_count,
+                       COALESCE(SUM(sz), 0) AS total_size
+                FROM (
+                    SELECT
+                        CASE
+                            WHEN instr(full_dir, '/') > 0
+                                THEN substr(full_dir, 1, instr(full_dir, '/') - 1)
+                            ELSE full_dir
+                        END AS seg,
+                        size AS sz
+                    FROM (
+                        SELECT {fd} AS full_dir, f.size
+                        FROM share_file f
+                        WHERE f.organized = 1 AND f.is_dir = 0
+                          AND f.organized_dir != ''
+                    )
+                )
+                WHERE seg != ''
+                GROUP BY seg
+                ORDER BY seg COLLATE NOCASE
+                """
+            )
+        else:
+            # full_dir LIKE 'path/%' ; remaining after 'path/'
+            like_pat = path.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "/%"
+            prefix_len = len(path) + 2  # 1-based substr start after "path/"
+            dir_rows = self.db.fetchall(
+                f"""
+                SELECT name,
+                       COUNT(*) AS file_count,
+                       COALESCE(SUM(sz), 0) AS total_size
+                FROM (
+                    SELECT
+                        CASE
+                            WHEN instr(remaining, '/') > 0
+                                THEN substr(remaining, 1, instr(remaining, '/') - 1)
+                            ELSE remaining
+                        END AS name,
+                        sz
+                    FROM (
+                        SELECT substr(full_dir, ?) AS remaining, size AS sz
+                        FROM (
+                            SELECT {fd} AS full_dir, f.size
+                            FROM share_file f
+                            WHERE f.organized = 1 AND f.is_dir = 0
+                              AND f.organized_dir != ''
+                              AND ({fd}) LIKE ? ESCAPE '\\'
+                        )
+                        WHERE full_dir != ?
+                    )
+                )
+                WHERE name != ''
+                GROUP BY name
+                ORDER BY name COLLATE NOCASE
+                """,
+                (prefix_len, like_pat, path),
+            )
 
-        # 未整理文件
-        unorganized_rows = self.db.fetchall(
-            """SELECT f.*, s.share_code, s.share_name
-               FROM share_file f
-               JOIN share_source s ON f.source_id = s.id
-               WHERE f.organized = 0 OR f.organized_dir = ''
-               ORDER BY f.name"""
+        dirs = []
+        for r in dir_rows:
+            name = r["name"]
+            full_path = name if not path else f"{path}/{name}"
+            dirs.append({
+                "name": name,
+                "path": full_path,
+                "is_dir": 1,
+                "file_count": int(r["file_count"] or 0),
+                "total_size": int(r["total_size"] or 0),
+            })
+
+        # ---- files exactly at this virtual path ----
+        file_count_row = self.db.fetchone(
+            f"""
+            SELECT COUNT(*) AS cnt
+            FROM share_file f
+            WHERE f.organized = 1 AND f.is_dir = 0 AND f.organized_dir != ''
+              AND ({fd}) = ?
+            """,
+            (path,),
         )
+        file_total = int(file_count_row["cnt"]) if file_count_row else 0
+
+        dir_total = len(dirs)
+        total = dir_total + file_total
+
+        # Combined pagination: dirs first, then files
+        entries: list = []
+        end = offset + limit
+
+        # slice dirs
+        if offset < dir_total:
+            dir_slice = dirs[offset:end]
+            entries.extend(dir_slice)
+            files_needed = limit - len(dir_slice)
+            file_offset = 0
+        else:
+            files_needed = limit
+            file_offset = offset - dir_total
+
+        if files_needed > 0 and file_total > 0:
+            file_rows = self.db.fetchall(
+                f"""
+                SELECT f.id, f.source_id, f.share_code, f.receive_code, f.file_id,
+                       f.parent_id, f.name, f.is_dir, f.size, f.sha1,
+                       f.media_type, f.title, f.year, f.tmdb_id, f.category,
+                       f.organized_dir, f.organized_name, f.organized,
+                       f.created_at, f.updated_at,
+                       s.share_name, s.link_valid
+                FROM share_file f
+                JOIN share_source s ON f.source_id = s.id
+                WHERE f.organized = 1 AND f.is_dir = 0 AND f.organized_dir != ''
+                  AND ({fd}) = ?
+                ORDER BY f.organized_name COLLATE NOCASE, f.name COLLATE NOCASE
+                LIMIT ? OFFSET ?
+                """,
+                (path, files_needed, file_offset),
+            )
+            for r in file_rows:
+                d = dict(r)
+                disp = d.get("organized_name") or d.get("name") or ""
+                entries.append({
+                    "name": disp,
+                    "path": (path + "/" + disp) if path else disp,
+                    "is_dir": 0,
+                    "file_count": 0,
+                    "total_size": int(d.get("size") or 0),
+                    "file": d,
+                })
 
         return {
-            "organized": [dict(r) for r in organized_rows],
-            "unorganized": [dict(r) for r in unorganized_rows],
+            "path": path,
+            "entries": entries,
+            "total": total,
+            "dir_count": dir_total,
+            "file_count": file_total,
+            "limit": limit,
+            "offset": offset,
         }
 
-    def search_files(self, keyword: str) -> List[Dict]:
-        """搜索分享文件
+    def search_files(
+        self,
+        keyword: str,
+        limit: int = 50,
+        offset: int = 0,
+        scope: str = "all",
+    ) -> Dict:
+        """分页搜索分享文件。
 
-        匹配范围：
-        - 模糊匹配：原始文件名 name、识别后标题 title、整理后目录 organized_dir、整理后文件名 organized_name
-        - 精确匹配：TMDB ID（keyword 为数字时）
+        Args:
+            keyword: 关键字（匹配 name/title/organized_name/organized_dir；纯数字额外匹配 tmdb_id）
+            limit/offset: 分页
+            scope: all | organized | original
+                   original = 未整理文件/目录（organized=0）
+                   organized = 已整理文件
         """
-        # 模糊匹配的名称字段
-        like_fields = ["f.name", "f.title", "f.organized_name", "f.organized_dir"]
+        keyword = (keyword or "").strip()
+        limit = 50 if (limit is None or int(limit) <= 0) else min(int(limit), 200)
+        offset = max(0, int(offset or 0))
+        scope = (scope or "all").lower()
+        if scope not in ("all", "organized", "original"):
+            scope = "all"
+
+        if not keyword:
+            return {
+                "files": [],
+                "total": 0,
+                "limit": limit,
+                "offset": offset,
+                "keyword": keyword,
+                "scope": scope,
+            }
+
+        scope_clause = ""
+        if scope == "organized":
+            scope_clause = " AND f.organized = 1 AND f.is_dir = 0"
+        elif scope == "original":
+            # 原始视图搜索：全部条目（含目录），不限 organized
+            scope_clause = ""
+
+        # Prefer FTS when available; fall back to LIKE on error or empty
+        # (FTS unicode61 is weak for Chinese substring matches like "剧" in "电视剧")
+        files = None
+        total = None
+        used_fts = False
+        if self._fts_available():
+            try:
+                files, total = self._search_files_fts(keyword, limit, offset, scope_clause)
+                used_fts = True
+            except Exception:
+                files, total = None, None
+                used_fts = False
+
+        if files is None:
+            files, total = self._search_files_like(keyword, limit, offset, scope_clause)
+            used_fts = False
+        elif int(total or 0) == 0:
+            like_files, like_total = self._search_files_like(keyword, limit, offset, scope_clause)
+            if int(like_total or 0) > 0:
+                files, total = like_files, like_total
+                used_fts = False
+
+        return {
+            "files": files,
+            "total": total,
+            "limit": limit,
+            "offset": offset,
+            "keyword": keyword,
+            "scope": scope,
+            "engine": "fts" if used_fts else "like",
+        }
+
+    def _fts_available(self) -> bool:
+        try:
+            row = self.db.fetchone(
+                "SELECT 1 AS ok FROM sqlite_master WHERE type='table' AND name='share_file_fts'"
+            )
+            return bool(row)
+        except Exception:
+            return False
+
+    def _search_files_like(
+        self, keyword: str, limit: int, offset: int, scope_clause: str
+    ):
+        like_fields = ["f.name", "f.title", "f.organized_name", "f.organized_dir", "f.category"]
         like_pattern = f"%{keyword}%"
-        where_clauses = [f"{field} LIKE ?" for field in like_fields]
+        where_clauses = [f"{field} LIKE ? ESCAPE '\\'" for field in like_fields]
+        # escape LIKE wildcards in user input
+        esc = (
+            keyword.replace("\\", "\\\\")
+            .replace("%", "\\%")
+            .replace("_", "\\_")
+        )
+        like_pattern = f"%{esc}%"
         params: list = [like_pattern] * len(like_fields)
 
-        # keyword 是数字时，额外精确匹配 tmdb_id
         try:
             tmdb_id_val = int(keyword)
             where_clauses.append("f.tmdb_id = ?")
@@ -679,14 +1021,104 @@ class ShareService:
         except (ValueError, TypeError):
             pass
 
-        sql = f"""SELECT f.*, s.share_code, s.share_name
-                  FROM share_file f
-                  JOIN share_source s ON f.source_id = s.id
-                  WHERE {' OR '.join(where_clauses)}
-                  ORDER BY f.is_dir DESC, f.updated_at DESC
-                  LIMIT 100"""
-        rows = self.db.fetchall(sql, tuple(params))
-        return [dict(r) for r in rows]
+        where_sql = "(" + " OR ".join(where_clauses) + ")" + scope_clause
+
+        count_row = self.db.fetchone(
+            f"""SELECT COUNT(*) AS cnt
+                FROM share_file f
+                WHERE {where_sql}""",
+            tuple(params),
+        )
+        total = int(count_row["cnt"]) if count_row else 0
+
+        rows = self.db.fetchall(
+            f"""SELECT f.id, f.source_id, f.share_code, f.receive_code, f.file_id,
+                       f.parent_id, f.name, f.is_dir, f.size, f.sha1,
+                       f.media_type, f.title, f.year, f.tmdb_id, f.category,
+                       f.organized_dir, f.organized_name, f.organized,
+                       f.created_at, f.updated_at,
+                       s.share_name, s.link_valid
+                FROM share_file f
+                JOIN share_source s ON f.source_id = s.id
+                WHERE {where_sql}
+                ORDER BY f.is_dir DESC, f.updated_at DESC
+                LIMIT ? OFFSET ?""",
+            tuple(params + [limit, offset]),
+        )
+        return [dict(r) for r in rows], total
+
+    def _search_files_fts(
+        self, keyword: str, limit: int, offset: int, scope_clause: str
+    ):
+        """FTS5 search; keyword sanitized to phrase/token query."""
+        # Build MATCH query: quote phrase, strip FTS operators
+        raw = keyword.strip()
+        # Escape double quotes
+        safe = raw.replace('"', '""')
+        # Phrase match for multi-char; also allow prefix
+        match_q = f'"{safe}"'
+
+        # Also try tmdb exact via OR outside FTS if numeric
+        tmdb_extra = ""
+        tmdb_params: list = []
+        try:
+            tmdb_id_val = int(raw)
+            tmdb_extra = " OR f.tmdb_id = ?"
+            tmdb_params.append(tmdb_id_val)
+        except (ValueError, TypeError):
+            pass
+
+        # Ensure FTS index has rows (lazy rebuild if empty)
+        cnt = self.db.fetchone("SELECT COUNT(*) AS c FROM share_file_fts")
+        if cnt and int(cnt["c"] or 0) == 0:
+            self.rebuild_search_index()
+
+        base_where = f"(share_file_fts MATCH ?{tmdb_extra}){scope_clause}"
+        params = [match_q] + tmdb_params
+
+        count_row = self.db.fetchone(
+            f"""SELECT COUNT(*) AS cnt
+                FROM share_file f
+                JOIN share_file_fts ON share_file_fts.rowid = f.id
+                WHERE {base_where}""",
+            tuple(params),
+        )
+        total = int(count_row["cnt"]) if count_row else 0
+
+        rows = self.db.fetchall(
+            f"""SELECT f.id, f.source_id, f.share_code, f.receive_code, f.file_id,
+                       f.parent_id, f.name, f.is_dir, f.size, f.sha1,
+                       f.media_type, f.title, f.year, f.tmdb_id, f.category,
+                       f.organized_dir, f.organized_name, f.organized,
+                       f.created_at, f.updated_at,
+                       s.share_name, s.link_valid
+                FROM share_file f
+                JOIN share_file_fts ON share_file_fts.rowid = f.id
+                JOIN share_source s ON f.source_id = s.id
+                WHERE {base_where}
+                ORDER BY f.is_dir DESC, f.updated_at DESC
+                LIMIT ? OFFSET ?""",
+            tuple(params + [limit, offset]),
+        )
+        return [dict(r) for r in rows], total
+
+    def rebuild_search_index(self) -> int:
+        """全量重建 FTS 索引，返回索引条数。"""
+        if not self._fts_available():
+            return 0
+        self.db.execute("DELETE FROM share_file_fts")
+        self.db.execute(
+            """INSERT INTO share_file_fts(rowid, name, title, organized_name, organized_dir)
+               SELECT id,
+                      IFNULL(name, ''),
+                      IFNULL(title, ''),
+                      IFNULL(organized_name, ''),
+                      IFNULL(organized_dir, '')
+               FROM share_file"""
+        )
+        self.db.commit()
+        row = self.db.fetchone("SELECT COUNT(*) AS c FROM share_file_fts")
+        return int(row["c"]) if row else 0
 
     def get_share_info(self, source_id: int) -> Optional[Dict]:
         """获取分享来源详情"""

@@ -18,9 +18,8 @@ from typing import Optional, Dict, Any
 import qrcode
 import requests
 
-from p115client import P115Client
-
 from ..services.config_service import get_config_service
+from ..services.p115_client_factory import get_p115_client_factory
 from ..logger import get_logger
 
 logger = get_logger(__name__)
@@ -62,6 +61,7 @@ class AuthService:
 
     def __init__(self):
         self.config_service = get_config_service()
+        self.client_factory = get_p115_client_factory()
         # 内存中的登录会话（扫码流程中间状态）
         self._login_sessions: Dict[str, Dict[str, Any]] = {}
 
@@ -113,15 +113,7 @@ class AuthService:
         vip_type = "none"  # none / vip / forever
         face = ""
         try:
-            # app 值必须与登录设备匹配，否则报 errno:99
-            login_device = self.config_service.get("login_device") or "web"
-            if login_device in ("android", "115android", "qandroid", "tv", "harmony"):
-                app = "android"
-            elif login_device in ("ios", "115ios", "115ipad", "wechatmini", "alipaymini"):
-                app = "ios"
-            else:
-                app = "web"
-            client = P115Client(cookies, app=app)
+            client = self.client_factory.create_web_client()
             user_info = client.user_my()
             if user_info and user_info.get("state"):
                 data = user_info.get("data", {})
