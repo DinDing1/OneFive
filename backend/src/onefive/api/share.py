@@ -110,39 +110,47 @@ async def check_all_links_stream():
 
         valid_count = 0
         invalid_count = 0
+        skipped_count = 0
 
         for i, share in enumerate(shares, 1):
             source_id = share["id"]
             # 逐个检测（同步方法放线程池）
             result = await asyncio.to_thread(service.check_link_valid, source_id)
+            skipped = bool(result.get("skipped"))
 
-            if result["valid"]:
+            if skipped:
+                skipped_count += 1
+            elif result.get("valid"):
                 valid_count += 1
             else:
                 invalid_count += 1
 
-            # 推送进度
+            # 推送进度（含 skipped，前端据此决定是否更新 UI/角标）
             progress_data = {
                 "type": "progress",
                 "current": i,
                 "total": total,
                 "source_id": source_id,
                 "share_name": share.get("share_name", ""),
-                "valid": result["valid"],
+                "valid": bool(result.get("valid")),
+                "skipped": skipped,
                 "error": result.get("error", ""),
             }
             yield f"data: {json.dumps(progress_data, ensure_ascii=False)}\n\n"
 
-            # 限流：share_snap docstring 明确警告"过于频繁会封禁 IP"
-            # 每次检测后等 0.5 秒，避免触发 115 IP 封禁（最后一个不等）
+            # 限流：p115client 文档警告 share_snap 频繁会封 IP；app 接口也需节流
+            # skipped(405/频控) 时额外退避
             if i < total:
-                await asyncio.sleep(0.5)
+                await asyncio.sleep(3.0 if skipped else 1.5)
 
-        # 推送完成
+        # 完成后附带文件级角标计数（与筛选按钮一致）
+        file_counts = await asyncio.to_thread(service.get_root_file_counts)
         done_data = {
             "type": "done",
             "valid_count": valid_count,
             "invalid_count": invalid_count,
+            "skipped_count": skipped_count,
+            "file_counts": file_counts,
         }
         yield f"data: {json.dumps(done_data, ensure_ascii=False)}\n\n"
 
@@ -278,9 +286,19 @@ async def recognize_file(req: FileActionRequest):
     if result.get("success"):
         title = result.get("title", "")
         media_type = result.get("media_type", "")
-        tmdb_id = result.get("tmdb_id", 0)
-        logger.info(f"识别成功: {title} ({media_type}, tmdb={tmdb_id})")
-        return ApiResponse(code=0, message="识别完成", data=result)
+        tmdb_id = result.get("tmdb_id") or 0
+        recognized = result.get("recognized")
+        if recognized is None:
+            recognized = bool(tmdb_id and media_type)
+        if recognized:
+            logger.info(f"识别成功: {title} ({media_type}, tmdb={tmdb_id})")
+        else:
+            logger.warning(
+                f"识别未命中 TMDB: {title or file_name} "
+                f"(media_type={media_type!r}, tmdb={tmdb_id}, error={result.get('error')})"
+            )
+        # 即使未命中也返回 data，方便前端展示解析标题 + 手动纠错
+        return ApiResponse(code=0, message="识别完成" if recognized else "未匹配到 TMDB", data=result)
     logger.warning(f"识别失败: {result.get('error', '未知')}")
     return ApiResponse(code=-1, message=result.get("error", "识别失败"))
 

@@ -225,87 +225,79 @@ class ShareService:
         row = self.db.fetchone("SELECT 1 AS ok FROM share_source LIMIT 1")
         return bool(row)
 
+
     def check_link_valid(self, source_id: int) -> Dict[str, Any]:
-        """检测单个分享链接是否有效
+        """检测分享链接是否有效（抗风控）。
 
-        判断逻辑：调用 share/snap 端点单次请求（limit=1），
-        通过返回的 state 和 errno 字段判断链接死活。
-
-        相比 share_iterdir 的优势：
-        - share_iterdir 会循环分页拉整个分享根目录所有文件，请求量大、易触发风控
-        - share/snap 单次调用，limit=1 只拉 1 条，请求量极小
-
-        客户端选择：始终用 P115Client(app='web') 走 webapi.115.com/share/snap 标准端点。
-        源码考证（p115client/client.py）：
-        - share_snap 方法（行 25263）内部用 get_request，不会带 cookies → 405
-        - 所以用 client.request(url, params=payload) 调用同一端点（和 fs_files 一致），
-          自动带上 self.cookies 和 self.headers
-
-        判定条件（全部满足才算有效）：
-        - resp.state == True（HTTP 请求成功）
-        - resp.errno == 0（业务层成功）
-
-        Args:
-            source_id: 分享来源 ID
-
-        Returns:
-            {"source_id": int, "share_code": str, "valid": bool, "error": str}
+        使用 p115client 官方接口：
+        1) 优先 share_snap_app（登录态 proapi，适合批量）
+        2) 回退 share_snap（webapi）
+        仅 115 明确业务结果才写 link_valid；405/频控/网络问题标记 skipped。
         """
-        # 查询分享信息
         row = self.db.fetchone(
             "SELECT share_code, receive_code, share_name FROM share_source WHERE id = ?",
-            (source_id,)
+            (source_id,),
         )
         if not row:
             return {"source_id": source_id, "valid": False, "error": "分享记录不存在"}
 
-        share_code = row["share_code"]
-        receive_code = row["receive_code"]
-        share_name = row["share_name"]
+        share_code = row["share_code"] or ""
+        receive_code = row["receive_code"] or ""
+        share_name = row["share_name"] or ""
 
         try:
-            from .file_service import get_file_service
             from ..exceptions import NotLoggedInError
 
-            file_svc = get_file_service()
-            # share_snap 的最小请求 payload：只拉 1 条根目录文件
-            # 注意：share_snap 的 count_folders/count_files 参数在源码中未声明，不传
             payload = {
                 "share_code": share_code,
                 "receive_code": receive_code,
-                "cid": 0,                # 根目录
+                "cid": 0,
                 "offset": 0,
-                "limit": 1,              # 只要 1 条就够判断有效性
+                "limit": 1,
+            }
+            resp = self._call_share_snap(payload)
+            valid, error_msg = self._parse_share_snap_response(resp)
+        except NotLoggedInError as e:
+            logger.warning(f"检测分享链接跳过（未登录）: {share_name} ({share_code})")
+            return {
+                "source_id": source_id,
+                "share_code": share_code,
+                "share_name": share_name,
+                "valid": False,
+                "error": str(e),
+                "skipped": True,
+            }
+        except Exception as e:
+            error_msg = str(e)[:200]
+            if self._is_transient_share_error(e):
+                logger.warning(
+                    f"检测分享链接跳过（频控/网络）: {share_name} ({share_code}): {error_msg}"
+                )
+            else:
+                logger.warning(
+                    f"detect share link error (not updating link_valid): {share_name} ({share_code}): {error_msg}"
+                )
+            return {
+                "source_id": source_id,
+                "share_code": share_code,
+                "share_name": share_name,
+                "valid": False,
+                "error": error_msg,
+                "skipped": True,
             }
 
-            # 调用 share_snap：内部强制用 P115Client(app='web') 走标准端点，
-            # 外层 _retry_on_busy 处理 115 繁忙错误
-            resp = file_svc._retry_on_busy(
-                lambda: self._call_share_snap(file_svc, payload)
-            )
-
-            # 解析返回结果，按 state/errno 判定有效性
-            valid, error_msg = self._parse_share_snap_response(resp)
-
-        except NotLoggedInError as e:
-            valid = False
-            error_msg = str(e)
-        except Exception as e:
-            valid = False
-            error_msg = str(e)[:200]  # 截断过长的错误信息
-
-        # 更新数据库
         self.db.execute(
             """UPDATE share_source
                SET link_valid = ?, error_msg = ?,
                    updated_at = datetime('now', 'localtime')
                WHERE id = ?""",
-            (1 if valid else 0, error_msg, source_id)
+            (1 if valid else 0, error_msg, source_id),
         )
         self.db.commit()
-
-        logger.info(f"检测分享链接: {share_name} ({share_code}) → {'有效' if valid else '无效: ' + error_msg}")
-
+        logger.info(
+            f"检测分享链接: {share_name} ({share_code}) → "
+            f"{'有效' if valid else '无效: ' + error_msg}"
+        )
         return {
             "source_id": source_id,
             "share_code": share_code,
@@ -315,86 +307,95 @@ class ShareService:
         }
 
     @staticmethod
-    def _call_share_snap(file_svc, payload: Dict[str, Any]) -> Dict[str, Any]:
-        """调用 share/snap 端点检测分享有效性，强制使用 Web API（app='web'）并带 cookies
+    def _is_transient_share_error(exc: BaseException) -> bool:
+        s = str(exc).lower()
+        keys = (
+            "405", "429", "method not allowed", "too many", "rate", "busy",
+            "timeout", "timed out", "频繁", "封禁", "风控", "try again",
+            "temporarily", "connection", "connect",
+        )
+        return any(k in s for k in keys)
 
-        源码考证（p115client/client.py）：
-        - share_snap 方法（行 25324-25325）内部直接用 get_request，不会带上 self.cookies
-        - fs_files 方法（行 11508）用 self.request，会自动带上 self.cookies（行 730-732）
-        - 所以不能用 client.share_snap(payload)，否则请求不带 cookies 会 405
-        - 解决方案：用 client.request(url, params=payload) 调用同一端点，确保带上 cookies
+    def _call_share_snap(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """抗风控调用 share snap。
 
-        端点：GET https://webapi.115.com/share/snap
-        参数：share_code, receive_code, cid=0, offset=0, limit=1
-
-        Args:
-            file_svc: FileService 实例（用于获取 cookies）
-            payload: share_snap 请求参数
-
-        Returns:
-            share_snap 返回的 dict
+        p115client 说明：
+        - share_snap：可不登录但频繁封 IP
+        - share_snap_app：需登录，更适合账号态批量探测
         """
-        from p115client import P115Client
-        from ..exceptions import NotLoggedInError
+        import time
+        from p115client.exception import P115BusyOSError
+        from .p115_client_factory import get_p115_client_factory
 
-        cookies = file_svc.auth_service.get_cookies()
-        if not cookies:
-            raise NotLoggedInError("未登录，请先扫码登录")
+        factory = get_p115_client_factory()
+        client = factory.create_web_client()
+        app = factory.get_client_app() or "web"
+        snap_app = app if app in ("android", "ios") else "android"
+        params = {
+            "share_code": str(payload.get("share_code") or ""),
+            "receive_code": str(payload.get("receive_code") or ""),
+            "cid": payload.get("cid", 0),
+            "offset": int(payload.get("offset") or 0),
+            "limit": int(payload.get("limit") or 1),
+        }
 
-        # 强制 app='web'，走 webapi.115.com/share/snap 标准端点
-        web_client = P115Client(cookies, app='web')
-        # 关键：用 client.request 而非 client.share_snap
-        # client.request 会自动带上 self.cookies 和 self.headers（和 fs_files 一致）
-        # client.share_snap 内部用 get_request，不会带 cookies，导致 405
-        api = "https://webapi.115.com/share/snap"
-        return web_client.request(url=api, params=payload)
+        last_err: Exception | None = None
+        attempts = [("app", snap_app), ("web", "web"), ("app", snap_app)]
+        for idx, (mode, mode_app) in enumerate(attempts):
+            try:
+                if mode == "app":
+                    resp = client.share_snap_app(params, app=mode_app)
+                else:
+                    resp = client.share_snap(params)
+                if not isinstance(resp, dict):
+                    raise RuntimeError(f"share snap unexpected type: {type(resp)}")
+                return resp
+            except P115BusyOSError as e:
+                last_err = e
+                wait = 2 * (idx + 1)
+                logger.warning(f"share snap busy, retry in {wait}s ({mode}/{mode_app})")
+                time.sleep(wait)
+            except Exception as e:
+                last_err = e
+                if idx >= len(attempts) - 1:
+                    raise
+                wait = 2 * (idx + 1) if self._is_transient_share_error(e) else 0.8
+                logger.warning(f"share snap {mode}/{mode_app} failed: {e}; next in {wait}s")
+                time.sleep(wait)
+
+        if last_err:
+            raise last_err
+        raise RuntimeError("share snap failed")
 
     @staticmethod
     def _parse_share_snap_response(resp: Dict[str, Any]) -> tuple:
-        """解析 share_snap 返回结果，判定分享是否有效
+        if not isinstance(resp, dict):
+            return False, "响应格式错误"
 
-        share_snap 返回结构（源码考证）：
-        {
-            "state": True | False,    # 顶层状态：True=请求成功
-            "errno": int,             # 错误码：0=成功，其它=失败
-            "error": str,             # 错误消息（失败时）
-            "data": {
-                "count": int,         # 目录内文件+子目录总数
-                "list": [...]         # 当前页文件/目录列表
-            }
-        }
+        def _msg() -> str:
+            for key in ("error", "message", "msg", "error_msg"):
+                val = resp.get(key)
+                if val:
+                    return str(val)
+            return "分享无效或已失效"
 
-        注意：share_snap 返回中没有 shareinfo/sharestate 字段
-        （shareinfo 是另一个独立方法 share_info 的端点 /share/shareinfo）
+        state = resp.get("state", False)
+        if state in (1, "1", "true", "True"):
+            state = True
+        if not state:
+            errno = resp.get("errno", resp.get("errNo", resp.get("code")))
+            msg = _msg()
+            if errno is not None and str(errno) not in ("", "0"):
+                return False, f"[{errno}] {msg}"
+            return False, msg
 
-        判定逻辑：
-        1. resp.state == True（HTTP 请求成功）
-        2. resp.errno == 0（业务层成功）
-
-        常见错误码（来自 p115client check_response）：
-        - 10004: 错误的链接
-        - 50003: 提取码不存在
-        - 99: 请重新登录
-        - 911: 请验证账号
-        - 1001: 参数错误
-
-        Args:
-            resp: share_snap 返回的 dict
-
-        Returns:
-            (is_valid: bool, error_msg: str)
-        """
-        # 1. state 字段判定（HTTP 层）
-        if not resp.get("state", False):
-            return False, resp.get("error", "请求失败")
-
-        # 2. errno 字段判定（业务层）
-        errno = resp.get("errno", -1)
-        if errno != 0:
-            return False, f"errno={errno}: {resp.get('error', '分享失效')}"
-
-        # state==True 且 errno==0 即视为有效
-        # （share_snap 能正常返回数据说明链接可访问、提取码正确）
+        errno = resp.get("errno", resp.get("errNo", resp.get("code", 0)))
+        try:
+            errno_i = int(errno)
+        except (TypeError, ValueError):
+            errno_i = 0 if errno in (None, "") else -1
+        if errno_i != 0:
+            return False, f"[{errno_i}] {_msg()}"
         return True, ""
 
     def get_all_shares_for_check(self) -> List[Dict]:

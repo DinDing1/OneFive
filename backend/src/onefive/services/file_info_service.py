@@ -361,29 +361,16 @@ def extract_key_info(filename: str, folder_files: Optional[List[str]] = None) ->
 
     优先级：
     1. 标准命名格式（标题 (年份) {tmdb=ID}）→ 直接提取，不走 guessit
-    2. guessit 解析标题、年份、季集
-    3. 自定义补充 TMDB ID、中文季集、分辨率、特效
-
-    Args:
-        filename: 完整文件名（含扩展名）
-        folder_files: （已废弃，保留仅为兼容性，当前实现不使用）文件夹内的文件列表
-
-    Returns:
-        {"title", "year", "season", "episode", "mediaType", "tmdbId", "fallbackQuery"}
+    2. 先剥离画质/来源/发布组等噪声，再交给 guessit
+    3. 标题 fallback 使用完整清洗串（禁止取第一个词）
+    4. 自定义补充 TMDB ID、中文季集、分辨率、特效
     """
     base = filename.rsplit('.', 1)[0] if '.' in filename else filename
-
-    # 自定义提取 TMDB ID（guessit 不支持）
     tmdb_id = _extract_tmdb_id(base)
-
-    # 自定义提取分辨率（guessit 不支持）
     video_format = _extract_video_format(base)
-
-    # 自定义提取特效（guessit 不支持）
     effects = _extract_effects(base)
+    fallback_query = _clean_query(base)
 
-    # 优先检测标准命名格式：标题 (年份) {tmdb=ID}
-    # 这种格式已经是最规范的，不需要 guessit 干扰
     std_match = STANDARD_NAME_PATTERN.match(base)
     if std_match:
         title = std_match.group(1).strip()
@@ -391,16 +378,10 @@ def extract_key_info(filename: str, folder_files: Optional[List[str]] = None) ->
         std_tmdb = std_match.group(3)
         if std_tmdb and not tmdb_id:
             tmdb_id = int(std_tmdb)
-
-        # 检测季集信息（自定义中文季集 + 仅季，统一调用避免重复代码）
         season, episode, season_only = _detect_season_episode(base)
-        # 仅当中文季集未命中时，才回退到仅季模式
         if season is None and episode is None and season_only is not None:
             season = season_only
-
-        # 媒体类型：有季或集即为电视剧（兼容季包 S02 无集号的情况）
         media_type = 'tv' if season is not None or episode is not None else 'movie'
-
         return {
             "title": title,
             "year": year,
@@ -410,27 +391,30 @@ def extract_key_info(filename: str, folder_files: Optional[List[str]] = None) ->
             "tmdbId": tmdb_id,
             "videoFormat": video_format,
             "effects": effects,
-            "fallbackQuery": _clean_query(base),
+            "fallbackQuery": fallback_query or _clean_query(title),
         }
 
-    # 非标准格式，使用 guessit 解析
+    # 先清洗再 guessit
+    guessit_input = _prepare_for_guessit(filename)
     try:
-        g = guessit.guessit(filename)
+        g = guessit.guessit(guessit_input) if guessit_input else {}
     except Exception:
         g = {}
+    if not g:
+        try:
+            g = guessit.guessit(filename)
+        except Exception:
+            g = {}
 
-    # 标题：guessit 优先
-    title = g.get('title', '')
-    if not title:
-        # fallback: 用正则提取
-        cleaned = _clean_query(base)
-        title = cleaned.split()[0] if cleaned else ''
+    title = g.get('title', '') or ''
+    if isinstance(title, list):
+        title = title[0] if title else ''
+    title = str(title).strip()
 
-    # 年份
-    year = str(g.get('year', '')) if g.get('year') else _extract_year(base)
+    if not title or len(title) < 2 or _looks_like_noise_title(title):
+        title = _title_from_cleaned(fallback_query)
 
-    # 季集
-    # guessit 解析 "S01-S18" 等季度范围时返回 list（如 [1, 18]），取第一个
+    year = str(g.get('year', '')) if g.get('year') else (_extract_year(base) or '')
     season = g.get('season')
     if isinstance(season, list):
         season = season[0] if season else None
@@ -442,30 +426,26 @@ def extract_key_info(filename: str, folder_files: Optional[List[str]] = None) ->
     if episode is not None:
         episode = int(episode)
 
-    # 自定义中文季集 + 仅季（guessit 不支持，仅在 guessit 未给出时补充）
     if season is None and episode is None:
         cn_season, cn_episode, season_only = _detect_season_episode(base)
         if cn_season is not None:
             season = cn_season
         if cn_episode is not None:
             episode = cn_episode
-        # 中文季集仍未命中时，回退到仅季模式
         if season is None and episode is None and season_only is not None:
             season = season_only
 
-    # 媒体类型：有季或集即为电视剧（兼容季包 S02 无集号的情况）
     media_type = 'tv' if season is not None or episode is not None else 'movie'
-
     return {
         "title": title,
-        "year": year,
+        "year": year or '',
         "season": season,
         "episode": episode,
         "mediaType": media_type,
         "tmdbId": tmdb_id,
         "videoFormat": video_format,
         "effects": effects,
-        "fallbackQuery": _clean_query(base),
+        "fallbackQuery": fallback_query,
     }
 
 
@@ -564,32 +544,182 @@ def _detect_season_episode(base: str) -> Tuple[Optional[int], Optional[int], Opt
     return season, episode, season_only
 
 
+# ==================== 标题清洗 / 搜索 query ====================
+
+_TECH_NOISE_RE = re.compile(
+    r'\b('
+    r'2160p|1080p|720p|480p|360p|4K|8K|UHD|FHD|HD|SD|'
+    r'WEB-?DL|WEBRip|WEB|Blu-?Ray|BluRay|BDRip|BRRip|HDTV|DVDRip|HDDVD|REMUX|REMUX|'
+    r'H\.?26[45]|X\.?26[45]|HEVC|AVC|AV1|XviD|DivX|VP9|'
+    r'DTS[-\s.]?HD[-\s.]?MA|DTS[-\s.]?HD|DTS[-\s.]?X|DDP?\d*\.?\d*|EAC3|'
+    r'AAC\d*\.?\d*|TrueHD|Atmos|FLAC|AC3|LPCM|PCM|'
+    r'DV|DoVi|Dolby[\s.]?Vision|HDR10\+?|HDR|HLG|SDR|EDR|'
+    r'10bit|8bit|12bit|\d{2,3}fps|HFR|IMAX|REPACK|PROPER|EXTENDED|THEATRICAL|'
+    r'MA\s*5\.1|5\.1|7\.1|2\.0|'
+    r'NF|AMZN|DSNP|ATVP|HMAX|HULU|PCOK|PMTP|iT|Bilibili|'
+    r'Complete|COMPLETE|Pack|PACK'
+    r')\b',
+    re.IGNORECASE,
+)
+
+_CN_NOISE_RE = re.compile(
+    r'(高清|超清|蓝光|国语|粤语|中字|中文字幕|简体|繁体|内嵌|外挂|'
+    r'无水印|特效字幕|双语|三语|完整版|未删减|收藏版|加长版|导演剪辑版|'
+    r'更新至|全\d+集|共\d+集)'
+)
+
+_NOISE_TITLE_RE = re.compile(
+    r'^(WEB-?DL|WEBRip|BluRay|REMUX|HDR|DV|H\.?26[45]|X\.?26[45]|HEVC|AAC|DDP?|DTS)$',
+    re.I,
+)
+
+
+def _strip_release_group_token(text: str) -> str:
+    if not text:
+        return text
+    group = _extract_release_group(text)
+    if not group:
+        return text
+    return re.sub(
+        rf'(?:^|[\s.\-_@\[\(]){re.escape(group)}(?:$|[\s.\-_@\]\)])',
+        ' ',
+        text,
+        flags=re.IGNORECASE,
+    )
+
+
 def _clean_query(text: str) -> str:
-    """清理文件名用于搜索"""
-    cleaned = text
+    """清理文件名得到搜索用 fallbackQuery（完整短语，非首词）。"""
+    cleaned = text or ''
     cleaned = re.sub(r'\[[^\]]*\]', ' ', cleaned)
     cleaned = re.sub(r'\{[^}]*\}', ' ', cleaned)
     cleaned = re.sub(r'\([^)]*\)', ' ', cleaned)
+    cleaned = re.sub(r'【[^】]*】', ' ', cleaned)
     cleaned = re.sub(r'S\d{1,2}E\d{1,3}', ' ', cleaned, flags=re.IGNORECASE)
     cleaned = re.sub(r'\d{1,2}x\d{1,3}', ' ', cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r'第\d+[季部营]?', ' ', cleaned)
     cleaned = re.sub(r'第\d+集', ' ', cleaned)
     cleaned = re.sub(r'EP?\d{1,3}', ' ', cleaned, flags=re.IGNORECASE)
-    cleaned = re.sub(r'\b(2160p|1080p|720p|480p|360p|4K|8K|UHD|HD|SD)\b', ' ', cleaned, flags=re.IGNORECASE)
-    cleaned = re.sub(
-        r'\b(WEB-?DL|WEBRip|BluRay|BDRip|HDTV|DVDRip|REMUX)\b',
-        ' ', cleaned, flags=re.IGNORECASE
-    )
-    cleaned = re.sub(r'\b(H\.?26[45]|X\.?26[45]|HEVC|AVC|AV1)\b', ' ', cleaned, flags=re.IGNORECASE)
-    cleaned = re.sub(
-        r'\b(DTS[-\s.]?HD[-\s.]?MA|DTS[-\s.]?HD|DDP\d*\.?\d*|'
-        r'AAC\d*\.?\d*|TrueHD|Atmos|FLAC)\b',
-        ' ', cleaned, flags=re.IGNORECASE
-    )
-    cleaned = re.sub(r'\b(DV|HDR10\+|HDR10|HDR|HLG|SDR)\b', ' ', cleaned, flags=re.IGNORECASE)
-    cleaned = re.sub(r'\btmdb[=＝]?\d+\b', ' ', cleaned, flags=re.IGNORECASE)
-    cleaned = re.sub(r'[._\-\[\]\(\)\{\}]', ' ', cleaned)
+    cleaned = re.sub(r'Season\s*\d{1,2}', ' ', cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r'\bS\d{1,2}\b', ' ', cleaned, flags=re.IGNORECASE)
+    cleaned = _TECH_NOISE_RE.sub(' ', cleaned)
+    cleaned = _CN_NOISE_RE.sub(' ', cleaned)
+    cleaned = re.sub(r'\btmdb[=＝\-]?\d+\b', ' ', cleaned, flags=re.IGNORECASE)
+    cleaned = _strip_release_group_token(cleaned)
+    cleaned = re.sub(r'(?<=[A-Za-z0-9])-(?=[A-Za-z]{2,}$)', ' ', cleaned)
+    cleaned = re.sub(r'[._\-\[\]\(\)\{\}@]+', ' ', cleaned)
     cleaned = re.sub(r'\s+', ' ', cleaned).strip()
+    cleaned = re.sub(r'^\d{4}\s+|\s+\d{4}$', ' ', cleaned).strip()
     return cleaned
+
+
+def _prepare_for_guessit(filename: str) -> str:
+    """guessit 前剥离噪声，保留标题/年份/季集骨架。"""
+    name = filename or ''
+    ext = ''
+    if '.' in name:
+        base, maybe_ext = name.rsplit('.', 1)
+        if 1 <= len(maybe_ext) <= 5 and maybe_ext.isalnum():
+            ext = '.' + maybe_ext
+            name = base
+    name = re.sub(r'\{[^}]*tmdb[^}]*\}', ' ', name, flags=re.IGNORECASE)
+    name = re.sub(r'\[[^\]]*\]', ' ', name)
+    name = _TECH_NOISE_RE.sub(' ', name)
+    name = _CN_NOISE_RE.sub(' ', name)
+    name = _strip_release_group_token(name)
+    name = re.sub(r'[._]+', ' ', name)
+    name = re.sub(r'\s+', ' ', name).strip(' -_.')
+    if not name:
+        return filename
+    return name + (ext if ext else '.mkv')
+
+
+def _looks_like_noise_title(title: str) -> bool:
+    t = (title or '').strip()
+    if not t:
+        return True
+    if _NOISE_TITLE_RE.match(t):
+        return True
+    if re.fullmatch(r'\d{3,4}p?', t, re.I):
+        return True
+    return False
+
+
+def _title_from_cleaned(cleaned: str) -> str:
+    """完整清洗串作为标题，禁止 split()[0]。"""
+    text = (cleaned or '').strip()
+    if not text:
+        return ''
+    text = re.sub(r'\s+\d{4}$', '', text).strip()
+    cjk_parts = re.findall(
+        r'[\u4e00-\u9fff\u3400-\u4dbf]+(?:[\u4e00-\u9fff\u3400-\u4dbf·：:\s]{0,8}[\u4e00-\u9fff\u3400-\u4dbf]+)*',
+        text,
+    )
+    if cjk_parts:
+        best = max((re.sub(r'\s+', '', p) for p in cjk_parts), key=len)
+        if len(best) >= 1:
+            return best
+    return text
+
+
+def _split_language_parts(text: str) -> List[str]:
+    parts: List[str] = []
+    if not text:
+        return parts
+    for m in re.finditer(
+        r'[\u4e00-\u9fff\u3400-\u4dbf]+(?:[\u4e00-\u9fff\u3400-\u4dbf·：:\s]*[\u4e00-\u9fff\u3400-\u4dbf]+)*',
+        text,
+    ):
+        p = re.sub(r'\s+', '', m.group(0)).strip('·：:')
+        if len(p) >= 1:
+            parts.append(p)
+    for m in re.finditer(r"[A-Za-z][A-Za-z0-9'.:\s\-]{1,}", text):
+        p = re.sub(r'\s+', ' ', m.group(0)).strip(' .-')
+        if len(p) >= 2 and not _looks_like_noise_title(p):
+            parts.append(p)
+    return parts
+
+
+def build_search_queries(
+    title: str,
+    year: Optional[str] = None,
+    fallback_query: str = "",
+) -> List[Tuple[str, Optional[str]]]:
+    """TMDB 搜索顺序：title+year → title → fallback → 中英拆分。"""
+    out: List[Tuple[str, Optional[str]]] = []
+    seen = set()
+    year = str(year).strip() if year else ''
+
+    def add(q: str, y: Optional[str]):
+        q = (q or '').strip()
+        if not q or len(q) < 1:
+            return
+        key = (q.lower(), y or '')
+        if key in seen:
+            return
+        seen.add(key)
+        out.append((q, y or None))
+
+    title = (title or '').strip()
+    fb = (fallback_query or '').strip()
+    if title and year:
+        add(title, year)
+    if title:
+        add(title, None)
+    if fb and fb.lower() != title.lower():
+        if year:
+            add(fb, year)
+        add(fb, None)
+    for src in (title, fb):
+        if not src:
+            continue
+        for part in _split_language_parts(src):
+            if part.lower() in (title.lower(), fb.lower()):
+                continue
+            if year:
+                add(part, year)
+            add(part, None)
+    return out
 
 
 def _extract_video_codec(base: str) -> str:

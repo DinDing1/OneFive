@@ -64,27 +64,10 @@ class ShareOrganizeService:
         """识别单个文件（只读，不写入数据库）"""
         try:
             result, _ = self._do_recognize(name, tmdb_cache)
-            return {
-                "success": True,
-                "file_id": file_id,
-                "filename": name,
-                "media_type": result["media_type"],
-                "title": result["title"] or name,
-                "year": result["year"],
-                "season": result["season"],
-                "episode": result["episode"],
-                "tmdb_id": result["tmdb_id"],
-                "category": result["category"],
-                "tech_info": result["tech_info"],
-                "target_path": {"dir": result["organized_dir"], "filename": result["organized_name"]} if result["organized_dir"] else None,
-                "tmdb_poster": result["poster"] or None,
-                "tmdb_backdrop": result["backdrop"] or None,
-                "tmdb_overview": result["overview"],
-                "tmdb_rating": result["rating"],
-            }
+            return self._build_recognize_result(file_id, name, result, False)
         except Exception as e:
             logger.error(f"分享文件识别失败 ({name}): {e}")
-            return {"success": False, "error": str(e)}
+            return {"success": False, "recognized": False, "error": str(e)}
 
     def _recognize_directory(self, source_id: int, dir_file_id: str,
                             share_service, tmdb_cache: Dict) -> Dict[str, Any]:
@@ -110,29 +93,28 @@ class ShareOrganizeService:
             (source_id, dir_file_id)
         )
 
-        # 找到第一个视频文件
-        video_file = None
+        # 找第一个视频文件：先看直接子项，没有则递归子目录（多层 Season 结构）
+        video_name = None
         for file_row in files:
             if not file_row["is_dir"] and self._is_video_file(file_row["name"]):
-                video_file = file_row
+                video_name = file_row["name"]
                 break
+        if not video_name:
+            nested_videos = self._collect_video_names(source_id, dir_file_id, share_service, limit=1)
+            if nested_videos:
+                video_name = nested_videos[0]
+                logger.info(f"目录无直接视频，递归取到: {video_name}")
 
-        # 如果有视频文件，用视频文件名提取季集/技术信息，用目录 TMDB ID 锁定媒体信息
-        if video_file:
-            result, _ = self._do_recognize(video_file["name"], tmdb_cache,
-                                        forced_tmdb_id=folder_tmdb_id,
-                                        forced_media_type=folder_media_type)
-            data = self._build_recognize_result(dir_file_id, dir_name, result, True)
-            data["total_files"] = len(files)
-            return data
-        else:
-            # 没有视频文件，用目录名识别
-            result, _ = self._do_recognize(dir_name, tmdb_cache,
-                                        forced_tmdb_id=folder_tmdb_id,
-                                        forced_media_type=folder_media_type)
-            data = self._build_recognize_result(dir_file_id, dir_name, result, True)
-            data["total_files"] = len(files)
-            return data
+        # 有视频：用视频文件名提取季集/技术信息；无视频：回退目录名
+        parse_name = video_name or dir_name
+        result, _ = self._do_recognize(
+            parse_name, tmdb_cache,
+            forced_tmdb_id=folder_tmdb_id,
+            forced_media_type=folder_media_type,
+        )
+        data = self._build_recognize_result(dir_file_id, dir_name, result, True)
+        data["total_files"] = len(files)
+        return data
 
     def _is_video_file(self, filename: str) -> bool:
         """判断是否为视频文件（复用 file_info_service 的扩展名集合，保持一致）"""
@@ -223,24 +205,33 @@ class ShareOrganizeService:
     def _build_recognize_result(self, file_id: str, filename: str,
                                 result: Dict[str, Any], is_directory: bool = False) -> Dict[str, Any]:
         """把内部识别结果统一转成前端识别弹窗需要的数据"""
+        tmdb_id = result.get("tmdb_id") or 0
+        media_type = result.get("media_type") or ""
+        recognized = bool(tmdb_id and media_type)
         return {
+            # success=True 表示请求完成；recognized 表示真正命中 TMDB
             "success": True,
+            "recognized": recognized,
             "is_directory": is_directory,
             "file_id": file_id,
             "filename": filename,
-            "media_type": result["media_type"],
-            "title": result["title"] or filename,
-            "year": result["year"],
-            "season": result["season"],
-            "episode": result["episode"],
-            "tmdb_id": result["tmdb_id"],
-            "category": result["category"],
-            "tech_info": result["tech_info"],
-            "target_path": {"dir": result["organized_dir"], "filename": result["organized_name"]} if result["organized_dir"] else None,
-            "tmdb_poster": result["poster"] or None,
-            "tmdb_backdrop": result["backdrop"] or None,
-            "tmdb_overview": result["overview"],
-            "tmdb_rating": result["rating"],
+            "media_type": media_type or result.get("media_type") or "",
+            "title": result.get("title") or filename,
+            "year": result.get("year"),
+            "season": result.get("season"),
+            "episode": result.get("episode"),
+            "tmdb_id": tmdb_id if tmdb_id else None,
+            "category": result.get("category") or "",
+            "tech_info": result.get("tech_info") or {},
+            "target_path": (
+                {"dir": result.get("organized_dir") or "", "filename": result.get("organized_name") or ""}
+                if result.get("organized_dir") else None
+            ),
+            "tmdb_poster": result.get("poster") or None,
+            "tmdb_backdrop": result.get("backdrop") or None,
+            "tmdb_overview": result.get("overview") or "",
+            "tmdb_rating": result.get("rating") or 0,
+            "error": None if recognized else "未匹配到 TMDB 媒体信息",
         }
 
     # ==================== 写入整理 ====================
@@ -761,7 +752,8 @@ class ShareOrganizeService:
         # 生成整理后的目录路径和文件名
         organized_dir = ""
         organized_name = ""
-        if media_type and title and tech_info:
+        # tech_info 允许为空（目录名识别场景），只要有 media_type + title 就生成路径
+        if media_type and title:
             season_year = ""
             if media_type == "tv" and season and tmdb_id:
                 # 缓存 get_tv_season 结果，避免同一季每集都查询 TMDB API
@@ -782,10 +774,11 @@ class ShareOrganizeService:
                     if season_year_cache is not None:
                         season_year_cache[season_cache_key] = season_year
 
+            tech = tech_info or {}
             if media_type == "movie":
-                path_info = generate_movie_path(title, year, str(tmdb_id), tech_info)
+                path_info = generate_movie_path(title, year, str(tmdb_id), tech)
             else:
-                path_info = generate_tv_path(title, year, str(tmdb_id), tech_info,
+                path_info = generate_tv_path(title, year, str(tmdb_id), tech,
                                             season_year=season_year, season=str(season) if season else "",
                                             episode=str(episode) if episode else "")
             organized_dir = path_info.get("dir", "")
@@ -1106,6 +1099,7 @@ class ShareOrganizeService:
         search_media_type = forced_media_type or key_info.get("mediaType", "")
         title = key_info.get("title", "")
         year = key_info.get("year", "")
+        fallback_query = key_info.get("fallbackQuery") or ""
         tmdb_id = key_info.get("tmdbId", 0)
         if forced_tmdb_id:
             tmdb_id = forced_tmdb_id
@@ -1115,13 +1109,19 @@ class ShareOrganizeService:
         # 避免 movie 端查不到时回退命中 tv 端同 ID 导致电影被误判为电视剧
         strict_media_type = bool(forced_media_type)
         tmdb_service = get_tmdb_service()
-        cache_key = ("tmdb", tmdb_id, search_media_type, strict_media_type) if tmdb_id else (title, year, search_media_type)
+        cache_key = (
+            ("tmdb", tmdb_id, search_media_type, strict_media_type)
+            if tmdb_id
+            else (title, year, fallback_query, search_media_type)
+        )
         if cache_key in tmdb_cache:
             tmdb_details = tmdb_cache[cache_key]
         else:
             tmdb_details, _resolved_type = tmdb_service.search_with_validation(
                 tmdb_id, title, search_media_type, year,
-                strict_media_type=strict_media_type)
+                strict_media_type=strict_media_type,
+                fallback_query=fallback_query,
+            )
             tmdb_cache[cache_key] = tmdb_details
 
         # 3. 从 TMDB 结果提取信息并生成整理路径（委托给公共方法，消除与 _recognize_with_cached_tmdb 的重复）

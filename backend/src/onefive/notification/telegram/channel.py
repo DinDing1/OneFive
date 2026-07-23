@@ -42,6 +42,12 @@ CFG_PROXY_URL = "tg_proxy_url"
 CFG_NOTIFY_CHAT = "tg_notify_chat"
 CFG_ADMIN_IDS = "tg_admin_ids"
 
+# 连接参数：避免网络异常时长时间阻塞（Telethon 默认会多次重试）
+TG_CLIENT_TIMEOUT = 10          # 单次 socket 超时（秒）
+TG_CONNECTION_RETRIES = 1       # 连接重试次数（默认 5，过大易卡死启动/接口）
+TG_CONNECT_WAIT = 20            # 单次 connect() 总等待上限（秒）
+TG_AUTO_CONNECT_WAIT = 45       # 启动自动连接总等待上限（秒）
+
 
 class TelegramChannel(NotificationChannel):
     """Telegram 通知渠道"""
@@ -124,6 +130,62 @@ class TelegramChannel(NotificationChannel):
 
     # ==================== 客户端管理 ====================
 
+    def _new_client(self, session, api_id, api_hash, proxy=None):
+        """创建带超时/有限重试的 Telethon 客户端，避免网络差时无限卡死。"""
+        from telethon import TelegramClient
+        from telethon.sessions import StringSession
+        return TelegramClient(
+            StringSession(session),
+            int(api_id),
+            api_hash,
+            proxy=proxy,
+            timeout=TG_CLIENT_TIMEOUT,
+            connection_retries=TG_CONNECTION_RETRIES,
+            retry_delay=1,
+            auto_reconnect=True,
+        )
+
+    async def _quiet_disconnect(self, client) -> None:
+        if not client:
+            return
+        try:
+            await client.disconnect()
+        except Exception:
+            pass
+
+    async def _safe_client_connect(self, client, label: str) -> bool:
+        """带总超时的 connect。
+
+        成功返回 True；明确失败返回 False；超时/网络错误抛出异常，
+        便于上层避免“失败后再二次长重试”。
+        """
+        try:
+            await asyncio.wait_for(client.connect(), timeout=TG_CONNECT_WAIT)
+            if client.is_connected():
+                return True
+            logger.error(f"{label}: 连接后未处于 connected 状态")
+            await self._quiet_disconnect(client)
+            return False
+        except asyncio.TimeoutError:
+            logger.error(f"{label}: 连接超时（{TG_CONNECT_WAIT}s）")
+            await self._quiet_disconnect(client)
+            raise
+        except Exception as e:
+            logger.error(f"{label}: 连接失败: {e}")
+            await self._quiet_disconnect(client)
+            raise
+
+    @staticmethod
+    def _is_network_error(exc: BaseException) -> bool:
+        """判断是否为网络/超时类错误（此类错误不应立即二次长重试）。"""
+        if isinstance(exc, (asyncio.TimeoutError, TimeoutError, ConnectionError, OSError)):
+            return True
+        name = type(exc).__name__
+        msg = str(exc).lower()
+        if name in {"ConnectionError", "TimeoutError", "OSError", "NetworkError"}:
+            return True
+        return any(k in msg for k in ("timeout", "timed out", "connection", "network", "unreachable"))
+
     async def _ensure_bot(self):
         """确保 Bot 客户端已连接"""
         if self._bot_client is not None and self._bot_connected:
@@ -134,8 +196,6 @@ class TelegramChannel(NotificationChannel):
         if not (bot_enabled and bot_token):
             return
 
-        from telethon import TelegramClient
-        from telethon.sessions import StringSession
         proxy = self._get_proxy()
         use_api_id = int(self._cfg(CFG_API_ID)) if self._cfg(CFG_API_ID) else 17349
         use_api_hash = self._cfg(CFG_API_HASH) or "344583e45741c457fe1862106095a5eb"
@@ -143,22 +203,34 @@ class TelegramChannel(NotificationChannel):
         # 优先复用已保存的 session
         bot_session = self._cfg("tg_bot_session")
         if bot_session:
-            self._bot_client = TelegramClient(StringSession(bot_session), use_api_id, use_api_hash, proxy=proxy, timeout=60)
+            self._bot_client = self._new_client(bot_session, use_api_id, use_api_hash, proxy)
             try:
-                await self._bot_client.connect()
-                if self._bot_client.is_connected():
+                if await self._safe_client_connect(self._bot_client, "Bot"):
                     self._bot_connected = True
                     logger.info("Bot: 连接成功（Session 复用）")
                     self._register_bot_handlers()
                     return
-            except Exception:
+                # Session 可能失效，继续尝试 token 登录
                 self._bot_client = None
+            except Exception as e:
+                logger.warning(f"Bot: Session 复用失败: {e}")
+                self._bot_client = None
+                # 网络问题时不再立即用 token 重连，避免二次长时间卡住
+                if self._is_network_error(e):
+                    self._bot_connected = False
+                    return
 
-        # 首次登录
-        self._bot_client = TelegramClient(StringSession(''), use_api_id, use_api_hash, proxy=proxy, timeout=60)
+        # 首次登录 / Session 无效后的 token 登录
+        self._bot_client = self._new_client("", use_api_id, use_api_hash, proxy)
         try:
-            await self._bot_client.connect()
-            await self._bot_client.sign_in(bot_token=bot_token)
+            if not await self._safe_client_connect(self._bot_client, "Bot"):
+                self._bot_client = None
+                self._bot_connected = False
+                return
+            await asyncio.wait_for(
+                self._bot_client.sign_in(bot_token=bot_token),
+                timeout=TG_CONNECT_WAIT,
+            )
             self._bot_connected = True
             session_str = self._bot_client.session.save()
             get_config_service().set("tg_bot_session", session_str, "Bot Session")
@@ -166,7 +238,9 @@ class TelegramChannel(NotificationChannel):
             self._register_bot_handlers()
         except Exception as e:
             logger.error(f"Bot: 连接失败: {e}")
+            await self._quiet_disconnect(self._bot_client)
             self._bot_client = None
+            self._bot_connected = False
 
     async def _ensure_user(self):
         """确保 User 客户端已连接"""
@@ -180,13 +254,12 @@ class TelegramChannel(NotificationChannel):
         if not (user_enabled and api_id and api_hash and session_string):
             return
 
-        from telethon import TelegramClient
-        from telethon.sessions import StringSession
         proxy = self._get_proxy()
-
-        self._user_client = TelegramClient(StringSession(session_string), int(api_id), api_hash, proxy=proxy, timeout=60)
+        self._user_client = self._new_client(session_string, api_id, api_hash, proxy)
         try:
-            await self._user_client.connect()
+            if not await self._safe_client_connect(self._user_client, "User"):
+                self._user_client = None
+                return
             if await self._user_client.is_user_authorized():
                 self._user_connected = True
                 logger.info("User: 连接成功")
@@ -196,7 +269,9 @@ class TelegramChannel(NotificationChannel):
                 self._user_client = None
         except Exception as e:
             logger.error(f"User: 连接失败: {e}")
+            await self._quiet_disconnect(self._user_client)
             self._user_client = None
+            self._user_connected = False
 
     async def _ensure_all(self):
         """确保所有已启用的客户端都已连接"""
@@ -362,8 +437,24 @@ class TelegramChannel(NotificationChannel):
         if not await self.is_configured():
             return
         logger.info("Telegram 自动连接...")
-        success = await self.connect()
-        logger.info(f"Telegram 自动连接{'成功' if success else '失败'}")
+        try:
+            success = await asyncio.wait_for(self.connect(), timeout=TG_AUTO_CONNECT_WAIT)
+            logger.info(f"Telegram 自动连接{'成功' if success else '失败'}")
+        except asyncio.TimeoutError:
+            logger.warning(
+                f"Telegram 自动连接超时（{TG_AUTO_CONNECT_WAIT}s），"
+                "HTTP 服务不受影响，可稍后在通知设置中手动重连"
+            )
+            try:
+                await self.disconnect()
+            except Exception:
+                pass
+        except Exception as e:
+            logger.warning(f"Telegram 自动连接异常: {e}")
+            try:
+                await self.disconnect()
+            except Exception:
+                pass
 
     async def disconnect(self) -> None:
         if self._bot_client:
@@ -386,8 +477,6 @@ class TelegramChannel(NotificationChannel):
 
     async def send_code(self, phone: str, api_id: str, api_hash: str) -> Dict[str, Any]:
         import time
-        from telethon import TelegramClient
-        from telethon.sessions import StringSession
 
         if self._login_client:
             try:
@@ -397,9 +486,14 @@ class TelegramChannel(NotificationChannel):
 
         proxy = self._get_proxy()
         try:
-            self._login_client = TelegramClient(StringSession(''), int(api_id), api_hash, proxy=proxy, timeout=60)
-            await self._login_client.connect()
-            await self._login_client.send_code_request(phone)
+            self._login_client = self._new_client("", api_id, api_hash, proxy)
+            if not await self._safe_client_connect(self._login_client, "Login"):
+                self._login_client = None
+                return {"success": False, "message": "连接失败: 超时或网络不可用"}
+            await asyncio.wait_for(
+                self._login_client.send_code_request(phone),
+                timeout=TG_CONNECT_WAIT,
+            )
             self._login_phone = phone
             self._login_api_id = api_id
             self._login_api_hash = api_hash
@@ -454,11 +548,10 @@ class TelegramChannel(NotificationChannel):
         if not (session_string and api_id and api_hash):
             return {"logged_in": False, "message": "未配置用户模式凭据"}
         try:
-            from telethon import TelegramClient
-            from telethon.sessions import StringSession
             proxy = self._get_proxy()
-            client = TelegramClient(StringSession(session_string), int(api_id), api_hash, proxy=proxy, timeout=30)
-            await client.connect()
+            client = self._new_client(session_string, api_id, api_hash, proxy)
+            if not await self._safe_client_connect(client, "LoginCheck"):
+                return {"logged_in": False, "message": "检查失败: 连接超时或网络不可用"}
             authorized = await client.is_user_authorized()
             await client.disconnect()
             return {"logged_in": authorized, "message": "Session 有效" if authorized else "Session 已失效，请重新登录"}
@@ -575,7 +668,8 @@ class TelegramChannel(NotificationChannel):
             return status
 
         try:
-            await self._ensure_all()
+            # 状态查询也限制连接等待，避免通知页在网络异常时卡住
+            await asyncio.wait_for(self._ensure_all(), timeout=TG_AUTO_CONNECT_WAIT)
             if self._bot_client and self._bot_connected:
                 me = await self._bot_client.get_me()
                 if me:

@@ -102,14 +102,30 @@ class NotificationManager:
             return False
         return await channel.send_message(message, image_url)
 
-    async def auto_connect_all(self) -> None:
-        """启动时自动连接所有已配置的渠道"""
+    async def disconnect_all(self) -> None:
+        """断开所有渠道连接。"""
         for name, channel in self._channels.items():
-            if hasattr(channel, 'auto_connect'):
-                try:
-                    await channel.auto_connect()
-                except Exception as e:
-                    logger.warning(f"自动连接 {name} 失败: {e}")
+            try:
+                await channel.disconnect()
+            except Exception as e:
+                logger.debug(f"断开渠道 {name} 失败: {e}")
+
+    async def auto_connect_all(self) -> None:
+        """启动时自动连接所有已配置的渠道（并行，单渠道失败不影响其他）。"""
+        tasks = []
+        names = []
+        for name, channel in self._channels.items():
+            if hasattr(channel, "auto_connect"):
+                tasks.append(channel.auto_connect())
+                names.append(name)
+
+        if not tasks:
+            return
+
+        outcomes = await asyncio.gather(*tasks, return_exceptions=True)
+        for name, outcome in zip(names, outcomes):
+            if isinstance(outcome, Exception):
+                logger.warning(f"自动连接 {name} 失败: {outcome}")
 
 
 # 全局单例

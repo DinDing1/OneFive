@@ -248,8 +248,8 @@
                   <span v-else class="status-tag status-no">未整理</span>
                 </div>
                 <div class="tbl-col tbl-col-link">
-                  <!-- 数据库只存储两种状态：0=无效，其它均视为有效 -->
-                  <span v-if="(item.link_valid ?? linkValidMap.get(item.source_id) ?? 1) === 0" class="link-tag link-invalid">无效</span>
+                  <!-- 优先使用检测过程中的 linkValidMap，避免 item.link_valid=0 时 ?? 不回退 -->
+                  <span v-if="resolveLinkValid(item) === 0" class="link-tag link-invalid">无效</span>
                   <span v-else class="link-tag link-valid">有效</span>
                 </div>
                 <div class="tbl-col tbl-col-time">
@@ -295,6 +295,17 @@
             <button class="row-menu-item" @click="rowMenuProperties">
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 20h9" /><path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z" /></svg>
               属性
+            </button>
+            <button
+              class="row-menu-item"
+              :disabled="checkingSingleSourceId === rowMenuTarget?.source_id"
+              @click="rowMenuCheckLink"
+            >
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <path d="M9 12l2 2 4-4" />
+                <circle cx="12" cy="12" r="10" />
+              </svg>
+              {{ checkingSingleSourceId === rowMenuTarget?.source_id ? '检测中…' : '检测有效期' }}
             </button>
             <div class="row-menu-divider"></div>
             <button class="row-menu-item row-menu-danger" @click="rowMenuDelete">
@@ -463,9 +474,9 @@
                 <div class="sr-meta">
                   <span v-if="recognizeResult" class="sr-meta-type">{{ recognizeResult.media_type === 'movie' ? '电影' : '电视剧' }}</span>
                   <span v-if="recognizeResult?.year" class="sr-meta-year">{{ recognizeResult.year }}</span>
-                  <span v-if="recognizeResult?.tmdb_rating" class="sr-meta-rating">
+                  <span v-if="Number(recognizeResult?.tmdb_rating) > 0" class="sr-meta-rating">
                     <svg viewBox="0 0 24 24" fill="currentColor" width="14" height="14"><path d="M12 2l3.09 6.26L22 9.27l-5 4.87 1.18 6.88L12 17.77l-6.18 3.25L7 14.14 2 9.27l6.91-1.01L12 2z" /></svg>
-                    {{ recognizeResult.tmdb_rating.toFixed(1) }}
+                    {{ Number(recognizeResult.tmdb_rating).toFixed(1) }}
                   </span>
                 </div>
               </template>
@@ -490,6 +501,7 @@
             <div class="sr-tags">
               <span v-if="recognizeResult.category" class="sr-tag sr-tag-cat">{{ recognizeResult.category }}</span>
               <span v-if="recognizeResult.tmdb_id" class="sr-tag sr-tag-id">TMDB {{ recognizeResult.tmdb_id }}</span>
+              <span v-else class="sr-tag sr-tag-warn">未命中 TMDB，可手动纠错</span>
             </div>
             <!-- 手动纠错 -->
             <div class="sr-section sr-manual-box">
@@ -708,6 +720,7 @@ type FileFilter = 'all' | 'organized' | 'unorganized' | 'valid' | 'invalid'
 const linkValidMap = ref<Map<number, number>>(new Map())
 const checkingLinks = ref(false)
 const checkProgress = ref('')
+const checkingSingleSourceId = ref<number | null>(null)
 const loadingShares = ref(false)
 const recomputingOrganized = ref(false)
 
@@ -963,9 +976,55 @@ async function handleRecomputeOrganized() {
   }
 }
 
+/** 解析展示用链接状态：检测过程中的 map 优先于列表缓存字段 */
+function resolveLinkValid(item: { source_id: number; link_valid?: number | null }) {
+  if (linkValidMap.value.has(item.source_id)) {
+    return linkValidMap.value.get(item.source_id) as number
+  }
+  // 仅在 map 无记录时使用列表字段；默认有效
+  return item.link_valid ?? 1
+}
+
+/** 将检测结果写回 map + 当前列表行，保证标签即时变化 */
+function applyLinkValidResult(sourceId: number, valid: boolean) {
+  const v = valid ? 1 : 0
+  const m = new Map(linkValidMap.value)
+  m.set(sourceId, v)
+  linkValidMap.value = m
+  // 同步当前页可见行，避免 item.link_valid 旧值盖住 UI
+  for (const f of allFiles.value) {
+    if (f.source_id === sourceId) {
+      f.link_valid = v
+    }
+  }
+}
+
+/** 刷新筛选角标（有效/失效等），不强制重载整页时可单独调用 */
+async function refreshFilterCounts() {
+  try {
+    const res = await shareApi.getAllFiles({
+      filter: 'all',
+      limit: 1,
+      offset: 0,
+      includeCounts: true,
+    })
+    if (res.code === 0 && res.data?.counts) {
+      serverCounts.value = {
+        all_count: res.data.counts.all_count ?? serverCounts.value.all_count,
+        organized_count: res.data.counts.organized_count ?? serverCounts.value.organized_count,
+        unorganized_count: res.data.counts.unorganized_count ?? serverCounts.value.unorganized_count,
+        valid_count: res.data.counts.valid_count ?? 0,
+        invalid_count: res.data.counts.invalid_count ?? 0,
+      }
+    }
+  } catch (e) {
+    console.error('refreshFilterCounts failed:', e)
+  }
+}
+
 /** 批量检测分享链接有效性（SSE 流式）
  * 说明：数据库只存储两种状态（1=有效 / 0=无效），不引入"检测中"中间态。
- * 检测过程中保留上一次的有效/无效状态，逐个更新为最新结果。
+ * 每检出一条立即更新标签；角标按库内最新聚合计数刷新。
  */
 function handleCheckLinks() {
   if (checkingLinks.value) return
@@ -973,6 +1032,7 @@ function handleCheckLinks() {
   checkProgress.value = ''
 
   const es = shareApi.checkAllLinksStream()
+  let countsRefreshChain: Promise<void> = Promise.resolve()
 
   es.onmessage = (event) => {
     try {
@@ -980,25 +1040,49 @@ function handleCheckLinks() {
       if (data.type === 'start') {
         checkProgress.value = `0/${data.total}`
       } else if (data.type === 'progress') {
-        // 更新对应分享的有效性状态
-        const m = new Map(linkValidMap.value)
-        m.set(data.source_id, data.valid ? 1 : 0)
-        linkValidMap.value = m
         checkProgress.value = `${data.current}/${data.total}`
+        // skipped=未登录/网络异常，未改库，不刷新状态以免误标
+        if (!data.skipped) {
+          applyLinkValidResult(data.source_id, !!data.valid)
+          // 串行刷新角标，避免并发乱序覆盖
+          countsRefreshChain = countsRefreshChain
+            .then(() => refreshFilterCounts())
+            .catch(() => {})
+        }
       } else if (data.type === 'done') {
         checkingLinks.value = false
         checkProgress.value = ''
         es.close()
-        const msg = `检测完成：${data.valid_count} 个有效，${data.invalid_count} 个无效`
-        showToast(msg, data.invalid_count > 0 ? 'info' : 'success')
-        if (!isSearching.value) {
-          if (isInSubDir.value) {
-            const last = currentDirBreadcrumbs.value[currentDirBreadcrumbs.value.length - 1]
-            loadSubDirFiles(last.sourceId, last.parentId, { keepPage: true })
-          } else {
-            fetchRootPage({ keepPage: true, includeCounts: true })
+
+        // 优先使用后端附带的文件级角标
+        if (data.file_counts) {
+          serverCounts.value = {
+            all_count: data.file_counts.all_count ?? serverCounts.value.all_count,
+            organized_count: data.file_counts.organized_count ?? serverCounts.value.organized_count,
+            unorganized_count: data.file_counts.unorganized_count ?? serverCounts.value.unorganized_count,
+            valid_count: data.file_counts.valid_count ?? 0,
+            invalid_count: data.file_counts.invalid_count ?? 0,
           }
         }
+
+        const skipped = data.skipped_count || 0
+        let msg = `检测完成：${data.valid_count} 个有效，${data.invalid_count} 个无效`
+        if (skipped > 0) msg += `，${skipped} 个跳过`
+        showToast(msg, data.invalid_count > 0 || skipped > 0 ? 'info' : 'success')
+
+        // 再拉一次列表，保证筛选/分页与标签一致
+        countsRefreshChain
+          .then(async () => {
+            if (!data.file_counts) await refreshFilterCounts()
+            if (isSearching.value) return
+            if (isInSubDir.value) {
+              const last = currentDirBreadcrumbs.value[currentDirBreadcrumbs.value.length - 1]
+              await loadSubDirFiles(last.sourceId, last.parentId, { keepPage: true })
+            } else {
+              await fetchRootPage({ keepPage: true, includeCounts: true })
+            }
+          })
+          .catch(() => {})
       }
     } catch (e) {
       console.error('解析 SSE 数据失败:', e)
@@ -1010,6 +1094,8 @@ function handleCheckLinks() {
     checkProgress.value = ''
     es.close()
     showToast('检测中断，请重试', 'error')
+    // 中断也尽量同步一次角标
+    refreshFilterCounts()
   }
 }
 
@@ -1058,8 +1144,8 @@ async function confirmDeleteShare() {
 
 // ==================== 行操作菜单 ====================
 
-/** 右键菜单预估高度（px）：识别 + 属性 + 分隔线 + 删除 4 项之和的近似值 */
-const MENU_HEIGHT_PX = 140
+/** 右键菜单预估高度（px）：识别 + 属性 + 检测有效期 + 分隔线 + 删除 */
+const MENU_HEIGHT_PX = 176
 
 /** 打开/关闭行菜单 */
 function toggleRowMenu(item: ShareFile, event: MouseEvent) {
@@ -1114,6 +1200,49 @@ function rowMenuProperties() {
   propTargetIds.value = { sourceId: item.source_id, fileId: item.file_id }
   showPropertiesModal.value = true
   loadProperties()
+}
+
+/** 菜单：检测当前行所属分享链接有效期（单个） */
+async function rowMenuCheckLink() {
+  const item = rowMenuTarget.value
+  closeRowMenu()
+  if (!item) return
+  if (checkingLinks.value) {
+    showToast('批量检测进行中，请稍后再试', 'info')
+    return
+  }
+  if (checkingSingleSourceId.value != null) {
+    showToast('已有单个检测在进行', 'info')
+    return
+  }
+
+  checkingSingleSourceId.value = item.source_id
+  try {
+    const res = await shareApi.checkLinkValid(item.source_id)
+    if (res.code !== 0) {
+      showToast(res.message || '检测失败', 'error')
+      return
+    }
+    const data = res.data || {}
+    if (data.skipped) {
+      showToast(data.error || '检测跳过（网络/频控）', 'info')
+      return
+    }
+    applyLinkValidResult(item.source_id, !!data.valid)
+    await refreshFilterCounts()
+    if (data.valid) {
+      showToast(`「${data.share_name || item.share_name || item.name}」链接有效`, 'success')
+    } else {
+      showToast(
+        `「${data.share_name || item.share_name || item.name}」链接无效${data.error ? '：' + data.error : ''}`,
+        'info'
+      )
+    }
+  } catch (e: any) {
+    showToast(e?.message || '检测失败', 'error')
+  } finally {
+    checkingSingleSourceId.value = null
+  }
 }
 
 /** 加载属性数据（分享信息 + 文件信息 + 可选分类） */
@@ -2738,6 +2867,10 @@ function runOrganizeStream(
   transition: background var(--transition-fast);
 }
 
+.row-menu-item:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
 .row-menu-item:hover {
   background: var(--bg-hover);
 }
@@ -3377,6 +3510,7 @@ function runOrganizeStream(
   background: var(--accent-bg);
 }
 
+.sr-tag-warn { background: rgba(245, 158, 11, 0.15); color: #d97706; }
 .sr-tag-id {
   color: var(--text-secondary);
   background: var(--bg-hover);

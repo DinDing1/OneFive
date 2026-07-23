@@ -12,6 +12,7 @@ from urllib.parse import urlparse
 import requests
 from typing import Optional, Dict, Any, List
 from .config_service import get_config_service
+from .file_info_service import build_search_queries
 from ..logger import get_logger
 
 logger = get_logger(__name__)
@@ -110,8 +111,8 @@ class TMDBService:
         """检查是否已配置 API Key"""
         return bool(self.api_key)
 
-    def _get(self, path: str, params: Optional[Dict] = None) -> Optional[Dict]:
-        """调用 TMDB API"""
+    def _get(self, path: str, params: Optional[Dict] = None, retries: int = 2) -> Optional[Dict]:
+        """调用 TMDB API（网络抖动时自动重试）"""
         if not self.api_key:
             logger.warning("TMDB API Key 未配置")
             return None
@@ -121,36 +122,53 @@ class TMDBService:
         if params:
             p.update(params)
 
-        try:
-            resp = requests.get(url, params=p, timeout=API_TIMEOUT)
-            if not resp.ok:
-                text = (resp.text or "")[:200].replace("\n", " ")
-                # 404 是试错流程的正常部分（先按 movie 查，404 再回退查 tv，反之亦然），
-                # 用 debug 避免每次带 tmdb_id 的识别都出警告；其他错误码才是真正问题
-                if resp.status_code == 404:
-                    logger.debug(f"TMDB API 404（试错正常）: url={url}, body={text}")
-                else:
-                    logger.warning(f"TMDB API 请求失败: {resp.status_code}, url={url}, body={text}")
-                return None
-
-            content_type = resp.headers.get("Content-Type", "")
-            if "json" not in content_type.lower():
-                text = (resp.text or "")[:200].replace("\n", " ")
-                logger.error(
-                    f"TMDB API 返回非 JSON 内容，请检查代理地址是否正确: "
-                    f"url={url}, content_type={content_type}, body={text}"
-                )
-                return None
-
+        last_error = None
+        attempts = max(1, int(retries) + 1)
+        for attempt in range(1, attempts + 1):
             try:
-                return resp.json()
-            except JSONDecodeError as e:
-                text = (resp.text or "")[:200].replace("\n", " ")
-                logger.error(f"TMDB API JSON 解析失败，请检查代理返回内容: {e}, url={url}, body={text}")
-                return None
-        except requests.RequestException as e:
-            logger.error(f"TMDB API 请求异常: {e}")
-            return None
+                resp = requests.get(url, params=p, timeout=API_TIMEOUT)
+                if not resp.ok:
+                    body = (resp.text or "")[:200].replace("\n", " ")
+                    # 404 是试错流程的正常部分（先按 movie 查，404 再回退查 tv，反之亦然），
+                    # 用 debug 避免每次带 tmdb_id 的识别都出警告；其他错误码才是真正问题
+                    if resp.status_code == 404:
+                        logger.debug(f"TMDB API 404（试错正常）: url={url}, body={body}")
+                        return None
+                    logger.warning(
+                        f"TMDB API 请求失败: {resp.status_code}, url={url}, "
+                        f"attempt={attempt}/{attempts}, body={body}"
+                    )
+                    # 5xx 可重试；其余错误码直接返回
+                    if resp.status_code < 500 or attempt >= attempts:
+                        return None
+                    continue
+
+                content_type = resp.headers.get("Content-Type", "")
+                if "json" not in content_type.lower():
+                    body = (resp.text or "")[:200].replace("\n", " ")
+                    logger.error(
+                        f"TMDB API 返回非 JSON 内容，请检查代理地址是否正确: "
+                        f"url={url}, content_type={content_type}, body={body}"
+                    )
+                    return None
+
+                try:
+                    return resp.json()
+                except JSONDecodeError as e:
+                    body = (resp.text or "")[:200].replace("\n", " ")
+                    logger.error(f"TMDB API JSON 解析失败，请检查代理返回内容: {e}, url={url}, body={body}")
+                    return None
+            except requests.RequestException as e:
+                last_error = e
+                if attempt >= attempts:
+                    break
+                logger.warning(
+                    f"TMDB API 请求异常，准备重试 ({attempt}/{attempts}): {e}"
+                )
+
+        if last_error is not None:
+            logger.error(f"TMDB API 请求异常: {last_error}")
+        return None
 
     def search_media(self, query: str, media_type: str = "movie", year: Optional[str] = None) -> List[Dict]:
         """搜索电影/电视剧
@@ -433,36 +451,104 @@ class TMDBService:
         )
         return best
 
-    def search_and_pick(self, query: str, media_type: str, year: Optional[str] = None) -> Optional[Dict]:
-        """搜索并智能匹配最佳结果
 
-        Returns:
-            匹配的媒体详情，未匹配返回 None
+    def _details_from_search_result(self, item: Dict, media_type: str) -> Optional[Dict]:
+        """搜索命中但详情接口失败时，把 search 结果规整成 details 形状。
+
+        足够支撑识别弹窗（id/title/poster/overview/rating/year）和基础分类。
         """
-        results = self.search_media(query, media_type, year)
-        if not results:
+        if not item or not item.get("id"):
             return None
-
-        best = self._pick_best_result(results, query, media_type, year)
-        if not best:
-            return None
-
-        tmdb_id = best.get("id")
-        if not tmdb_id:
-            return None
-
-        if media_type == "movie":
-            details = self.get_movie_details(tmdb_id)
+        details = dict(item)
+        # 分类逻辑读 genres；搜索接口只有 genre_ids
+        if not details.get("genres") and details.get("genre_ids"):
+            details["genres"] = [{"id": gid} for gid in details.get("genre_ids") or []]
+        # 确保类型判定字段存在
+        if media_type == "tv":
+            details.setdefault("first_air_date", item.get("first_air_date") or "")
+            if item.get("name") and not details.get("name"):
+                details["name"] = item.get("name")
         else:
-            details = self.get_tv_details(tmdb_id)
-
-        # 保留搜索结果的标题到 _search_title 字段
-        # 搜索接口可能返回中文本地化标题（如"蝴蝶楼·惊魂"），
-        # 但详情接口的 title 字段可能是拼音（如"Hu die lou: Jing hun"）。
-        # get_chinese_title 兜底时会优先用 _search_title，避免拼音覆盖中文。
-        if details is not None and best.get("title"):
-            details["_search_title"] = best.get("title")
+            details.setdefault("release_date", item.get("release_date") or "")
+            if item.get("title") and not details.get("title"):
+                details["title"] = item.get("title")
         return details
+
+    def search_and_pick(
+        self,
+        query: str,
+        media_type: str,
+        year: Optional[str] = None,
+        fallback_query: str = "",
+    ) -> Optional[Dict]:
+        """搜索并智能匹配最佳结果（多 query 顺序尝试）。
+
+        顺序：title+year → title → fallbackQuery → 中英拆分，命中即停。
+        """
+        if not media_type:
+            media_type = "movie"
+
+        candidates = build_search_queries(query, year, fallback_query)
+        if not candidates and (query or "").strip():
+            candidates = [((query or "").strip(), str(year).strip() if year else None)]
+
+        for q, y in candidates:
+            results = self.search_media(q, media_type, y)
+            if not results:
+                # 带年份无结果时，同 query 不带年份再试一次（若候选里还没有）
+                if y:
+                    results = self.search_media(q, media_type, None)
+                    y_for_pick = None
+                else:
+                    continue
+            else:
+                y_for_pick = y
+
+            if not results:
+                continue
+
+            best = self._pick_best_result(results, q, media_type, y_for_pick)
+            if not best:
+                # 带年份被年份硬拒时，再试无年份打分
+                if y_for_pick:
+                    best = self._pick_best_result(results, q, media_type, None)
+            if not best:
+                continue
+
+            tmdb_id = best.get("id")
+            if not tmdb_id:
+                continue
+
+            if media_type == "movie":
+                details = self.get_movie_details(tmdb_id)
+            else:
+                details = self.get_tv_details(tmdb_id)
+
+            # 详情接口偶发 SSL/网络失败时，用搜索结果兜底，避免"已匹配却无详情"导致前端空白
+            if details is None:
+                details = self._details_from_search_result(best, media_type)
+                if details is not None:
+                    logger.warning(
+                        f"TMDB details 获取失败，使用搜索结果兜底: type={media_type}, id={tmdb_id}"
+                    )
+
+            if details is not None:
+                # 搜索接口中文标题兜底
+                if best.get("title"):
+                    details["_search_title"] = best.get("title")
+                elif best.get("name"):
+                    details["_search_title"] = best.get("name")
+                logger.info(
+                    f"TMDB multi-query hit: q={q!r}, year={y_for_pick or '-'}, "
+                    f"type={media_type}, id={tmdb_id}"
+                )
+                return details
+
+        logger.warning(
+            f"TMDB multi-query miss: title={query!r}, year={year or '-'}, "
+            f"fallback={fallback_query!r}, type={media_type}, tried={len(candidates)}"
+        )
+        return None
 
     def search_with_validation(
         self,
@@ -471,6 +557,7 @@ class TMDBService:
         media_type: str,
         year: str,
         strict_media_type: bool = False,
+        fallback_query: str = "",
     ) -> tuple:
         """TMDB 搜索验证：优先 ID 查询，验证名称和年份，智能回退
 
@@ -489,6 +576,7 @@ class TMDBService:
             media_type: 媒体类型 ("movie" 或 "tv")
             year: 年份字符串
             strict_media_type: True 时主类型查不到不回退到另一类型（避免电影误判为电视剧）
+            fallback_query: 清洗后的兜底搜索串（多 query 链路使用）
 
         Returns:
             (details, resolved_media_type) 元组：
@@ -551,7 +639,7 @@ class TMDBService:
                     return fallback_details, fallback_type
                 # 另一类型也不匹配：tmdbid 可能是错的，回退到标题+年份搜索
                 if title:
-                    search_result = self.search_and_pick(title, media_type, year)
+                    search_result = self.search_and_pick(title, media_type, year, fallback_query=fallback_query)
                     if search_result:
                         return search_result, media_type
                 # 搜索也失败：不采用名称/年份不符的 tmdbid 结果
@@ -570,16 +658,21 @@ class TMDBService:
             # 5. 严格模式主类型查不到，或非严格模式另一类型也失败：
             #    尝试同类型标题搜索兜底（严格模式不允许跨类型，但允许同类型标题搜索）
             if title:
-                search_result = self.search_and_pick(title, media_type, year)
+                search_result = self.search_and_pick(title, media_type, year, fallback_query=fallback_query)
                 if search_result:
                     return search_result, media_type
 
             # 6. 所有回退都失败：返回 None（不采用名称/年份不符的结果）
             return None, None
 
-        # ---- 无 tmdb_id，通过标题搜索 ----
-        if title:
-            result = self.search_and_pick(title, media_type, year)
+        # ---- 无 tmdb_id，通过标题多 query 搜索 ----
+        if title or fallback_query:
+            result = self.search_and_pick(
+                title or fallback_query,
+                media_type,
+                year,
+                fallback_query=fallback_query,
+            )
             if result:
                 return result, media_type
             return None, None

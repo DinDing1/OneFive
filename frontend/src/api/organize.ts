@@ -1,4 +1,4 @@
-import api, { type ApiResult } from './index'
+﻿import api, { type ApiResult } from './index'
 
 export interface RecognizeRequest {
   file_id: string
@@ -13,6 +13,7 @@ export interface ManualRecognizeRequest extends RecognizeRequest {
 }
 
 export interface RecognizeResult {
+  recognized?: boolean
   file_id: string
   filename: string
   is_dir: boolean
@@ -62,14 +63,14 @@ export interface ExecuteRequest {
 }
 
 export const organizeApi = {
-  /** 识别文件 */
+  /** 识别文件（TMDB 网络慢时可能超过默认 30s） */
   recognize(req: RecognizeRequest): Promise<ApiResult<RecognizeResult>> {
-    return api.post('/organize/recognize', req)
+    return api.post('/organize/recognize', req, { timeout: 120000 })
   },
 
   /** 手动纠错识别 */
   manualRecognize(req: ManualRecognizeRequest): Promise<ApiResult<RecognizeResult>> {
-    return api.post('/organize/recognize/manual', req)
+    return api.post('/organize/recognize/manual', req, { timeout: 120000 })
   },
 
   /** 获取整理配置 */

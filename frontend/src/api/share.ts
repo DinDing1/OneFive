@@ -56,14 +56,14 @@ export interface ShareFileListResponse {
 }
 
 export const shareApi = {
-  /** 识别文件（只识别不写入数据库，用于预览） */
+  /** 识别文件（只识别不写入数据库；TMDB 慢时放宽超时到 120s） */
   recognizeFile(sourceId: number, fileId: string): Promise<ApiResult<RecognizeResult>> {
-    return api.post('/share/recognize', { source_id: sourceId, file_id: fileId })
+    return api.post('/share/recognize', { source_id: sourceId, file_id: fileId }, { timeout: 120000 })
   },
 
   /** 手动纠错识别 */
   manualRecognizeFile(sourceId: number, fileId: string, tmdbId: number, mediaType: 'movie' | 'tv'): Promise<ApiResult<RecognizeResult>> {
-    return api.post('/share/recognize/manual', { source_id: sourceId, file_id: fileId, tmdb_id: tmdbId, media_type: mediaType })
+    return api.post('/share/recognize/manual', { source_id: sourceId, file_id: fileId, tmdb_id: tmdbId, media_type: mediaType }, { timeout: 120000 })
   },
 
   /** 手动纠错整理 */

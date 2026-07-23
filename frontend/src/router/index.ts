@@ -33,6 +33,11 @@ const router = createRouter({
           component: () => import('@/views/Share.vue')
         },
         {
+          path: 'share-wash',
+          name: 'ShareWash',
+          component: () => import('@/views/ShareWash.vue')
+        },
+        {
           path: 'about',
           name: 'About',
           component: () => import('@/views/About.vue')

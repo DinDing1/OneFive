@@ -46,6 +46,13 @@
           </svg>
           <span>分享管理</span>
         </router-link>
+        <router-link to="/share-wash" class="nav-item" @click="showSidebar = false">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <path d="M3 6h18"/><path d="M8 6V4h8v2"/><path d="M19 6l-1 14H6L5 6"/>
+            <path d="M10 11v6"/><path d="M14 11v6"/>
+          </svg>
+          <span>分享洗版</span>
+        </router-link>
         <router-link to="/settings" class="nav-item" @click="showSidebar = false">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
             <circle cx="12" cy="12" r="3" />
@@ -166,6 +173,7 @@ const currentTitle = computed(() => {
   const titles: Record<string, string> = {
     'Files': '文件管理',
     'Share': '分享管理',
+    'ShareWash': '分享洗版',
     'Settings': '设置',
     'About': '关于'
   }

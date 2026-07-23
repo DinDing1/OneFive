@@ -109,6 +109,7 @@ class OrganizeService:
             title=key_info.get("title", ""),
             media_type=key_info["mediaType"],
             year=key_info.get("year"),
+            fallback_query=key_info.get("fallbackQuery") or "",
         )
         # 回退到另一类型时更新 mediaType
         if resolved_media_type:
@@ -176,6 +177,7 @@ class OrganizeService:
             title=key_info.get("title", ""),
             media_type=key_info["mediaType"],
             year=key_info.get("year"),
+            fallback_query=key_info.get("fallbackQuery") or "",
         )
         # 回退到另一类型时更新 mediaType
         if resolved_media_type:
@@ -227,6 +229,7 @@ class OrganizeService:
             title=key_info.get("title", ""),
             media_type=media_type,
             year=key_info.get("year"),
+            fallback_query=key_info.get("fallbackQuery") or "",
         )
         # 回退到另一类型时更新 mediaType
         if resolved_media_type:

@@ -44,11 +44,11 @@
             <div class="hero-meta">
               <span v-if="result" class="meta-type">{{ result.media_type === 'movie' ? '电影' : '电视剧' }}</span>
               <span v-if="result?.year" class="meta-year">{{ result.year }}</span>
-              <span v-if="result?.tmdb_rating" class="meta-rating">
+              <span v-if="Number(result?.tmdb_rating) > 0" class="meta-rating">
                 <svg viewBox="0 0 24 24" fill="currentColor" width="14" height="14">
                   <path d="M12 2l3.09 6.26L22 9.27l-5 4.87 1.18 6.88L12 17.77l-6.18 3.25L7 14.14 2 9.27l6.91-1.01L12 2z" />
                 </svg>
-                {{ result.tmdb_rating.toFixed(1) }}
+                {{ Number(result.tmdb_rating).toFixed(1) }}
               </span>
             </div>
           </div>
@@ -67,6 +67,7 @@
         <div class="tag-row">
           <span v-if="result.category" class="tag tag-category">{{ result.category }}</span>
           <span v-if="result.tmdb_id" class="tag tag-id">TMDB {{ result.tmdb_id }}</span>
+          <span v-else class="tag tag-warn">未命中 TMDB，可手动纠错</span>
         </div>
 
         <!-- 手动纠错 -->
@@ -630,6 +631,7 @@ async function doOrganize() {
 }
 
 /* TMDB ID 标签：中性灰，monospace */
+.tag-warn { background: rgba(245, 158, 11, 0.15); color: #d97706; }
 .tag-id {
   color: var(--text-secondary);
   background: var(--bg-hover);

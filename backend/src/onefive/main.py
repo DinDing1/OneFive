@@ -25,6 +25,7 @@ try:
 except AttributeError:
     pass  # Windows 不支持 time.tzset()
 
+import asyncio
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -45,6 +46,7 @@ from .api.notification import router as notification_router
 from .api.direct_link import router as direct_link_router
 from .api.share import router as share_router
 from .api.strm import router as strm_router
+from .api.share_wash import router as share_wash_router
 from .db.database import close_db
 
 # 初始化日志
@@ -52,18 +54,26 @@ setup_logging()
 logger = get_logger(__name__)
 
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    """应用生命周期管理"""
-    logger.info("壹伍（OneFive）服务启动中...")
-
-    # 启动时自动连接已配置的通知渠道
+async def _auto_connect_notifications() -> None:
+    """后台连接通知渠道，失败不影响 HTTP 服务。"""
     try:
         from .notification import get_notification_manager
         manager = get_notification_manager()
         await manager.auto_connect_all()
     except Exception as e:
         logger.warning(f"通知渠道自动连接失败: {e}")
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """应用生命周期管理"""
+    logger.info("壹伍（OneFive）服务启动中...")
+
+    # 通知渠道放到后台连接：网络/Telegram 超时不得阻塞 HTTP 就绪
+    auto_connect_task = asyncio.create_task(
+        _auto_connect_notifications(),
+        name="notification-auto-connect",
+    )
 
     # 自动启动直链服务
     try:
@@ -74,8 +84,26 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.warning(f"直链服务自动启动失败: {e}")
 
+    logger.info("HTTP 服务就绪（通知渠道后台连接中）")
     yield
     logger.info("壹伍（OneFive）服务关闭中...")
+
+    # 取消仍在进行的自动连接，避免关闭阶段挂起
+    if not auto_connect_task.done():
+        auto_connect_task.cancel()
+        try:
+            await auto_connect_task
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            logger.debug(f"取消通知自动连接任务: {e}")
+
+    # 断开通知渠道
+    try:
+        from .notification import get_notification_manager
+        await get_notification_manager().disconnect_all()
+    except Exception:
+        pass
 
     # 停止直链服务
     try:
@@ -128,6 +156,7 @@ app.include_router(notification_router)
 app.include_router(direct_link_router)
 app.include_router(share_router)
 app.include_router(strm_router)
+app.include_router(share_wash_router)
 
 # ==================== 前端静态文件 ====================
 # 飞牛网关通过 gatewayPrefix="/app/onefive" 转发请求，
