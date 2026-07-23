@@ -8,10 +8,12 @@
 - 自动创建数据目录和数据库文件
 - 路径由 paths 模块统一管理，自动适配飞牛环境
 """
+import os
 import sqlite3
+import stat
 import threading
 from pathlib import Path
-from typing import Optional, List
+from typing import Optional, List, Any
 
 from ..paths import DB_PATH
 
@@ -38,27 +40,94 @@ class Database:
         # 但 SQLite 写入需要串行化，并发写入会抛 "database is locked"。
         # 所有数据库操作都通过 self._lock 串行化，保证线程安全。
         # 注意：所有方法均为单次 acquire-release，不嵌套调用其他加锁方法，避免死锁。
+        # 例外：reconnect / execute_write 在同一把锁内完成多步操作。
         self._lock = threading.Lock()
+        self._conn: Optional[sqlite3.Connection] = None
 
-        # 建立连接并初始化表结构
-        self._conn = sqlite3.connect(str(self.db_path), check_same_thread=False)
-        self._conn.row_factory = sqlite3.Row  # 返回字典形式的结果
-
-        # Performance PRAGMAs for concurrent reads and large queries
-        # WAL: readers don't block writers as much as delete journal
-        # synchronous=NORMAL: safe enough with WAL, faster than FULL
-        # cache_size=-64000: ~64MB page cache
-        # temp_store=MEMORY: temp tables/sorts in memory
-        # mmap_size: memory-map large tables
-        # busy_timeout: reduce transient database is locked errors
-        self._conn.execute("PRAGMA journal_mode=WAL")
-        self._conn.execute("PRAGMA synchronous=NORMAL")
-        self._conn.execute("PRAGMA cache_size=-64000")
-        self._conn.execute("PRAGMA temp_store=MEMORY")
-        self._conn.execute("PRAGMA mmap_size=268435456")
-        self._conn.execute("PRAGMA busy_timeout=10000")
-        self._conn.execute("PRAGMA foreign_keys=ON")
+        self._ensure_path_writable()
+        self._open_connection()
         self._init_tables()
+
+    @staticmethod
+    def _clear_readonly_attr(path: Path) -> None:
+        """清除 Windows 只读属性 / POSIX 写权限，避免 readonly database。"""
+        try:
+            if not path.exists():
+                return
+            # POSIX / 通用：加上 owner 写权限
+            mode = path.stat().st_mode
+            path.chmod(mode | stat.S_IWRITE | stat.S_IREAD)
+        except Exception:
+            pass
+        if os.name == "nt":
+            try:
+                import ctypes
+                # 去掉 FILE_ATTRIBUTE_READONLY，保留其余常见属性无妨
+                FILE_ATTRIBUTE_NORMAL = 0x80
+                ctypes.windll.kernel32.SetFileAttributesW(str(path), FILE_ATTRIBUTE_NORMAL)
+            except Exception:
+                pass
+
+    def _ensure_path_writable(self) -> None:
+        """确保数据库目录与相关文件可写（含 WAL/SHM）。"""
+        try:
+            self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            pass
+        self._clear_readonly_attr(self.db_path.parent)
+        self._clear_readonly_attr(self.db_path)
+        for suffix in ("-wal", "-shm", "-journal"):
+            self._clear_readonly_attr(Path(str(self.db_path) + suffix))
+
+    def _apply_pragmas(self, conn: sqlite3.Connection) -> None:
+        """应用性能与并发相关 PRAGMA。"""
+        # WAL: 读写并发更好
+        # synchronous=NORMAL: WAL 下足够安全且更快
+        # cache_size=-64000: ~64MB page cache
+        # temp_store=MEMORY: 临时表/排序走内存
+        # mmap_size: Windows 上过大 mmap 偶发异常，保守一些
+        # busy_timeout: 降低 database is locked
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
+        conn.execute("PRAGMA cache_size=-64000")
+        conn.execute("PRAGMA temp_store=MEMORY")
+        # Windows 上 mmap 有时会触发奇怪的 IO/只读错误，使用较小映射
+        mmap = 0 if os.name == "nt" else 268435456
+        conn.execute(f"PRAGMA mmap_size={mmap}")
+        conn.execute("PRAGMA busy_timeout=15000")
+        conn.execute("PRAGMA foreign_keys=ON")
+        # 明确关闭 query_only，防止连接残留只读状态
+        conn.execute("PRAGMA query_only=OFF")
+
+    def _open_connection(self) -> None:
+        """打开 SQLite 连接并配置 PRAGMA（调用方需持有锁或处于初始化）。"""
+        self._ensure_path_writable()
+        conn = sqlite3.connect(
+            str(self.db_path),
+            timeout=30.0,
+            check_same_thread=False,
+            isolation_level="DEFERRED",
+        )
+        conn.row_factory = sqlite3.Row
+        self._apply_pragmas(conn)
+        self._conn = conn
+
+    def reconnect(self) -> None:
+        """关闭并重建连接（用于 readonly / locked 等可恢复错误）。"""
+        with self._lock:
+            try:
+                if self._conn is not None:
+                    try:
+                        self._conn.rollback()
+                    except Exception:
+                        pass
+                    try:
+                        self._conn.close()
+                    except Exception:
+                        pass
+            finally:
+                self._conn = None
+            self._open_connection()
 
     def _init_tables(self):
         """初始化数据库表结构
@@ -146,6 +215,10 @@ class Database:
         self._conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_share_file_src_org "
             "ON share_file(source_id, organized, is_dir)"
+        )
+        self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_share_file_wash "
+            "ON share_file(organized, is_dir, media_type, tmdb_id, source_id)"
         )
         # COUNT WHERE source_id=? AND is_dir=0
         self._conn.execute(
@@ -274,10 +347,31 @@ class Database:
 
         self._conn.commit()
 
+    def _require_conn(self) -> sqlite3.Connection:
+        if self._conn is None:
+            self._open_connection()
+        assert self._conn is not None
+        return self._conn
+
+    @staticmethod
+    def is_recoverable_write_error(err: BaseException) -> bool:
+        """判断是否为可恢复的写入错误（只读库 / 锁 / IO）。"""
+        msg = str(err).lower()
+        needles = (
+            "readonly",
+            "read-only",
+            "read only",
+            "locked",
+            "busy",
+            "disk i/o error",
+            "unable to open database file",
+        )
+        return any(n in msg for n in needles)
+
     def execute(self, sql: str, params: tuple = ()) -> sqlite3.Cursor:
         """执行 SQL 语句（线程安全）"""
         with self._lock:
-            return self._conn.execute(sql, params)
+            return self._require_conn().execute(sql, params)
 
     def executemany(self, sql: str, params: list) -> None:
         """批量执行 SQL 语句（线程安全）
@@ -285,40 +379,74 @@ class Database:
         用于一次性插入/更新多条记录，减少数据库往返次数。
         """
         with self._lock:
-            self._conn.executemany(sql, params)
+            self._require_conn().executemany(sql, params)
+
+    def execute_write(self, sql: str, params: tuple = ()) -> sqlite3.Cursor:
+        """在同一把锁内执行写语句并 commit，避免 execute/commit 间隙竞态。"""
+        with self._lock:
+            conn = self._require_conn()
+            try:
+                cur = conn.execute(sql, params)
+                conn.commit()
+                return cur
+            except Exception:
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
+                raise
+
+    def executemany_write(self, sql: str, params: list) -> None:
+        """批量写入并在同一把锁内 commit。"""
+        with self._lock:
+            conn = self._require_conn()
+            try:
+                conn.executemany(sql, params)
+                conn.commit()
+            except Exception:
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
+                raise
 
     def commit(self):
         """提交事务（线程安全）"""
         with self._lock:
-            self._conn.commit()
+            self._require_conn().commit()
 
     def rollback(self):
         """Rollback transaction (thread-safe)"""
         with self._lock:
-            self._conn.rollback()
+            if self._conn is not None:
+                self._conn.rollback()
 
     def executescript(self, sql: str) -> None:
         """Execute multiple SQL statements (thread-safe)"""
         with self._lock:
-            self._conn.executescript(sql)
+            self._require_conn().executescript(sql)
 
     def fetchone(self, sql: str, params: tuple = ()) -> Optional[sqlite3.Row]:
         """查询单条记录（线程安全）"""
         with self._lock:
-            cursor = self._conn.execute(sql, params)
+            cursor = self._require_conn().execute(sql, params)
             return cursor.fetchone()
 
     def fetchall(self, sql: str, params: tuple = ()) -> List[sqlite3.Row]:
         """查询多条记录（线程安全）"""
         with self._lock:
-            cursor = self._conn.execute(sql, params)
+            cursor = self._require_conn().execute(sql, params)
             return cursor.fetchall()
 
     def close(self):
         """关闭数据库连接"""
-        if self._conn:
-            self._conn.close()
-            self._conn = None
+        with self._lock:
+            if self._conn is not None:
+                try:
+                    self._conn.close()
+                except Exception:
+                    pass
+                self._conn = None
 
     def __enter__(self):
         return self
@@ -330,19 +458,23 @@ class Database:
 
 # 全局数据库实例（单例模式）
 _db_instance: Optional[Database] = None
+_db_instance_lock = threading.Lock()
 
 
 def get_db() -> Database:
-    """获取数据库实例（单例模式）"""
+    """获取数据库实例（线程安全单例）"""
     global _db_instance
     if _db_instance is None:
-        _db_instance = Database()
+        with _db_instance_lock:
+            if _db_instance is None:
+                _db_instance = Database()
     return _db_instance
 
 
 def close_db():
     """关闭全局数据库实例"""
     global _db_instance
-    if _db_instance is not None:
-        _db_instance.close()
-        _db_instance = None
+    with _db_instance_lock:
+        if _db_instance is not None:
+            _db_instance.close()
+            _db_instance = None

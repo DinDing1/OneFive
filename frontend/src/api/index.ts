@@ -11,7 +11,7 @@ export interface ApiResult<T = any> {
   data: T
 }
 
-/** 全局请求超时时间（毫秒），长耗时接口（如整理）改用 SSE 流式响应绕过此限制 */
+/** 全局请求超时时间（毫秒）。长耗时接口（整理/检测/分享洗版分析）请用 SSE，勿依赖拉长 timeout */
 const API_TIMEOUT = 30000
 
 const api = axios.create({

@@ -48,6 +48,33 @@ class DirectLinkCacheService:
         self.db = get_db()
         self._write_count = 0
 
+    def _write_with_retry(self, sql: str, params: tuple = (), *, action: str = "write") -> int:
+        """原子写入；遇到 readonly/locked 时重连重试一次。
+
+        Returns:
+            cursor.rowcount（失败时 -1 不抛到调用方时由上层处理）
+        """
+        last_err = None
+        for attempt in range(2):
+            try:
+                cur = self.db.execute_write(sql, params)
+                return cur.rowcount if cur is not None else 0
+            except Exception as e:
+                last_err = e
+                if attempt == 0 and self.db.is_recoverable_write_error(e):
+                    logger.warning(
+                        f"直链缓存{action}失败，尝试重连数据库后重试: {e}"
+                    )
+                    try:
+                        self.db.reconnect()
+                    except Exception as re:
+                        logger.warning(f"数据库重连失败: {re}")
+                        break
+                    continue
+                break
+        assert last_err is not None
+        raise last_err
+
     # ==================== 键构建 ====================
 
     @staticmethod
@@ -150,11 +177,11 @@ class DirectLinkCacheService:
         if expires_at <= now:
             # 过期则删除，避免表膨胀
             try:
-                self.db.execute(
+                self._write_with_retry(
                     "DELETE FROM direct_link_cache WHERE cache_key = ?",
                     (cache_key,),
+                    action="删除过期",
                 )
-                self.db.commit()
             except Exception as e:
                 logger.debug(f"删除过期直链缓存失败: {e}")
             return None
@@ -219,7 +246,7 @@ class DirectLinkCacheService:
             return False
 
         try:
-            self.db.execute(
+            self._write_with_retry(
                 """
                 INSERT INTO direct_link_cache (
                     cache_key, pickcode, file_id, share_code, sha1,
@@ -245,14 +272,16 @@ class DirectLinkCacheService:
                     url,
                     float(expires_at),
                 ),
+                action="写入",
             )
-            self.db.commit()
             self._write_count += 1
             if self._write_count % _CLEANUP_EVERY_N_WRITES == 0:
                 self.cleanup_expired()
             return True
         except Exception as e:
-            logger.warning(f"写入直链缓存失败: key={cache_key}, err={e}")
+            logger.warning(
+                f"写入直链缓存失败: key={cache_key}, db={self.db.db_path}, err={e}"
+            )
             return False
 
     def invalidate(
@@ -276,12 +305,14 @@ class DirectLinkCacheService:
         if not base_key:
             return 0
         try:
-            cursor = self.db.execute(
-                "DELETE FROM direct_link_cache WHERE cache_key = ? OR cache_key LIKE ?",
-                (base_key, f"{base_key}|ua:%"),
+            return max(
+                0,
+                self._write_with_retry(
+                    "DELETE FROM direct_link_cache WHERE cache_key = ? OR cache_key LIKE ?",
+                    (base_key, f"{base_key}|ua:%"),
+                    action="清除",
+                ),
             )
-            self.db.commit()
-            return cursor.rowcount if cursor is not None else 0
         except Exception as e:
             logger.warning(f"清除直链缓存失败: {e}")
             return 0
@@ -293,12 +324,14 @@ class DirectLinkCacheService:
             删除行数
         """
         try:
-            cursor = self.db.execute(
-                "DELETE FROM direct_link_cache WHERE expires_at <= ?",
-                (time.time(),),
+            count = max(
+                0,
+                self._write_with_retry(
+                    "DELETE FROM direct_link_cache WHERE expires_at <= ?",
+                    (time.time(),),
+                    action="清理过期",
+                ),
             )
-            self.db.commit()
-            count = cursor.rowcount if cursor is not None else 0
             if count:
                 logger.info(f"清理过期直链缓存: {count} 条")
             return count

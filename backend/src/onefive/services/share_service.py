@@ -286,25 +286,31 @@ class ShareService:
                 "skipped": True,
             }
 
-        self.db.execute(
-            """UPDATE share_source
-               SET link_valid = ?, error_msg = ?,
-                   updated_at = datetime('now', 'localtime')
-               WHERE id = ?""",
-            (1 if valid else 0, error_msg, source_id),
-        )
-        self.db.commit()
+        # 写库单独保护：检测结果本身已拿到，库只读/锁失败不应变成 500
+        write_error = ""
+        try:
+            self._update_link_valid(source_id, valid, error_msg)
+        except Exception as e:
+            write_error = str(e)[:200]
+            logger.warning(
+                f"检测结果写库失败（不影响本次判定）: {share_name} ({share_code}): {write_error}"
+            )
+
         logger.info(
             f"检测分享链接: {share_name} ({share_code}) → "
-            f"{'有效' if valid else '无效: ' + error_msg}"
+            f"{'有效' if valid else '无效: ' + (error_msg or '')}"
+            + (f"（写库失败: {write_error}）" if write_error else "")
         )
-        return {
+        result = {
             "source_id": source_id,
             "share_code": share_code,
             "share_name": share_name,
             "valid": valid,
-            "error": error_msg,
+            "error": error_msg or write_error,
         }
+        if write_error:
+            result["write_error"] = write_error
+        return result
 
     @staticmethod
     def _is_transient_share_error(exc: BaseException) -> bool:
@@ -315,6 +321,35 @@ class ShareService:
             "temporarily", "connection", "connect",
         )
         return any(k in s for k in keys)
+
+
+    def _update_link_valid(self, source_id: int, valid: bool, error_msg: str = "") -> None:
+        """更新 link_valid；遇到只读库/锁则重连重试一次。"""
+        sql = """
+            UPDATE share_source
+               SET link_valid = ?, error_msg = ?,
+                   updated_at = datetime('now', 'localtime')
+             WHERE id = ?
+        """
+        params = (1 if valid else 0, error_msg or "", source_id)
+        last_err: Exception | None = None
+        for attempt in range(2):
+            try:
+                self.db.execute_write(sql, params)
+                return
+            except Exception as e:
+                last_err = e
+                if attempt == 0 and getattr(self.db, "is_recoverable_write_error", lambda _e: False)(e):
+                    logger.warning(f"更新 link_valid 失败，重连数据库后重试: {e}")
+                    try:
+                        self.db.reconnect()
+                    except Exception as re_err:
+                        logger.warning(f"数据库重连失败: {re_err}")
+                        break
+                    continue
+                break
+        if last_err:
+            raise last_err
 
     def _call_share_snap(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         """抗风控调用 share snap。

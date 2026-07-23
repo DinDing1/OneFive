@@ -54,11 +54,25 @@ export interface WashAnalyzeResult {
   groups: WashGroup[]
 }
 
+/**
+ * 分享洗版分析：正式环境走飞牛统一网关，长任务用 SSE（与整理/检测一致），
+ * 不依赖 axios 默认 30s 超时。
+ */
+export function analyzeShareWashStream(mediaType: 'all' | 'movie' | 'tv' = 'all'): EventSource {
+  const baseURL = api.defaults.baseURL || '/app/onefive/api'
+  const url = `${baseURL}/share-wash/analyze-stream?media_type=${encodeURIComponent(mediaType)}`
+  return new EventSource(url)
+}
+
 export const shareWashApi = {
+  /** @deprecated 优先使用 analyzeStream，保留同步接口作兼容 */
   analyze(mediaType: 'all' | 'movie' | 'tv' = 'all'): Promise<ApiResult<WashAnalyzeResult>> {
-    return api.post('/share-wash/analyze', { media_type: mediaType })
+    return api.post('/share-wash/analyze', { media_type: mediaType }, { timeout: 300000 })
+  },
+  analyzeStream(mediaType: 'all' | 'movie' | 'tv' = 'all'): EventSource {
+    return analyzeShareWashStream(mediaType)
   },
   deleteSources(sourceIds: number[]): Promise<ApiResult<{ total: number; success: number; failed: number; source_ids: number[] }>> {
-    return api.post('/share-wash/delete', { source_ids: sourceIds })
+    return api.post('/share-wash/delete', { source_ids: sourceIds }, { timeout: 120000 })
   }
 }

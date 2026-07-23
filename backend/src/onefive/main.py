@@ -225,10 +225,15 @@ async def global_exception_handler(request, exc):
     返回 HTTP 200 而非 500，确保前端 axios 拦截器能正常解析 ApiResult，
     前端统一通过 code 字段判断成功/失败，不依赖 HTTP 状态码。
     """
-    logger.exception(f"未处理异常: {request.url.path}")
+    err = str(exc)[:300] if exc is not None else "unknown"
+    logger.exception(f"未处理异常: {request.url.path} | {type(exc).__name__}: {err}")
     return JSONResponse(
         status_code=200,
-        content={"code": -1, "message": "服务器内部错误，请查看服务端日志", "data": None}
+        content={
+            "code": -1,
+            "message": f"服务器内部错误: {type(exc).__name__}: {err}",
+            "data": None,
+        },
     )
 
 

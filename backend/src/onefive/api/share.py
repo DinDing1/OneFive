@@ -85,9 +85,25 @@ async def list_shares(limit: int = 50, offset: int = 0):
 @router.post("/{source_id}/check", summary="检测单个分享链接有效性")
 async def check_link_valid(source_id: int):
     """检测单个分享链接是否有效"""
-    service = get_share_service()
-    result = await asyncio.to_thread(service.check_link_valid, source_id)
-    return ApiResponse(code=0, message="检测完成", data=result)
+    try:
+        service = get_share_service()
+        result = await asyncio.to_thread(service.check_link_valid, source_id)
+        skipped = bool((result or {}).get("skipped"))
+        valid = bool((result or {}).get("valid"))
+        if skipped:
+            msg = (result or {}).get("error") or "检测跳过（网络/频控/未登录）"
+        elif valid:
+            msg = "链接有效"
+        else:
+            msg = (result or {}).get("error") or "链接无效"
+        return ApiResponse(code=0, message=msg, data=result)
+    except Exception as e:
+        logger.exception(f"检测单个分享链接失败: source_id={source_id}")
+        return ApiResponse(
+            code=-1,
+            message=f"检测失败: {str(e)[:200]}",
+            data={"source_id": source_id, "valid": False, "error": str(e)[:200], "skipped": True},
+        )
 
 
 @router.get("/check-stream", summary="批量检测分享链接有效性（SSE 流式）")

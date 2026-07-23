@@ -98,11 +98,17 @@
         </div>
       </div>
       <h2 class="state-title">正在分析分享库</h2>
-      <p class="state-desc">按作品归并版本，计算画质分与完整度加成…</p>
+      <p class="state-desc">{{ analyzeMessage || '按作品归并版本，计算画质分与完整度加成…' }}</p>
+      <div class="progress-wrap" v-if="analyzePercent > 0">
+        <div class="progress-bar">
+          <div class="progress-fill" :style="{ width: analyzePercent + '%' }"></div>
+        </div>
+        <span class="progress-text">{{ analyzePercent }}%</span>
+      </div>
       <div class="loading-steps">
-        <div class="ls-item active"><span class="ls-dot"></span>扫描已整理分享</div>
-        <div class="ls-item active"><span class="ls-dot"></span>归并重复作品</div>
-        <div class="ls-item"><span class="ls-dot"></span>评分与排序</div>
+        <div class="ls-item" :class="{ active: analyzeStageRank >= 1 }"><span class="ls-dot"></span>扫描已整理分享</div>
+        <div class="ls-item" :class="{ active: analyzeStageRank >= 2 }"><span class="ls-dot"></span>归并重复作品</div>
+        <div class="ls-item" :class="{ active: analyzeStageRank >= 3 }"><span class="ls-dot"></span>评分与排序</div>
       </div>
     </section>
 
@@ -360,13 +366,17 @@
 </template>
 
 <script setup lang="ts">
-import { computed, ref } from 'vue'
+import { computed, onUnmounted, ref } from 'vue'
 import { shareWashApi, type WashAnalyzeResult, type WashGroup, type WashSourceItem } from '@/api/shareWash'
 import { formatSize } from '@/composables/useFormat'
 import { showToast } from '@/composables/useToast'
 
 const mediaType = ref<'all' | 'movie' | 'tv'>('all')
 const analyzing = ref(false)
+const analyzePercent = ref(0)
+const analyzeMessage = ref('')
+const analyzeStage = ref('')
+let analyzeEventSource: EventSource | null = null
 const deleting = ref(false)
 const summary = ref<WashAnalyzeResult['summary'] | null>(null)
 const groups = ref<WashGroup[]>([])
@@ -383,6 +393,22 @@ const mediaOptions = [
 const selectedCount = computed(() =>
   groups.value.reduce((n, g) => n + g.items.filter(i => i.selected).length, 0)
 )
+
+const analyzeStageRank = computed(() => {
+  const s = analyzeStage.value
+  if (['score', 'rank', 'finish', 'done'].includes(s)) return 3
+  if (['load', 'meta'].includes(s)) return 2
+  if (['start', 'scan', 'done_prep'].includes(s)) return 1
+  return analyzePercent.value > 0 ? 1 : 0
+})
+
+function closeAnalyzeStream() {
+  if (analyzeEventSource) {
+    analyzeEventSource.close()
+    analyzeEventSource = null
+  }
+}
+
 
 function levelClass(score: number) {
   if (score >= 4000) return 'lv-best'
@@ -425,24 +451,71 @@ async function copyText(text: string) {
   }
 }
 
-async function runAnalyze() {
+function runAnalyze() {
+  if (analyzing.value) return
+  closeAnalyzeStream()
   analyzing.value = true
-  try {
-    const res = await shareWashApi.analyze(mediaType.value)
-    if (res.code !== 0) {
-      showToast(res.message || '分析失败', 'error')
+  analyzePercent.value = 0
+  analyzeMessage.value = '连接分析服务…'
+  analyzeStage.value = 'start'
+
+  const es = shareWashApi.analyzeStream(mediaType.value)
+  analyzeEventSource = es
+
+  es.onmessage = (event) => {
+    let data: any
+    try {
+      data = JSON.parse(event.data)
+    } catch {
       return
     }
-    summary.value = res.data.summary
-    groups.value = res.data.groups || []
-    hasReport.value = true
-    showToast(res.message || '分析完成', 'success')
-  } catch (e: any) {
-    showToast(e?.message || '分析失败', 'error')
-  } finally {
-    analyzing.value = false
+    const t = data?.type
+    if (t === 'start') {
+      analyzeMessage.value = '开始扫描…'
+      analyzePercent.value = 1
+      return
+    }
+    if (t === 'progress') {
+      analyzeStage.value = data.stage || ''
+      if (typeof data.percent === 'number') analyzePercent.value = data.percent
+      if (data.message) analyzeMessage.value = data.message
+      return
+    }
+    if (t === 'done') {
+      summary.value = data.summary || null
+      groups.value = data.groups || []
+      hasReport.value = true
+      analyzePercent.value = 100
+      analyzeStage.value = 'done'
+      analyzing.value = false
+      showToast(data.message || '分析完成', 'success')
+      closeAnalyzeStream()
+      return
+    }
+    if (t === 'error') {
+      analyzing.value = false
+      showToast(data.message || '分析失败', 'error')
+      closeAnalyzeStream()
+    }
+  }
+
+  es.onerror = () => {
+    // 正常结束关闭连接时浏览器也可能触发 error，已完成则忽略
+    if (!analyzing.value) {
+      closeAnalyzeStream()
+      return
+    }
+    if (es.readyState === EventSource.CLOSED) {
+      analyzing.value = false
+      showToast('分析连接中断（网关或网络），请重试', 'error')
+      closeAnalyzeStream()
+    }
   }
 }
+
+onUnmounted(() => {
+  closeAnalyzeStream()
+})
 
 function confirmDelete() {
   if (selectedCount.value === 0) return
@@ -461,7 +534,7 @@ async function doDelete() {
     }
     showToast(res.message || '删除完成', 'success')
     showConfirm.value = false
-    await runAnalyze()
+    runAnalyze()
   } catch (e: any) {
     showToast(e?.message || '删除失败', 'error')
   } finally {
@@ -1359,5 +1432,33 @@ async function doDelete() {
   .stats-grid { grid-template-columns: 1fr 1fr; gap: 8px; }
   .stat-card { padding: 12px; min-height: 68px; }
   .stat-num { font-size: 18px; }
+}
+
+.progress-wrap {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  width: min(360px, 90%);
+  margin: 8px auto 4px;
+}
+.progress-bar {
+  flex: 1;
+  height: 8px;
+  border-radius: 999px;
+  background: rgba(0, 0, 0, 0.08);
+  overflow: hidden;
+}
+.progress-fill {
+  height: 100%;
+  border-radius: inherit;
+  background: linear-gradient(90deg, #3b82f6, #8b5cf6);
+  transition: width 0.25s ease;
+}
+.progress-text {
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+  color: var(--text-secondary, #64748b);
+  min-width: 36px;
+  text-align: right;
 }
 </style>
