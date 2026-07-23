@@ -305,7 +305,7 @@
                 <path d="M9 12l2 2 4-4" />
                 <circle cx="12" cy="12" r="10" />
               </svg>
-              {{ checkingSingleSourceId === rowMenuTarget?.source_id ? '检测中…' : '检测有效期' }}
+              {{ checkingSingleSourceId === rowMenuTarget?.source_id ? '检测中…' : '检测' }}
             </button>
             <div class="row-menu-divider"></div>
             <button class="row-menu-item row-menu-danger" @click="rowMenuDelete">
@@ -476,7 +476,7 @@
                   <span v-if="recognizeResult?.year" class="sr-meta-year">{{ recognizeResult.year }}</span>
                   <span v-if="Number(recognizeResult?.tmdb_rating) > 0" class="sr-meta-rating">
                     <svg viewBox="0 0 24 24" fill="currentColor" width="14" height="14"><path d="M12 2l3.09 6.26L22 9.27l-5 4.87 1.18 6.88L12 17.77l-6.18 3.25L7 14.14 2 9.27l6.91-1.01L12 2z" /></svg>
-                    {{ Number(recognizeResult.tmdb_rating).toFixed(1) }}
+                    {{ Number(recognizeResult?.tmdb_rating).toFixed(1) }}
                   </span>
                 </div>
               </template>
