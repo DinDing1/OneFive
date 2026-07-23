@@ -20,7 +20,7 @@ STRM 文件生成服务 - 基于已整理的分享数据库记录生成本地 .s
 """
 import os
 from pathlib import Path
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Sequence, Set, Any
 from urllib.parse import urlencode
 
 from ..services.p115_client_factory import get_p115_client_factory
@@ -752,6 +752,233 @@ class StrmService:
             # errors 达到上限后被截断，前端可据此提示"错误较多未全部展示"
             "truncated": len(errors) >= MAX_ERRORS,
         }
+
+
+    # ==================== 分享 STRM 删除（与 generate 路径规则对称） ====================
+
+    def plan_share_strm_deletion(self, source_ids: Sequence[int]) -> Dict[str, Any]:
+        """在删除 share_file 之前，收集各 source 对应的分享 STRM 路径计划。
+
+        只处理与 generate() 相同条件的已整理文件，路径规则与
+        _build_relative_path 完全一致。不删除云盘 STRM。
+        """
+        ids = sorted({int(x) for x in source_ids if int(x) > 0})
+        plan: Dict[str, Any] = {
+            "output_root": None,
+            "items_by_source": {},
+            "skip_reason": "",
+            "candidate_count": 0,
+            "skipped_invalid_path": 0,
+        }
+        if not ids:
+            return plan
+
+        output_path = (self.get_settings().get("output_path") or "").strip()
+        if not output_path:
+            plan["skip_reason"] = "no_output_path"
+            logger.info("分享 STRM 清理跳过：未配置 strm_output_path")
+            return plan
+
+        accessible = self.get_accessible_paths()
+        if not accessible or not self._is_path_authorized(output_path, accessible):
+            plan["skip_reason"] = "not_authorized"
+            logger.warning(f"分享 STRM 清理跳过：输出路径未授权: {output_path}")
+            return plan
+
+        output_root = Path(output_path)
+        plan["output_root"] = str(output_root)
+
+        placeholders = ",".join("?" * len(ids))
+        rows = self.db.fetchall(
+            f"""SELECT source_id, category, organized_dir, organized_name
+                FROM share_file
+                WHERE source_id IN ({placeholders})
+                  AND organized = 1
+                  AND is_dir = 0
+                  AND category != ''
+                  AND organized_dir != ''
+                  AND organized_name != ''""",
+            tuple(ids),
+        )
+
+        items_by_source: Dict[int, List[Dict[str, str]]] = {}
+        seen_per_source: Dict[int, Set[str]] = {}
+        candidate_count = 0
+        skipped_invalid = 0
+
+        for row in rows:
+            sid = int(row["source_id"])
+            category = row["category"] or ""
+            organized_dir = row["organized_dir"] or ""
+            organized_name = row["organized_name"] or ""
+            rel_path = self._build_relative_path(category, organized_dir, organized_name)
+            full_path = output_root / rel_path
+            if not self._is_within_directory(full_path, output_root):
+                skipped_invalid += 1
+                logger.warning(
+                    f"分享 STRM 清理跳过越界路径: source_id={sid} rel={rel_path}"
+                )
+                continue
+
+            rel_key = rel_path.as_posix()
+            path_str = str(full_path)
+            if sid not in items_by_source:
+                items_by_source[sid] = []
+                seen_per_source[sid] = set()
+            if path_str in seen_per_source[sid]:
+                continue
+            seen_per_source[sid].add(path_str)
+            items_by_source[sid].append({
+                "path": path_str,
+                "category": category,
+                "organized_dir": organized_dir,
+                "organized_name": organized_name,
+                "rel_key": rel_key,
+            })
+            candidate_count += 1
+
+        plan["items_by_source"] = items_by_source
+        plan["candidate_count"] = candidate_count
+        plan["skipped_invalid_path"] = skipped_invalid
+        logger.info(
+            f"分享 STRM 清理计划: sources={len(ids)} candidates={candidate_count} "
+            f"invalid={skipped_invalid} root={output_root}"
+        )
+        return plan
+
+    def _remaining_owns_share_strm_path(
+        self,
+        category: str,
+        organized_dir: str,
+        organized_name: str,
+    ) -> bool:
+        """删库后复查：是否仍有其它 share_file 映射到同一 STRM 相对路径。"""
+        target_stem = Path(organized_name).stem
+        if not target_stem:
+            return False
+        rows = self.db.fetchall(
+            """SELECT organized_name FROM share_file
+               WHERE organized = 1
+                 AND is_dir = 0
+                 AND category = ?
+                 AND organized_dir = ?
+                 AND organized_name != ''""",
+            (category, organized_dir),
+        )
+        for row in rows:
+            other_name = row["organized_name"] or ""
+            if Path(other_name).stem == target_stem:
+                return True
+        return False
+
+    def _remove_empty_parents(self, start: Path, root: Path) -> int:
+        """自下而上删除空父目录，不删除 root 本身，不跨出 root。"""
+        removed = 0
+        try:
+            root_resolved = root.resolve()
+        except Exception:
+            return 0
+
+        current = start
+        while True:
+            try:
+                cur_resolved = current.resolve()
+            except Exception:
+                break
+            if cur_resolved == root_resolved:
+                break
+            if root_resolved not in cur_resolved.parents:
+                break
+            try:
+                if not current.is_dir():
+                    break
+                if any(current.iterdir()):
+                    break
+                current.rmdir()
+                removed += 1
+                current = current.parent
+            except Exception:
+                break
+        return removed
+
+    def execute_share_strm_deletion(
+        self,
+        plan: Dict[str, Any],
+        succeeded_source_ids: Sequence[int],
+    ) -> Dict[str, Any]:
+        """在 DB 删除成功后，删除计划中对应的分享 .strm 文件。"""
+        stats: Dict[str, Any] = {
+            "strm_deleted": 0,
+            "strm_skipped": 0,
+            "strm_errors": [],
+            "strm_dirs_removed": 0,
+            "strm_skip_reason": (plan or {}).get("skip_reason") or "",
+        }
+
+        if not plan:
+            return stats
+
+        if not plan.get("output_root"):
+            stats["strm_skipped"] = int(plan.get("candidate_count") or 0)
+            return stats
+
+        output_root = Path(plan["output_root"])
+        succeeded = {int(x) for x in succeeded_source_ids if int(x) > 0}
+        items_by_source: Dict = plan.get("items_by_source") or {}
+
+        stats["strm_skipped"] += int(plan.get("skipped_invalid_path") or 0)
+
+        unique_items: Dict[str, Dict[str, str]] = {}
+        for sid in succeeded:
+            for item in items_by_source.get(sid, []) or []:
+                p = item.get("path") or ""
+                if p and p not in unique_items:
+                    unique_items[p] = item
+
+        for path_str, item in unique_items.items():
+            full_path = Path(path_str)
+            category = item.get("category") or ""
+            organized_dir = item.get("organized_dir") or ""
+            organized_name = item.get("organized_name") or ""
+
+            try:
+                if not self._is_within_directory(full_path, output_root):
+                    stats["strm_skipped"] += 1
+                    continue
+
+                if self._remaining_owns_share_strm_path(
+                    category, organized_dir, organized_name
+                ):
+                    stats["strm_skipped"] += 1
+                    logger.info(
+                        f"分享 STRM 保留（仍被其它记录占用）: {full_path}"
+                    )
+                    continue
+
+                if not full_path.is_file():
+                    stats["strm_skipped"] += 1
+                    continue
+
+                full_path.unlink()
+                stats["strm_deleted"] += 1
+                stats["strm_dirs_removed"] += self._remove_empty_parents(
+                    full_path.parent, output_root
+                )
+            except Exception as e:
+                err = {"path": path_str, "error": str(e)}
+                if len(stats["strm_errors"]) < MAX_ERRORS:
+                    stats["strm_errors"].append(err)
+                logger.warning(f"删除分享 STRM 失败: {path_str}: {e}")
+
+        logger.info(
+            f"分享 STRM 清理完成: deleted={stats['strm_deleted']} "
+            f"skipped={stats['strm_skipped']} errors={len(stats['strm_errors'])} "
+            f"dirs_removed={stats['strm_dirs_removed']} "
+            f"reason={stats['strm_skip_reason'] or '-'}"
+        )
+        return stats
+
+
 
 
 # ==================== 单例 ====================

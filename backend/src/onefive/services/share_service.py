@@ -440,34 +440,70 @@ class ShareService:
         )
         return [dict(r) for r in rows]
 
-    def delete_share(self, source_id: int) -> bool:
-        """删除分享来源及其所有文件"""
-        self.db.execute("DELETE FROM share_file WHERE source_id = ?", (source_id,))
-        self.db.execute("DELETE FROM share_source WHERE id = ?", (source_id,))
-        self.db.commit()
-        return True
+    def delete_share(self, source_id: int) -> Dict:
+        """删除分享来源及其所有文件，并清理对应分享 STRM。
+
+        Returns:
+            与 delete_shares_batch 相同结构的统计字典
+        """
+        return self.delete_shares_batch([int(source_id)])
 
     def delete_shares_batch(self, source_ids: List[int]) -> Dict:
-        """批量删除分享来源及其所有文件
+        """批量删除分享来源及其所有文件，并清理对应分享 STRM。
+
+        顺序：
+        1. 删库前按 organized 字段 + strm_output_path 计算待删 .strm 路径
+        2. 每条 source 独立事务删除 share_file / share_source
+        3. 仅对 DB 删除成功的 source 删除本地 .strm（删前复查是否仍被占用）
 
         每条删除独立事务：成功才 commit，失败立即 rollback，
         避免部分删除被统一 commit 留下不一致状态。
 
         Returns:
-            {"total": int, "success": int, "failed": int}
+            {
+              "total": int, "success": int, "failed": int,
+              "strm_deleted": int, "strm_skipped": int,
+              "strm_errors": list, "strm_dirs_removed": int,
+              "strm_skip_reason": str,
+            }
         """
-        total = len(source_ids)
+        ids = [int(x) for x in source_ids if int(x) > 0]
+        total = len(ids)
+
+        # 延迟导入，避免与 strm_service 形成循环依赖
+        from .strm_service import get_strm_service
+        strm_service = get_strm_service()
+        strm_plan = strm_service.plan_share_strm_deletion(ids)
+
         success = 0
-        for sid in source_ids:
+        succeeded_ids: List[int] = []
+        for sid in ids:
             try:
                 self.db.execute("DELETE FROM share_file WHERE source_id = ?", (sid,))
                 self.db.execute("DELETE FROM share_source WHERE id = ?", (sid,))
                 self.db.commit()
                 success += 1
+                succeeded_ids.append(sid)
             except Exception:
                 # 异常时回滚当前 sid 的删除，不影响其它 sid
                 self.db.rollback()
-        return {"total": total, "success": success, "failed": total - success}
+
+        strm_stats = strm_service.execute_share_strm_deletion(strm_plan, succeeded_ids)
+        logger.info(
+            f"批量删除分享: total={total} success={success} failed={total - success} "
+            f"strm_deleted={strm_stats.get('strm_deleted', 0)} "
+            f"strm_skipped={strm_stats.get('strm_skipped', 0)}"
+        )
+        return {
+            "total": total,
+            "success": success,
+            "failed": total - success,
+            "strm_deleted": int(strm_stats.get("strm_deleted") or 0),
+            "strm_skipped": int(strm_stats.get("strm_skipped") or 0),
+            "strm_errors": list(strm_stats.get("strm_errors") or []),
+            "strm_dirs_removed": int(strm_stats.get("strm_dirs_removed") or 0),
+            "strm_skip_reason": str(strm_stats.get("strm_skip_reason") or ""),
+        }
 
     def update_share_source(self, source_id: int, share_name: str = None,
                             share_code: str = None, receive_code: str = None) -> bool:

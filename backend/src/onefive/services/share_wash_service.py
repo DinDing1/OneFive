@@ -266,18 +266,35 @@ class ShareWashService:
     def delete_sources(self, source_ids: Sequence[int]) -> Dict[str, Any]:
         ids = sorted({int(x) for x in source_ids if int(x) > 0})
         if not ids:
-            return {"total": 0, "success": 0, "failed": 0, "source_ids": []}
+            return {
+                "total": 0,
+                "success": 0,
+                "failed": 0,
+                "source_ids": [],
+                "strm_deleted": 0,
+                "strm_skipped": 0,
+                "strm_errors": [],
+                "strm_dirs_removed": 0,
+                "strm_skip_reason": "",
+            }
         share_service = get_share_service()
         result = share_service.delete_shares_batch(ids)
         logger.info(
             f"[分享洗版] 删除分享链接 total={result.get('total')} "
-            f"success={result.get('success')} failed={result.get('failed')}"
+            f"success={result.get('success')} failed={result.get('failed')} "
+            f"strm_deleted={result.get('strm_deleted', 0)} "
+            f"strm_skipped={result.get('strm_skipped', 0)}"
         )
         return {
             "total": int(result.get("total") or 0),
             "success": int(result.get("success") or 0),
             "failed": int(result.get("failed") or 0),
             "source_ids": ids,
+            "strm_deleted": int(result.get("strm_deleted") or 0),
+            "strm_skipped": int(result.get("strm_skipped") or 0),
+            "strm_errors": list(result.get("strm_errors") or []),
+            "strm_dirs_removed": int(result.get("strm_dirs_removed") or 0),
+            "strm_skip_reason": str(result.get("strm_skip_reason") or ""),
         }
 
     # ------------------------------------------------------------------

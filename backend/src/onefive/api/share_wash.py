@@ -139,13 +139,21 @@ async def analyze_share_wash_stream(
 
 @router.post("/delete", summary="删除劣质分享链接")
 async def delete_wash_sources(req: DeleteWashRequest):
-    """按 source_id 批量删除整条分享（本地库记录）。"""
+    """按 source_id 批量删除整条分享（本地库记录 + 对应分享 STRM）。"""
     if not req.source_ids:
         return ApiResponse(code=1, message="未指定要删除的分享", data=None)
     service = get_share_wash_service()
     result = await asyncio.to_thread(service.delete_sources, req.source_ids)
+    deleted = int(result.get("success") or 0)
+    total = int(result.get("total") or 0)
+    strm_deleted = int(result.get("strm_deleted") or 0)
+    msg = f"已删除 {deleted}/{total} 条分享链接"
+    if strm_deleted:
+        msg += f"，并清理 {strm_deleted} 个分享 STRM"
+    elif result.get("strm_skip_reason") == "no_output_path":
+        msg += "（未配置分享 STRM 路径，跳过本地文件）"
     return ApiResponse(
         code=0,
-        message=f"已删除 {result.get('success', 0)}/{result.get('total', 0)} 条分享链接",
+        message=msg,
         data=result,
     )

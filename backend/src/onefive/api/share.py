@@ -175,20 +175,28 @@ async def check_all_links_stream():
 
 @router.delete("/{source_id}", summary="删除分享")
 async def delete_share(source_id: int):
-    """删除分享来源及关联的所有文件"""
+    """删除分享来源及关联的所有文件，并清理对应分享 STRM"""
     service = get_share_service()
-    await asyncio.to_thread(service.delete_share, source_id)
-    return ApiResponse(code=0, message="分享已删除")
+    result = await asyncio.to_thread(service.delete_share, source_id)
+    msg = "分享已删除"
+    strm_deleted = int((result or {}).get("strm_deleted") or 0)
+    if strm_deleted:
+        msg += f"，并清理 {strm_deleted} 个分享 STRM"
+    return ApiResponse(code=0, message=msg, data=result)
 
 
 @router.post("/delete-batch", summary="批量删除分享")
 async def delete_shares_batch(req: DeleteBatchRequest):
-    """批量删除分享来源及关联的所有文件"""
+    """批量删除分享来源及关联的所有文件，并清理对应分享 STRM"""
     service = get_share_service()
     result = await asyncio.to_thread(service.delete_shares_batch, req.source_ids)
+    msg = f"已删除 {result['success']}/{result['total']} 个分享"
+    strm_deleted = int(result.get("strm_deleted") or 0)
+    if strm_deleted:
+        msg += f"，并清理 {strm_deleted} 个分享 STRM"
     return ApiResponse(
         code=0,
-        message=f"已删除 {result['success']}/{result['total']} 个分享",
+        message=msg,
         data=result
     )
 
