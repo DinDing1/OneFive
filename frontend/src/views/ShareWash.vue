@@ -1,4 +1,4 @@
-<template>
+﻿<template>
   <div class="share-wash">
     <!-- ===== 工具栏 ===== -->
     <section class="toolbar glass-card">
@@ -253,7 +253,7 @@
                   </div>
                 </div>
 
-                <div class="score-ring" :class="levelClass(item.score)">
+                <div class="score-ring" :class="levelClass(item.quality_score ?? item.score)">
                   <div class="score-val">{{ item.score }}</div>
                   <div class="score-lv">{{ item.quality_level || '-' }}</div>
                 </div>
@@ -411,9 +411,9 @@ function closeAnalyzeStream() {
 
 
 function levelClass(score: number) {
-  if (score >= 4000) return 'lv-best'
-  if (score >= 3000) return 'lv-good'
-  if (score >= 2000) return 'lv-mid'
+  if (score >= 90) return 'lv-best'
+  if (score >= 75) return 'lv-good'
+  if (score >= 60) return 'lv-mid'
   return 'lv-bad'
 }
 
@@ -1462,3 +1462,4 @@ async function doDelete() {
   text-align: right;
 }
 </style>
+

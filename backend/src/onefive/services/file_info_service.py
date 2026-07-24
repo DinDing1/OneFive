@@ -1,4 +1,4 @@
-"""
+﻿"""
 文件名解析服务（混合方案）
 
 职责：从视频文件名中提取关键信息
@@ -857,7 +857,7 @@ def _extract_source(base: str) -> str:
         return 'UHD'
 
     patterns = [
-        (r'web\.?dl|webdl', 'WEB-DL'),
+        (r'web[.\-]?dl|webdl', 'WEB-DL'),
         (r'webrip', 'WEBRip'),
         (r'hdtv', 'HDTV'),
         (r'dvd', 'DVD'),
@@ -866,3 +866,4 @@ def _extract_source(base: str) -> str:
         if re.search(pattern, base, re.IGNORECASE):
             return source
     return ''
+

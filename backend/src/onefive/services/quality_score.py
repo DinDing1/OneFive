@@ -1,452 +1,352 @@
-"""
-文件名质量评分模块
+﻿"""
+文件名质量评分模块（分享洗版）
 
-从 media-dashboard 的 duplicates.ts 移植：
-- extract_video_info
-- calculate_quality_score
-- get_quality_level
-- generate_video_tags
+100 分制，与整理重命名字段对齐（file_info_service / rename_service）：
+  分辨率 videoFormat     0~40
+  片源   source(edition) 0~35
+  动态范围 effects       0~12
+  音频   audioCodec      0~8
+  编码微调 videoCodec等  0~5
+  合计                   0~100
 
-用于分享洗版：按路径/文件名中的质量标签加权打分。
+规则：
+- 不考虑文件体积
+- 词表复用 extract_tech_info / _extract_source 等，避免与重命名漂移
+- REMUX 缺编码/音轨时给缺省分，保证同分辨率原盘压 WEB
 """
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass, field
-from typing import Dict, List, Optional
+from dataclasses import dataclass
+from typing import Dict, List, Optional, Tuple
+
+from .file_info_service import (
+    _extract_audio_codec,
+    _extract_edition,
+    _extract_effects,
+    _extract_release_group,
+    _extract_source,
+    _extract_video_codec,
+    _extract_video_format,
+    extract_tech_info,
+)
 
 
-@dataclass
-class VideoInfo:
-    resolution: Optional[str] = None
-    video_codec: Optional[str] = None
-    audio_codec: Optional[str] = None
-    hdr_type: Optional[str] = None
-    dolby_vision: bool = False
-    atmos: bool = False
-    source: Optional[str] = None
-    bit_depth: Optional[int] = None
-    fps: Optional[int] = None
-    quality_tags: List[str] = field(default_factory=list)
-    hfr: bool = False
-    ultra_hd: bool = False
-    release_group: Optional[str] = None
-
-
-_RESOLUTION_PATTERNS = [
-    (re.compile(r"7680x4320|4320p|\b8k\b", re.I), "4320p"),
-    (re.compile(r"3840x2160|2160p|\b4k\b|ultra\s*hd|uhd", re.I), "2160p"),
-    (re.compile(r"1920x1080p|1920x1080|1080p|\bhd1080p\b|bd1080p|1080i", re.I), "1080p"),
-    (re.compile(r"1440p|2k", re.I), "1440p"),
-    (re.compile(r"1280x720|1280\*720|720p|bd720p", re.I), "720p"),
-    (re.compile(r"1024x576|960x540|1024x560|1024x550|1024x554|1024x544", re.I), "576p"),
-    (re.compile(r"480p|480i|960x528", re.I), "480p"),
-    (re.compile(r"360p", re.I), "360p"),
-]
-
-_VIDEO_CODEC_PATTERNS = [
-    (re.compile(r"prores", re.I), "ProRes"),
-    (re.compile(r"hevc|x265|h\.?265", re.I), "H.265"),
-    (re.compile(r"x264|h\.?264|avc", re.I), "H.264"),
-    (re.compile(r"av1", re.I), "AV1"),
-    (re.compile(r"vp9", re.I), "VP9"),
-    (re.compile(r"xvid", re.I), "XviD"),
-    (re.compile(r"divx", re.I), "DivX"),
-    (re.compile(r"mpeg-2|mpeg2", re.I), "MPEG-2"),
-    (re.compile(r"mpeg-4", re.I), "MPEG-4"),
-    (re.compile(r"vc-1|vc1", re.I), "VC-1"),
-    (re.compile(r"vp8", re.I), "VP8"),
-    (re.compile(r"avs", re.I), "AVS"),
-    (re.compile(r"realvideo|rv\d+", re.I), "RealVideo"),
-    (re.compile(r"thora|theora", re.I), "Theora"),
-    (re.compile(r"dirac", re.I), "Dirac"),
-]
-
-_AUDIO_CODEC_PATTERNS = [
-    (re.compile(r"alac", re.I), "ALAC"),
-    (re.compile(r"opus", re.I), "OPUS"),
-    (re.compile(r"wav", re.I), "WAV"),
-    (re.compile(r"pcm(\s*stereo|\.2\.0|\s*2\.0|\s*stereo)?", re.I), "PCM"),
-    (re.compile(r"truehd|true-hd", re.I), "TrueHD"),
-    (re.compile(r"dts[\s\-_.]*hd[\s\-_.]*ma", re.I), "DTS-HD MA"),
-    (re.compile(r"dts[\s\-_.]*hd|dtshd", re.I), "DTS-HD"),
-    (re.compile(r"dts[\s\-_.]*x|dtsx", re.I), "DTS:X"),
-    (re.compile(r"dts", re.I), "DTS"),
-    (re.compile(r"\bdd\+\b|\bddp\b|eac3", re.I), "DD+"),
-    (re.compile(r"ddp\.2\.0|ddp2\.0", re.I), "DD+"),
-    (re.compile(r"ddp\.5\.1|ddp5\.1", re.I), "DD+"),
-    (re.compile(r"\bdd(?!p)(?=[^a-z]|$)|\\bac3\\b", re.I), "DD"),
-    (re.compile(r"\baac\b", re.I), "AAC"),
-    (re.compile(r"\bflac\b", re.I), "FLAC"),
-    (re.compile(r"\bmp3\b", re.I), "MP3"),
-]
-
-_HDR_PATTERNS = [
-    (re.compile(r"hdr10\+|hdr10plus", re.I), "HDR10+"),
-    (re.compile(r"hdr10", re.I), "HDR10"),
-    (re.compile(r"hdr", re.I), "HDR"),
-]
-
-_SOURCE_PATTERNS = [
-    (re.compile(r"bluray\.?remux|remux", re.I), "REMUX"),
-    (re.compile(r"uhd\.?bluray|uhd\.?bd", re.I), "UHD BluRay"),
-    (re.compile(r"blu[-\s]?ray|bluray|\bbd\b|blu-ray", re.I), "BluRay"),
-    (re.compile(r"brrip", re.I), "BRRip"),
-    (re.compile(r"hdrip", re.I), "HDRip"),
-    (re.compile(r"hddvd", re.I), "HDDVD"),
-    (re.compile(r"dvd\-?(5|9|10|14|18)|dvdrip|dvdscr|pdvd|\bdvd\b", re.I), "DVD"),
-    (re.compile(r"web\.?dl|\bweb\b|webdl|amzn\.web\-?dl", re.I), "WEB-DL"),
-    (re.compile(r"webrip", re.I), "WEBRip"),
-    (re.compile(r"hr\-?hdtv|hdtvrip|tvrip|pdtv|\bhdtv\b", re.I), "HDTV"),
-    (re.compile(r"\btv\b|dtv|pdtv", re.I), "TV"),
-    (re.compile(r"vhsrip", re.I), "VHSRip"),
-    (re.compile(r"vod", re.I), "VOD"),
-    (re.compile(r"camrip|\bcam\b|camera", re.I), "CAM"),
-    (re.compile(r"\bts\b|tc|hc", re.I), "TS/TC/HC"),
-    (re.compile(r"\br5\b", re.I), "R5"),
-    (re.compile(r"\bamzn\b", re.I), "AMZN"),
-    (re.compile(r"\bnf\b", re.I), "NF"),
-    (re.compile(r"\bp2p\b", re.I), "P2P"),
-]
+# ==================== 分值表（满分 100） ====================
 
 _RESOLUTION_SCORES: Dict[str, int] = {
-    "4320p": 2000,
-    "2160p": 2000,
-    "1440p": 1700,
-    "1080p": 1500,
-    "720p": 1000,
-    "576p": 650,
-    "480p": 600,
-    "360p": 300,
-}
-
-_VIDEO_CODEC_SCORES: Dict[str, int] = {
-    "AV1": 500,
-    "H.265": 400,
-    "H.264": 300,
-    "VP9": 250,
-    "ProRes": 350,
-    "VC-1": 220,
-    "VP8": 200,
-    "Dirac": 200,
-    "MPEG-2": 180,
-    "MPEG-4": 160,
-    "AVS": 150,
-    "XviD": 150,
-    "Theora": 120,
-    "DivX": 100,
-    "RealVideo": 80,
-}
-
-_AUDIO_CODEC_SCORES: Dict[str, int] = {
-    "TrueHD": 300,
-    "DTS:X": 280,
-    "DTS-HD MA": 260,
-    "DTS-HD": 250,
-    "DTS": 200,
-    "DD+": 150,
-    "DD": 120,
-    "PCM": 120,
-    "WAV": 110,
-    "AAC": 100,
-    "ALAC": 100,
-    "FLAC": 90,
-    "OPUS": 90,
-    "MP3": 50,
-}
-
-_HDR_SCORES: Dict[str, int] = {
-    "HDR10+": 200,
-    "HDR10": 150,
-    "HDR": 100,
+    "4320p": 40,
+    "2160p": 38,
+    "1440p": 30,
+    "1080p": 26,
+    "720p": 18,
+    "576p": 12,
+    "480p": 10,
+    "360p": 10,
 }
 
 _SOURCE_SCORES: Dict[str, int] = {
-    "REMUX": 400,
-    "UHD BluRay": 350,
-    "BluRay": 300,
-    "HDDVD": 280,
-    "WEB-DL": 250,
-    "AMZN": 240,
-    "NF": 230,
-    "VOD": 220,
-    "WEBRip": 200,
-    "P2P": 200,
-    "BRRip": 180,
-    "HDTV": 150,
-    "TV": 120,
-    "DVDRip": 100,
-    "DVD": 80,
-    "R5": 70,
-    "TS/TC/HC": 50,
-    "CAM": 20,
-    "VHSRip": 10,
+    "UHD BluRay REMUX": 35,
+    "BluRay REMUX": 34,
+    "UHD BluRay": 28,
+    "BluRay": 26,
+    "UHD": 20,
+    "WEB-DL": 15,
+    "WEBRip": 11,
+    "HDTV": 7,
+    "DVD": 4,
 }
 
-_QUALITY_TAG_SCORES: Dict[str, int] = {
-    "REMUX": 200,
-    "PROPER": 50,
-    "REPACK": 30,
-    "EXTENDED": 40,
-    "IMAX": 100,
-    "ULTRAHD": 70,
-    "HFR": 60,
-    "HQ": 40,
-    "EDR": 120,
-}
+_SOURCE_DEFAULT = 1  # 无法识别片源
+
+# 动态范围：取最高一档，不叠爆
+_HDR_SCORES: List[Tuple[str, int]] = [
+    ("DV", 12),
+    ("HDR10+", 10),
+    ("HDR10", 8),
+    ("HDR", 6),
+    ("HLG", 4),
+]
+
+_REMUX_SOURCES = frozenset({"UHD BluRay REMUX", "BluRay REMUX"})
 
 
-def extract_video_info(path: str) -> VideoInfo:
-    """从路径/文件名解析画质相关信息。"""
-    result = VideoInfo()
-    if not path:
-        return result
-
-    lower_path = path.lower()
-
-    for pattern, resolution in _RESOLUTION_PATTERNS:
-        if pattern.search(lower_path):
-            result.resolution = resolution
-            break
-
-    if re.search(r"\bultrahd\b|\buhd\b", lower_path):
-        result.ultra_hd = True
-
-    for pattern, codec in _VIDEO_CODEC_PATTERNS:
-        if pattern.search(lower_path):
-            result.video_codec = codec
-            break
-
-    audio_codecs: List[str] = []
-    for pattern, codec in _AUDIO_CODEC_PATTERNS:
-        if pattern.search(lower_path):
-            audio_codecs.append(codec)
-    if audio_codecs:
-        filtered = []
-        for c in audio_codecs:
-            if c in ("DTS-HD MA", "DTS:X"):
-                filtered.append(c)
-            elif c == "DTS-HD" and (
-                "DTS-HD MA" in audio_codecs or "DTS:X" in audio_codecs
-            ):
-                continue
-            elif c == "DTS" and (
-                "DTS-HD MA" in audio_codecs
-                or "DTS:X" in audio_codecs
-                or "DTS-HD" in audio_codecs
-            ):
-                continue
-            else:
-                filtered.append(c)
-        unique: List[str] = []
-        seen = set()
-        for c in filtered:
-            if c not in seen:
-                seen.add(c)
-                unique.append(c)
-        result.audio_codec = " | ".join(unique)
-
-    for pattern, hdr_type in _HDR_PATTERNS:
-        if pattern.search(lower_path):
-            result.hdr_type = hdr_type
-            break
-
-    if re.search(r"\bdv\b|dolby\.?vision|dovi|doblyvison|dolby\.vision", lower_path):
-        result.dolby_vision = True
-
-    if re.search(r"atmos|atomos|dolby.?atmos", lower_path):
-        result.atmos = True
-
-    fps_match = re.search(r"(\d{2,3})\s*fps", lower_path)
-    if fps_match:
-        result.fps = int(fps_match.group(1))
-
-    if re.search(r"\bhfr\b", lower_path):
-        result.hfr = True
-
-    for pattern, source in _SOURCE_PATTERNS:
-        if pattern.search(lower_path):
-            result.source = source
-            break
-
-    quality_tags: List[str] = []
-    if re.search(r"remux", lower_path):
-        quality_tags.append("REMUX")
-    if re.search(r"proper", lower_path):
-        quality_tags.append("PROPER")
-    if re.search(r"repack", lower_path):
-        quality_tags.append("REPACK")
-    if re.search(r"extended|director.?cut", lower_path):
-        quality_tags.append("EXTENDED")
-    if re.search(r"imax", lower_path):
-        quality_tags.append("IMAX")
-    if re.search(r"\bhq\b", lower_path):
-        quality_tags.append("HQ")
-    if result.ultra_hd:
-        quality_tags.append("ULTRAHD")
-    if result.hfr:
-        quality_tags.append("HFR")
-    if re.search(r"\bedr\b|edr10", lower_path):
-        quality_tags.append("EDR")
-    result.quality_tags = quality_tags
-
-    bit_depth_match = re.search(r"(\d+)\s*bit", lower_path)
-    if bit_depth_match:
-        result.bit_depth = int(bit_depth_match.group(1))
-
-    result.release_group = _extract_release_group_from_path(path) or None
-
-    return result
+@dataclass
+class QualityBreakdown:
+    """百分制分项，便于调试/展示。"""
+    resolution: int = 0
+    source: int = 0
+    hdr: int = 0
+    audio: int = 0
+    codec_extra: int = 0
+    total: int = 0
+    video_format: str = ""
+    source_name: str = ""
+    effects: str = ""
+    video_codec: str = ""
+    audio_codec: str = ""
+    release_group: str = ""
 
 
-def _extract_release_group_from_path(path: str) -> str:
-    """从路径/文件名解析发布组（复用整理模块的内置+自定义发布组）。"""
+def _basename(path: str) -> str:
     if not path:
         return ""
-    try:
-        from .file_info_service import _extract_release_group
-    except Exception:
-        return ""
-
     parts = [p for p in re.split(r"[/\\]", path) if p]
-    # 优先文件名，其次父目录名，再次整段路径文本
-    candidates: List[str] = []
-    if parts:
-        candidates.append(parts[-1])
-    if len(parts) >= 2:
-        candidates.append(parts[-2])
-    candidates.append(path)
+    return parts[-1] if parts else path
 
-    for raw in candidates:
-        base = raw.rsplit(".", 1)[0] if ("." in raw and not raw.startswith(".")) else raw
-        group = _extract_release_group(base)
-        if group:
-            return group
-    return ""
+
+def _base_no_ext(filename: str) -> str:
+    if not filename:
+        return ""
+    if "." in filename and not filename.startswith("."):
+        return filename.rsplit(".", 1)[0]
+    return filename
+
+
+def parse_quality_fields(path: str) -> Dict[str, str]:
+    """从整理后路径/文件名解析与重命名一致的技术字段。"""
+    name = _basename(path)
+    if not name:
+        return {
+            "videoFormat": "",
+            "source": "",
+            "effects": "",
+            "videoCodec": "",
+            "audioCodec": "",
+            "editionFlags": "",
+            "releaseGroup": "",
+            "webSource": "",
+            "fileExt": "",
+        }
+
+    tech = extract_tech_info(name)
+    base = _base_no_ext(name)
+    # 目录段也可能带质量词（少见）；拼上 basename 再抽一次片源/特效更稳
+    scan = base
+    parent_parts = [p for p in re.split(r"[/\\]", path or "") if p]
+    if len(parent_parts) >= 2:
+        scan = f"{parent_parts[-2]} {base}"
+
+    source = _extract_source(scan) or _extract_source(base)
+    effects = _extract_effects(scan) or _extract_effects(base)
+    edition_flags = _extract_edition(scan) or _extract_edition(base)
+
+    video_format = tech.get("videoFormat") or _extract_video_format(scan) or _extract_video_format(base)
+    video_codec = tech.get("videoCodec") or _extract_video_codec(scan) or _extract_video_codec(base)
+    audio_codec = tech.get("audioCodec") or _extract_audio_codec(scan) or _extract_audio_codec(base)
+    release_group = tech.get("releaseGroup") or _extract_release_group(base) or ""
+
+    return {
+        "videoFormat": video_format or "",
+        "source": source or "",
+        "effects": effects or "",
+        "videoCodec": video_codec or "",
+        "audioCodec": audio_codec or "",
+        "editionFlags": edition_flags or "",
+        "releaseGroup": release_group or "",
+        "webSource": tech.get("webSource") or "",
+        "fileExt": tech.get("fileExt") or "",
+    }
+
+
+def _score_resolution(video_format: str) -> int:
+    if not video_format:
+        return 0
+    return int(_RESOLUTION_SCORES.get(video_format, 0))
+
+
+def _score_source(source: str) -> int:
+    if not source:
+        return _SOURCE_DEFAULT
+    return int(_SOURCE_SCORES.get(source, _SOURCE_DEFAULT))
+
+
+def _score_hdr(effects: str) -> int:
+    if not effects:
+        return 0
+    text = effects.upper().replace(" ", "")
+    # DV 优先，命中后不再叠 HDR
+    if re.search(r"\bDV\b|DOVI|DOLBY.?VISION", effects, re.I):
+        return 12
+    if "HDR10+" in text or "HDR10PLUS" in text:
+        return 10
+    if "HDR10" in text:
+        return 8
+    if re.search(r"\bHDR\b", effects, re.I):
+        return 6
+    if re.search(r"\bHLG\b", effects, re.I):
+        return 4
+    return 0
+
+
+def _score_audio(audio_codec: str) -> int:
+    if not audio_codec:
+        return 0
+    ac = audio_codec.upper()
+    if ac.startswith("TRUEHD.ATMOS") or "TRUEHD.ATMOS" in ac:
+        return 8
+    if ac.startswith("TRUEHD"):
+        return 7
+    if "DTS-HD.MA.ATMOS" in ac or ac.startswith("DTS.ATMOS"):
+        return 7
+    if ac.startswith("DTS-HD.MA") or "DTS-HD.MA" in ac:
+        return 6
+    if ac.startswith("DDP.ATMOS") or "DDP.ATMOS" in ac:
+        return 5
+    if ac.startswith("DDP") or ac.startswith("DTS"):
+        return 3
+    if ac.startswith("AAC") or ac.startswith("FLAC"):
+        return 2
+    return 1
+
+
+def _score_codec_extra(video_codec: str, edition_flags: str, source: str) -> int:
+    pts = 0
+    vc = (video_codec or "").upper()
+    if vc in ("AV1", "H265"):
+        pts += 3
+    elif vc in ("H264",):
+        pts += 2
+    elif vc:
+        pts += 1
+
+    flags = edition_flags or ""
+    extra = 0
+    if re.search(r"\bIMAX\b", flags, re.I):
+        extra += 2
+    if re.search(r"\bPROPER\b", flags, re.I):
+        extra += 1
+    if re.search(r"\bREPACK\b", flags, re.I):
+        extra += 1
+    pts += min(2, extra)
+    return min(5, pts)
+
+
+def _apply_remux_defaults(
+    source: str,
+    video_codec: str,
+    audio_codec: str,
+    codec_pts: int,
+    audio_pts: int,
+) -> Tuple[int, int]:
+    """原盘缺编码/音轨时给地板分，避免被写全标签的 WEB 反超。"""
+    if source not in _REMUX_SOURCES:
+        return codec_pts, audio_pts
+    if not video_codec and codec_pts < 3:
+        codec_pts = 3  # 默认按 H265
+    if not audio_codec and audio_pts < 3:
+        audio_pts = 3  # 音轨地板，非 TrueHD 满分
+    return min(5, codec_pts), min(8, audio_pts)
+
+
+def score_quality_breakdown(path: str) -> QualityBreakdown:
+    """计算百分制分项。"""
+    fields = parse_quality_fields(path)
+    video_format = fields["videoFormat"]
+    source = fields["source"]
+    effects = fields["effects"]
+    video_codec = fields["videoCodec"]
+    audio_codec = fields["audioCodec"]
+    edition_flags = fields["editionFlags"]
+
+    res_pts = _score_resolution(video_format)
+    src_pts = _score_source(source)
+    hdr_pts = _score_hdr(effects)
+    audio_pts = _score_audio(audio_codec)
+    codec_pts = _score_codec_extra(video_codec, edition_flags, source)
+    codec_pts, audio_pts = _apply_remux_defaults(
+        source, video_codec, audio_codec, codec_pts, audio_pts
+    )
+
+    total = res_pts + src_pts + hdr_pts + audio_pts + codec_pts
+    total = max(0, min(100, int(total)))
+
+    return QualityBreakdown(
+        resolution=res_pts,
+        source=src_pts,
+        hdr=hdr_pts,
+        audio=audio_pts,
+        codec_extra=codec_pts,
+        total=total,
+        video_format=video_format,
+        source_name=source,
+        effects=effects,
+        video_codec=video_codec,
+        audio_codec=audio_codec,
+        release_group=fields.get("releaseGroup") or "",
+    )
 
 
 def calculate_quality_score(path: str, size: int = 0) -> int:
-    """根据文件名/路径与体积计算质量分。"""
-    info = extract_video_info(path)
-    score = 0
+    """计算 0~100 画质分。
 
-    if info.resolution:
-        score += _RESOLUTION_SCORES.get(info.resolution, 0)
-
-    if info.video_codec:
-        score += _VIDEO_CODEC_SCORES.get(info.video_codec, 0)
-
-    if info.audio_codec:
-        best_audio = 0
-        for token in info.audio_codec.split("|"):
-            best_audio = max(best_audio, _AUDIO_CODEC_SCORES.get(token.strip(), 0))
-        score += best_audio
-
-    if info.hdr_type:
-        score += _HDR_SCORES.get(info.hdr_type, 0)
-
-    if info.dolby_vision:
-        score += 250
-    if info.atmos:
-        score += 150
-
-    if info.bit_depth:
-        if info.bit_depth >= 12:
-            score += 80
-        elif info.bit_depth >= 10:
-            score += 50
-
-    if info.fps:
-        if info.fps >= 50:
-            score += 70
-        elif info.fps >= 30:
-            score += 15
-
-    if info.source:
-        score += _SOURCE_SCORES.get(info.source, 0)
-
-    for tag in info.quality_tags:
-        score += _QUALITY_TAG_SCORES.get(tag, 0)
-
-    size_gb = size / (1024 * 1024 * 1024) if size else 0
-    if size_gb > 0:
-        ideal_size = 2.0
-        if info.resolution in ("2160p", "4320p"):
-            ideal_size = 25.0
-        elif info.resolution == "1440p":
-            ideal_size = 12.0
-        elif info.resolution == "1080p":
-            ideal_size = 8.0
-        elif info.resolution == "720p":
-            ideal_size = 4.0
-        elif info.resolution == "576p":
-            ideal_size = 2.5
-
-        size_ratio = size_gb / ideal_size
-        if 0.5 <= size_ratio <= 2.0:
-            size_score = 200 - abs(size_ratio - 1.0) * 100
-        else:
-            size_score = max(0.0, 100 - abs(size_ratio - 1.0) * 50)
-        score += round(size_score)
-
-    return int(round(score))
+    size 参数保留兼容，**不参与计分**。
+    """
+    _ = size  # 明确忽略体积
+    return score_quality_breakdown(path).total
 
 
 def get_quality_level(score: int) -> str:
-    if score >= 4000:
+    """百分制档位文案。"""
+    s = int(score or 0)
+    if s >= 90:
         return "优秀"
-    if score >= 3000:
+    if s >= 75:
         return "良好"
-    if score >= 2000:
+    if s >= 60:
         return "一般"
     return "较差"
 
 
 def generate_video_tags(path: str) -> List[str]:
-    """生成展示用标签列表（含发布组）。"""
-    info = extract_video_info(path)
+    """生成展示标签（与整理重命名词表一致）。"""
+    b = score_quality_breakdown(path)
     tags: List[str] = []
-    if info.resolution:
-        tags.append(info.resolution)
-
-    quality_section: List[str] = []
-    if info.hdr_type:
-        quality_section.append(info.hdr_type)
-    if info.dolby_vision:
-        quality_section.append("Dolby Vision")
-    if info.atmos:
-        quality_section.append("Dolby Atmos")
-    if "REMUX" in info.quality_tags:
-        quality_section.append("REMUX")
-    if "IMAX" in info.quality_tags:
-        quality_section.append("IMAX")
-    if "ULTRAHD" in info.quality_tags:
-        quality_section.append("UHD")
-    if "HFR" in info.quality_tags:
-        quality_section.append("HFR")
-    if "HQ" in info.quality_tags:
-        quality_section.append("HQ")
-    if "EDR" in info.quality_tags:
-        quality_section.append("EDR")
-    if quality_section:
-        tags.append(" / ".join(quality_section))
-
-    if info.fps:
-        tags.append(f"{info.fps}fps")
-    if info.bit_depth:
-        tags.append(f"{info.bit_depth}bit")
-    if info.audio_codec:
-        tags.append(info.audio_codec)
-    if info.source and info.source != "REMUX":
-        tags.append(info.source)
-    if info.video_codec:
-        tags.append(info.video_codec)
-    if info.release_group:
-        tags.append(info.release_group)
-
+    if b.video_format:
+        tags.append(b.video_format)
+    if b.source_name:
+        tags.append(b.source_name)
+    if b.effects:
+        # effects 可能是 "DV HDR10"，收成一段
+        tags.append(b.effects)
+    if b.video_codec:
+        tags.append(b.video_codec)
+    if b.audio_codec:
+        tags.append(b.audio_codec)
+    if b.release_group:
+        tags.append(b.release_group)
     return tags
 
 
 def extract_release_group(path: str) -> str:
-    """对外暴露：从路径提取发布组。"""
-    return _extract_release_group_from_path(path)
+    """从路径提取发布组（复用整理模块）。"""
+    name = _basename(path)
+    base = _base_no_ext(name)
+    if not base:
+        return ""
+    return _extract_release_group(base) or ""
+
+
+def aggregate_quality_scores(scores: List[int]) -> int:
+    """样本聚合：≤2 用 max，否则 P75。"""
+    if not scores:
+        return 0
+    if len(scores) == 1:
+        return int(scores[0])
+    if len(scores) == 2:
+        return int(max(scores))
+    ordered = sorted(int(s) for s in scores)
+    # 线性插值 75 分位
+    idx = 0.75 * (len(ordered) - 1)
+    lo = int(idx)
+    hi = min(lo + 1, len(ordered) - 1)
+    frac = idx - lo
+    return int(round(ordered[lo] * (1.0 - frac) + ordered[hi] * frac))
+
+
+# 兼容旧调用名（若外部仍引用）
+def extract_video_info(path: str):
+    """兼容旧接口：返回简单命名空间。"""
+    b = score_quality_breakdown(path)
+    return b
+

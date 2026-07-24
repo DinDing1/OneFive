@@ -1,4 +1,4 @@
-"""
+﻿"""
 分享洗版服务
 
 规则（产品确认）：
@@ -12,7 +12,6 @@
 from __future__ import annotations
 
 import re
-import statistics
 import time
 from collections import Counter, defaultdict
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
@@ -20,6 +19,7 @@ from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 from ..db.database import get_db
 from ..logger import get_logger
 from .quality_score import (
+    aggregate_quality_scores,
     calculate_quality_score,
     extract_release_group,
     generate_video_tags,
@@ -37,7 +37,7 @@ VIDEO_EXTS = (
 # 每个分享源最多参与打分的视频数（取体积最大的若干个，足够反映画质）
 MAX_SCORE_SAMPLES = 8
 
-COMPLETENESS_BONUS_MAX = 800
+COMPLETENESS_BONUS_MAX = 10  # 百分制下完整度加分上限，不进画质分本体
 
 _SEASON_CN_RE = re.compile("\u7b2c" + r"\s*([0-9]{1,2})\s*" + "\u5b63")
 _SEASON_EN_RE = re.compile(r"[Ss]eason[\s._-]*([0-9]{1,2})", re.I)
@@ -209,12 +209,12 @@ class ShareWashService:
                     bonus = 0
                 it["completeness_bonus"] = bonus
                 it["score"] = int(it.get("quality_score") or 0) + bonus
-                it["quality_level"] = get_quality_level(it["score"])
+                it["quality_level"] = get_quality_level(it.get("quality_score") or 0)
 
             items.sort(
                 key=lambda x: (
                     -int(x.get("score") or 0),
-                    -int(x.get("total_size") or 0),
+                    -float(x.get("completeness_ratio") or 0),
                     str(x.get("updated_at") or ""),
                     -int(x.get("source_id") or 0),
                 )
@@ -460,11 +460,12 @@ class ShareWashService:
         release_group_counter: Counter = Counter()
         total_size = sum(int(r.get("size") or 0) for r in matched)
 
+        # 仅用整理后路径打分/打标签（与重命名字段一致）；体积不进分；不使用 share_name
         for r in score_rows:
             path = r.get("organized_name") or r.get("name") or ""
             odir = r.get("organized_dir") or ""
             full = f"{odir}/{path}" if odir else path
-            scores.append(calculate_quality_score(full, int(r.get("size") or 0)))
+            scores.append(calculate_quality_score(full))
             for t in generate_video_tags(full):
                 tags_counter[t] += 1
             rg = extract_release_group(full)
@@ -473,18 +474,9 @@ class ShareWashService:
 
         if not scores:
             return None
-        quality_score = scores[0] if len(scores) == 1 else int(round(statistics.median(scores)))
+        quality_score = aggregate_quality_scores(scores)
 
         share_name = source.get("share_name") or ""
-        if share_name:
-            for t in generate_video_tags(share_name):
-                tags_counter[t] += 1
-            rg = extract_release_group(share_name)
-            if rg:
-                release_group_counter[rg] += 2  # 分享名权重略高
-            # 分享名也参与打分中位数
-            scores.append(calculate_quality_score(share_name, int(source.get("total_size") or total_size or 0)))
-            quality_score = int(round(statistics.median(scores)))
 
         episode_count = len(matched)
         release_group = release_group_counter.most_common(1)[0][0] if release_group_counter else ""
@@ -562,3 +554,5 @@ def get_share_wash_service() -> ShareWashService:
     if _service is None:
         _service = ShareWashService()
     return _service
+
+
