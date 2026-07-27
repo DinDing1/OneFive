@@ -79,6 +79,12 @@ class AuthService:
         try:
             self.config_service.set("cookie115", cookies, "115云盘cookie")
             logger.info("保存 cookies 成功")
+
+            try:
+                from .p115_client_factory import invalidate_p115_clients
+                invalidate_p115_clients()
+            except Exception:
+                pass
             return True
         except Exception as e:
             logger.error(f"保存 cookies 失败: {e}")
@@ -427,6 +433,11 @@ class AuthService:
         """登出：删除数据库中的 cookie 记录"""
         try:
             self.config_service.delete("cookie115")
+            try:
+                from .p115_client_factory import invalidate_p115_clients
+                invalidate_p115_clients()
+            except Exception:
+                pass
             logger.info("登出成功")
             return True
         except Exception as e:

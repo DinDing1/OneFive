@@ -677,6 +677,7 @@ const showPassword = ref(false)
 
 const organizeMode = ref('move')
 const sourcePath = ref('')
+const sourceCid = ref('')
 const mediaLibraryPath = ref('')
 const mediaLibraryCid = ref('')
 const movieTemplate = ref('')
@@ -819,6 +820,7 @@ async function loadOrganizeSettings() {
       tvTemplate.value = res.data.tv_template || ''
       organizeMode.value = res.data.organize_mode || 'move'
       sourcePath.value = res.data.source_path || ''
+      sourceCid.value = res.data.source_cid || ''
       // 分类策略相关
       if (res.data.classify_rules) {
         const rules = JSON.parse(res.data.classify_rules)
@@ -852,6 +854,7 @@ async function saveMediaSettings() {
     await organizeApi.updateSettings({
       organize_mode: organizeMode.value,
       source_path: sourcePath.value,
+      source_cid: sourceCid.value,
       media_library_path: mediaLibraryPath.value,
       media_library_cid: mediaLibraryCid.value,
       movie_template: movieTemplate.value,
@@ -904,6 +907,7 @@ function confirmPathPick() {
   const value = parts.length === 0 ? '/' : parts.join('/')
   if (pickerTarget.value === 'source') {
     sourcePath.value = value
+    sourceCid.value = pickerCid.value
   } else {
     mediaLibraryPath.value = value
     mediaLibraryCid.value = pickerCid.value

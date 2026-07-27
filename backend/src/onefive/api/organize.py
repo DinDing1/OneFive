@@ -44,6 +44,7 @@ class SettingsRequest(BaseModel):
     media_library_path: Optional[str] = None
     media_library_cid: Optional[str] = None
     source_path: Optional[str] = None
+    source_cid: Optional[str] = None
     movie_template: Optional[str] = None
     tv_template: Optional[str] = None
     organize_mode: Optional[str] = None
@@ -171,6 +172,7 @@ async def get_settings():
             "media_library_path": config_service.get("media_library_path") or "/媒体库",
             "media_library_cid": config_service.get("media_library_cid") or "",
             "source_path": config_service.get("source_path") or "",
+            "source_cid": config_service.get("source_cid") or "",
             "movie_template": movie_tpl,
             "tv_template": tv_tpl,
             "organize_mode": config_service.get("organize_mode") or "move",
@@ -201,6 +203,8 @@ async def update_settings(req: SettingsRequest):
         config_service.set("media_library_cid", req.media_library_cid, "媒体库根目录 CID")
     if req.source_path is not None:
         config_service.set("source_path", req.source_path, "保存路径")
+    if req.source_cid is not None:
+        config_service.set("source_cid", req.source_cid, "保存路径 CID")
     if req.movie_template is not None:
         config_service.set("movie_template", req.movie_template, "电影命名模板")
     if req.tv_template is not None:

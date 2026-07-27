@@ -13,8 +13,8 @@
     logger = get_logger(__name__)
     logger.info("信息")
 
-新增模块时，在 MODULE_NAMES 中注册简短名称即可：
-    MODULE_NAMES["onefive.services.xxx"] = "Xxx"
+新增模块时，在 MODULE_NAMES 中注册中文短名即可：
+    MODULE_NAMES["onefive.services.xxx_service"] = "业务名"
 """
 import os
 import logging
@@ -23,16 +23,32 @@ import logging.handlers
 from .paths import LOG_DIR, LOG_FILE
 
 # ==================== 模块名称映射 ====================
+# 约定：
+# 1) key 使用完整 logger 名（通常即 get_logger(__name__) 的 __name__）
+# 2) value 为中文短名，控制台/日志文件统一展示
+# 3) 同业务域 API 与 Service 尽量共用同一展示名，便于筛选
+# 4) 新增模块务必在此注册，避免日志出现 offline_download_service 这类原始名
 MODULE_NAMES = {
+    # ---- 应用核心 ----
     "onefive": "应用",
     "onefive.main": "应用",
     "onefive.logger": "日志",
+    "onefive.db.database": "数据库",
+
+    # ---- API ----
     "onefive.api.auth": "认证",
     "onefive.api.config": "配置",
     "onefive.api.files": "文件",
     "onefive.api.logs": "日志",
     "onefive.api.organize": "整理",
     "onefive.api.share": "分享",
+    "onefive.api.share_wash": "分享洗版",
+    "onefive.api.strm": "STRM",
+    "onefive.api.notification": "通知",
+    "onefive.api.direct_link": "直链",
+    "onefive.api.offline": "离线转存",
+
+    # ---- Services ----
     "onefive.services.auth_service": "认证",
     "onefive.services.config_service": "配置",
     "onefive.services.file_service": "文件",
@@ -44,15 +60,19 @@ MODULE_NAMES = {
     "onefive.services.organize_service": "整理",
     "onefive.services.share_service": "分享",
     "onefive.services.share_organize_service": "分享整理",
+    "onefive.services.share_wash_service": "分享洗版",
     "onefive.services.strm_service": "STRM",
-    "onefive.api.strm": "STRM",
-    "onefive.api.notification": "通知",
-    "onefive.api.direct_link": "直链",
     "onefive.services.direct_link_service": "直链",
+    "onefive.services.direct_link_cache_service": "直链缓存",
+    "onefive.services.offline_download_service": "离线转存",
+    "onefive.services.offline_link_parser": "离线解析",
+    "onefive.services.p115_client_factory": "115客户端",
+    "onefive.services.quality_score": "质量评分",
+
+    # ---- 通知 ----
     "onefive.notification": "通知",
     "onefive.notification.manager": "通知",
     "onefive.notification.telegram.channel": "Telegram",
-    "onefive.db.database": "数据库",
 }
 
 
@@ -70,10 +90,38 @@ def get_log_level() -> str:
 
 
 def _resolve_name(module_name: str) -> str:
-    """将模块路径转换为简短名称"""
+    """将模块路径转换为简短中文名称
+
+    解析顺序：
+    1. 精确匹配 MODULE_NAMES
+    2. 最长前缀匹配（兼容子 logger，如 xxx_service.worker）
+       - 仅匹配深度 >= 3 的 key（如 onefive.services.xxx）
+       - 避免 "onefive" 把未注册模块全部吞成「应用」，漏注册时更易发现
+    3. 回退：去掉 _service 等后缀后的末段
+    """
+    if not module_name:
+        return "应用"
     if module_name in MODULE_NAMES:
         return MODULE_NAMES[module_name]
-    return module_name.rsplit(".", 1)[-1]
+
+    # 最长前缀匹配：onefive.services.offline_download_service.worker → 离线转存
+    best_key = ""
+    for key in MODULE_NAMES:
+        # onefive / onefive.api 这类过短前缀不参与吞并
+        if key.count(".") < 2:
+            continue
+        if module_name.startswith(key + ".") and len(key) > len(best_key):
+            best_key = key
+    if best_key:
+        return MODULE_NAMES[best_key]
+
+    # 友好回退：auth_service → auth；避免整串 eng 类名刷屏
+    short = module_name.rsplit(".", 1)[-1]
+    for suffix in ("_service", "_api", "_router"):
+        if short.endswith(suffix) and len(short) > len(suffix):
+            short = short[: -len(suffix)]
+            break
+    return short
 
 
 class _ModuleNameFilter(logging.Filter):

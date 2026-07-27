@@ -1,4 +1,4 @@
-﻿"""
+"""
 文件名解析服务（混合方案）
 
 职责：从视频文件名中提取关键信息
@@ -94,13 +94,26 @@ _SEASON_EPISODE_PATTERNS = [
     re.compile(r'第\s*\d+\s*集'),                                # 第1集 / 第 01 集
     re.compile(r'(?:^|[\s._\-])[Ee][Pp]?\.?\s*\d{1,3}'),        # EP01 / E01 / ep.1（需前导边界）
     re.compile(r'Season\s*\d{1,2}', re.IGNORECASE),             # Season 1
+    # 特典 / Special / SP / OVA 等（无正规 SxxExx 时用于判定电视剧）
+    re.compile(r'(?:^|[\s._\-\[\(])SP\.?\s*\d{1,3}(?:$|[\s._\-\]\)])', re.IGNORECASE),
+    re.compile(
+        r'(?:^|[\s._\-\[\(])Specials?(?![A-Za-z])(?![\s._\-]*(?:Edition|Ed\b|Cut|Extended))',
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r'(?:^|[\s._\-\[\(])(?:OVA|OAD|ONA|NCOP|NCED)(?:\s*\d{0,3})(?:$|[\s._\-\]\)])',
+        re.IGNORECASE,
+    ),
+    re.compile(r'(?:^|[\s._\-\[\(])(?:Extras?|Bonus)(?:$|[\s._\-\]\)]|\s*\d)', re.IGNORECASE),
+    re.compile(r'特典|特别[篇章节目]|番外|花絮'),
 ]
 
 
 def has_season_episode_marker(name: str) -> bool:
     """判断文件名是否包含季集标记（用于区分电视剧/电影）
 
-    统一规则：S01E01、第x集、EP01、E01、Season 01 任一命中即视为电视剧。
+    统一规则：S01E01、第x集、EP01、E01、Season 01，
+    以及 Special/SP/特典/OVA 等特典标记，任一命中即视为电视剧。
     模块级预编译正则，避免每次调用重复编译。
     """
     return any(p.search(name) for p in _SEASON_EPISODE_PATTERNS)
@@ -381,6 +394,14 @@ def extract_key_info(filename: str, folder_files: Optional[List[str]] = None) ->
         season, episode, season_only = _detect_season_episode(base)
         if season is None and episode is None and season_only is not None:
             season = season_only
+        # 无正规季集时：Special / SP / 特典 等自动归 Season 00
+        if season is None:
+            is_special, special_ep = _detect_special_episode(base)
+            if is_special:
+                season = 0
+                if episode is None and special_ep is not None:
+                    episode = special_ep
+                title = _strip_special_tokens_from_title(title)
         media_type = 'tv' if season is not None or episode is not None else 'movie'
         return {
             "title": title,
@@ -434,6 +455,16 @@ def extract_key_info(filename: str, folder_files: Optional[List[str]] = None) ->
             episode = cn_episode
         if season is None and episode is None and season_only is not None:
             season = season_only
+
+    # 无正规季集时：Special / SP / 特典 等自动归 Season 00
+    # 已有 S01E01 等正规标记时不改写为 S00，避免误伤正片
+    if season is None:
+        is_special, special_ep = _detect_special_episode(base)
+        if is_special:
+            season = 0
+            if episode is None and special_ep is not None:
+                episode = special_ep
+            title = _strip_special_tokens_from_title(title)
 
     media_type = 'tv' if season is not None or episode is not None else 'movie'
     return {
@@ -544,6 +575,126 @@ def _detect_season_episode(base: str) -> Tuple[Optional[int], Optional[int], Opt
     return season, episode, season_only
 
 
+def _detect_special_episode(filename: str) -> Tuple[bool, Optional[int]]:
+    """检测特典 / Special / SP 等特殊集标记
+
+    用于文件名没有正规 S00Exx 时，自动归到 Season 00。
+    仅在 extract_key_info 中「当前 season 仍为 None」时调用，
+    已有 S01E01 等正规季集时不会改写。
+
+    识别范围（带边界，尽量少误伤）：
+    - SP01 / SP 01 / SP.1（必须带数字，避免 SPARKS 等发布组）
+    - Specials / Special 01；裸 Special 排除 Special Edition/Ed/Cut/Extended
+    - 中文：特典、特别篇/章/节目、番外、花絮（可带编号）
+    - OVA / OAD / ONA（可带编号）
+    - NCOP / NCED、Extras / Bonus
+    - 不单独匹配裸 OP/ED（易误伤片头片尾简称）
+
+    Returns:
+        (is_special, episode_or_none)
+    """
+    if not filename:
+        return False, None
+
+    name = filename
+
+    # 电影常见 "Special Edition / Special.Cut" 等：不当作特典集
+    # 允许空格/点/下划线/连字符分隔（Special.Edition / Special-Edition）
+    is_special_edition = bool(re.search(
+        r'(?:^|[\s._\-\[\(])Special[\s._\-]*(?:Edition|Ed(?![A-Za-z])|Cut|Extended)\b',
+        name,
+        re.IGNORECASE,
+    ))
+
+    if not is_special_edition:
+        # 裸 Special / Specials（可带编号）；后接 Edition 等已在上方排除
+        m = re.search(
+            r'(?:^|[\s._\-\[\(])Specials?(?![A-Za-z])'
+            r'(?:[\s._\-]*0*(\d{1,3}))?'
+            r'(?=$|[\s._\-\]\)]|(?=[\s._\-]*(?:1080|2160|720|480|4K|UHD|WEB|Blu|HDR|DV|H\.?26|x26|HEVC|AAC|DDP|DTS|\d{4})))',
+            name,
+            re.IGNORECASE,
+        )
+        if m:
+            ep = int(m.group(1)) if m.group(1) else None
+            return True, ep
+
+    # SP + 数字（必须有数字，避免 SPARKS / SPEED 等）
+    m = re.search(
+        r'(?:^|[\s._\-\[\(])SP\.?\s*0*(\d{1,3})(?:$|[\s._\-\]\)])',
+        name,
+        re.IGNORECASE,
+    )
+    if m:
+        return True, int(m.group(1))
+
+    # OVA / OAD / ONA（可带编号）
+    m = re.search(
+        r'(?:^|[\s._\-\[\(])(?:OVA|OAD|ONA)(?:[\s._\-]*0*(\d{1,3}))?(?:$|[\s._\-\]\)])',
+        name,
+        re.IGNORECASE,
+    )
+    if m:
+        ep = int(m.group(1)) if m.group(1) else None
+        return True, ep
+
+    # NCOP / NCED（可带编号）
+    m = re.search(
+        r'(?:^|[\s._\-\[\(])NC(?:OP|ED)(?:[\s._\-]*0*(\d{1,3}))?(?:$|[\s._\-\]\)])',
+        name,
+        re.IGNORECASE,
+    )
+    if m:
+        ep = int(m.group(1)) if m.group(1) else None
+        return True, ep
+
+    # Extras / Extra / Bonus
+    m = re.search(
+        r'(?:^|[\s._\-\[\(])(?:Extras?|Bonus)(?:[\s._\-]*0*(\d{1,3}))?(?:$|[\s._\-\]\)])',
+        name,
+        re.IGNORECASE,
+    )
+    if m:
+        ep = int(m.group(1)) if m.group(1) else None
+        return True, ep
+
+    # 中文特典类：特典01 / 特别篇 / 番外2 / 花絮
+    m = re.search(r'(?:特典|特别[篇章节目]|番外|花絮)\s*0*(\d{1,3})?', name)
+    if m:
+        ep = int(m.group(1)) if m.group(1) else None
+        return True, ep
+
+    return False, None
+
+
+def _strip_special_tokens_from_title(title: str) -> str:
+    """从标题中剥离特典标记，避免搜索词带上 SP01 / Special / 特典。"""
+    if not title:
+        return title
+    cleaned = title
+    cleaned = re.sub(
+        r'(?:^|[\s._\-])SP\.?\s*\d{1,3}(?=$|[\s._\-])',
+        ' ',
+        cleaned,
+        flags=re.IGNORECASE,
+    )
+    cleaned = re.sub(
+        r'(?:^|[\s._\-])Specials?(?:\s*\d{1,3})?(?=$|[\s._\-])',
+        ' ',
+        cleaned,
+        flags=re.IGNORECASE,
+    )
+    cleaned = re.sub(
+        r'(?:^|[\s._\-])(?:OVA|OAD|ONA|NCOP|NCED|Extras?|Bonus)(?:\s*\d{0,3})?(?=$|[\s._\-])',
+        ' ',
+        cleaned,
+        flags=re.IGNORECASE,
+    )
+    cleaned = re.sub(r'特典\s*\d*|特别[篇章节目]\s*\d*|番外\s*\d*|花絮\s*\d*', ' ', cleaned)
+    cleaned = re.sub(r'[\s._\-]+', ' ', cleaned).strip()
+    return cleaned or title
+
+
 # ==================== 标题清洗 / 搜索 query ====================
 
 _TECH_NOISE_RE = re.compile(
@@ -608,6 +759,18 @@ def _clean_query(text: str) -> str:
     cleaned = _strip_release_group_token(cleaned)
     cleaned = re.sub(r'(?<=[A-Za-z0-9])-(?=[A-Za-z]{2,}$)', ' ', cleaned)
     cleaned = re.sub(r'[._\-\[\]\(\)\{\}@]+', ' ', cleaned)
+    cleaned = re.sub(r'\s+', ' ', cleaned).strip()
+    # 分隔符规范化后再去特典标记（原文件名多为 Show.SP01.1080p 点分形式）
+    cleaned = re.sub(r'(?:^|\s)SP\.?\s*\d{1,3}(?=\s|$)', ' ', cleaned, flags=re.IGNORECASE)
+    # 不剥离 Special Edition / Special Cut 中的 Special
+    cleaned = re.sub(
+        r'(?:^|\s)Specials?(?!\s*(?:Edition|Ed\b|Cut|Extended))(?:\s*\d{1,3})?(?=\s|$)',
+        ' ',
+        cleaned,
+        flags=re.IGNORECASE,
+    )
+    cleaned = re.sub(r'(?:^|\s)(?:OVA|OAD|ONA|NCOP|NCED|Extras?|Bonus)(?:\s*\d{0,3})?(?=\s|$)', ' ', cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r'特典\s*\d*|特别[篇章节目]\s*\d*|番外\s*\d*|花絮\s*\d*', ' ', cleaned)
     cleaned = re.sub(r'\s+', ' ', cleaned).strip()
     cleaned = re.sub(r'^\d{4}\s+|\s+\d{4}$', ' ', cleaned).strip()
     return cleaned

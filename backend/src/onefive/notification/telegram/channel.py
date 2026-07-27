@@ -292,9 +292,8 @@ class TelegramChannel(NotificationChannel):
         logger.info("Bot: 消息事件处理器已注册")
 
     async def _on_bot_message(self, event):
-        """处理 Bot 收到的消息，检测 115 分享链接"""
+        """处理 Bot 收到的消息：115 分享链接 / ed2k / magnet。"""
         try:
-            # 仅处理管理员发送的消息
             sender_id = event.sender_id
             if not self.is_admin(sender_id):
                 return
@@ -303,37 +302,99 @@ class TelegramChannel(NotificationChannel):
             if not message_text:
                 return
 
-            # 检测是否包含 115 分享链接
-            if '115.com/s/' not in message_text and '115cdn.com/s/' not in message_text:
-                return
+            replies: list[str] = []
 
-            # 提取分享 URL
-            url_match = re.search(r'https?://\S*(?:115\.com|115cdn\.com)/s/\S+', message_text)
-            if not url_match:
-                return
-
-            share_url = url_match.group(0)
-            logger.info(f"Bot: 检测到 115 分享链接: {share_url}")
-
-            # 调用 share_service 处理分享链接（同步方法，用 asyncio.to_thread 包裹避免阻塞 Telethon 事件循环）
-            from ...services.share_service import get_share_service
-            share_service = get_share_service()
-            result = await asyncio.to_thread(share_service.add_share, share_url, source_type='bot')
-
-            # 构造回复消息
-            if result.get('success'):
-                reply = (
-                    f"✅ 分享添加成功\n"
-                    f"📁 {result.get('share_name', '')}\n"
-                    f"📄 {result.get('file_count', 0)} 个文件\n"
-                    f"💾 {format_size(result.get('total_size', 0))}\n"
-                    f"🔑 source_id: {result.get('source_id')}"
+            # ---- 115 分享链接 → 虚拟库 ----
+            has_share = ("115.com/s/" in message_text) or ("115cdn.com/s/" in message_text)
+            if has_share:
+                url_match = re.search(
+                    r"https?://\S*(?:115\.com|115cdn\.com)/s/\S+",
+                    message_text,
                 )
-            else:
-                reply = f"❌ 分享添加失败: {result.get('error', '未知错误')}"
+                if url_match:
+                    share_url = url_match.group(0)
+                    logger.info(f"Bot: 检测到 115 分享链接: {share_url}")
+                    from ...services.share_service import get_share_service
 
-            # 回复消息
-            await event.reply(reply)
+                    share_service = get_share_service()
+                    result = await asyncio.to_thread(
+                        share_service.add_share, share_url, source_type="bot"
+                    )
+                    if result.get("success"):
+                        replies.append(
+                            "✅ 分享添加成功\n"
+                            f"📦 {result.get('share_name', '')}\n"
+                            f"📁 {result.get('file_count', 0)} 个文件\n"
+                            f"💾 {format_size(result.get('total_size', 0))}\n"
+                            f"🆔 source_id: {result.get('source_id')}"
+                        )
+                    else:
+                        replies.append(
+                            f"❌ 分享添加失败: {result.get('error', '未知错误')}"
+                        )
+
+            # ---- ed2k / magnet → 115 离线转存 ----
+            from ...services.offline_link_parser import extract_offline_links_from_text
+            from ...services.offline_download_service import get_offline_download_service
+
+            offline_links = extract_offline_links_from_text(message_text)
+            if offline_links:
+                logger.info(
+                    f"Bot: 检测到离线链接 {len(offline_links)} 条 "
+                    f"({', '.join(sorted({x.url_type for x in offline_links}))})"
+                )
+                offline_service = get_offline_download_service()
+                off_result = await asyncio.to_thread(
+                    offline_service.add_urls,
+                    [x.url for x in offline_links],
+                    None,
+                    "bot",
+                )
+                if off_result.get("success"):
+                    accepted = off_result.get("accepted", 0)
+                    total = off_result.get("total", 0)
+                    exists = off_result.get("exists", 0) or 0
+                    if exists and exists == accepted:
+                        title = f"ℹ️ 离线任务已存在 {accepted}/{total}"
+                    elif exists:
+                        title = f"✅ 离线转存已提交 {accepted}/{total}（其中已存在 {exists}）"
+                    else:
+                        title = f"✅ 离线转存已提交 {accepted}/{total}"
+                    lines = [
+                        title,
+                        f"📂 保存路径: {off_result.get('save_path') or '-'}",
+                    ]
+                    if off_result.get("failed"):
+                        lines.append(f"⚠️ 失败 {off_result.get('failed')} 条")
+                    # 展示前几条明细
+                    for item in (off_result.get("items") or [])[:5]:
+                        name = item.get("name") or item.get("url_type") or "link"
+                        extra = ""
+                        if item.get("renamed"):
+                            extra = "（已恢复空格文件名）"
+                        elif item.get("rename_pending"):
+                            extra = "（下载完成后将尝试恢复文件名）"
+                        if item.get("status") == "exists":
+                            lines.append(f"• 已存在 {name}{extra}")
+                        elif item.get("ok"):
+                            lines.append(f"✓ {name}{extra}")
+                        else:
+                            lines.append(f"✗ {name}: {item.get('error') or '失败'}")
+                    if len(off_result.get("items") or []) > 5:
+                        lines.append(f"... 共 {len(off_result.get('items') or [])} 条")
+                    replies.append("\n".join(lines))
+                else:
+                    err = off_result.get("error", "未知错误")
+                    # 兜底：若错误文案是任务已存在，也按友好提示输出
+                    if any(k in str(err) for k in ("任务已存在", "重复的链接", "请勿输入重复")):
+                        replies.append(f"ℹ️ 离线任务已存在: {err}")
+                    else:
+                        replies.append(f"❌ 离线转存失败: {err}")
+
+            if not replies:
+                return
+
+            await event.reply("\n\n".join(replies))
 
         except Exception as e:
             logger.error(f"Bot: 处理消息时出错: {e}")

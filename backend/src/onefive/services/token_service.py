@@ -270,6 +270,11 @@ class TokenService:
         self.config_service.set("open_access_token", access_token, "Open API access_token")
         self.config_service.set("open_refresh_token", refresh_token, "Open API refresh_token")
         self.config_service.set("open_token_expire", str(expire_ts), "Open API token 过期时间戳")
+        try:
+            from .p115_client_factory import invalidate_p115_clients
+            invalidate_p115_clients()
+        except Exception:
+            pass
 
     @staticmethod
     def _generate_code_verifier() -> str:

@@ -20,7 +20,7 @@ from .file_info_service import (
     has_season_episode_marker, format_size,
 )
 from .classify_service import classify_media
-from .rename_service import generate_target_path
+from .rename_service import generate_target_path, normalize_se_number
 from .file_service import get_file_service
 from .config_service import get_config_service
 from ..logger import get_logger
@@ -253,11 +253,12 @@ class OrganizeService:
                  or key_info.get("title", ""))
         year = key_info.get("year", "")
         season_year = ""
-        season = str(key_info.get("season", "")) if key_info.get("season") else ""
-        episode = str(key_info.get("episode", "")) if key_info.get("episode") else ""
+        # 特别篇 season=0 合法，不能用 if key_info.get("season") 判空
+        season = normalize_se_number(key_info.get("season"))
+        episode = normalize_se_number(key_info.get("episode"))
 
-        # 获取季年份
-        if key_info["mediaType"] == "tv" and season and tmdb_id:
+        # 获取季年份（含 Season 00 特别篇）
+        if key_info["mediaType"] == "tv" and season != "" and tmdb_id:
             season_info = self.tmdb_service.get_tv_season(int(tmdb_id), int(season))
             if season_info:
                 air_date = season_info.get("air_date", "")
@@ -267,7 +268,7 @@ class OrganizeService:
         # 文件夹+电视剧：只返回文件夹路径
         if is_folder and key_info["mediaType"] == "tv":
             dir_path = f"{title} ({year}) {{tmdb={tmdb_id}}}"
-            if season:
+            if season != "":
                 dir_path += f"/Season {season.zfill(2)}"
             return {"dir": dir_path, "filename": ""}
 
@@ -796,8 +797,8 @@ class OrganizeService:
                 year=key_info.get("year", ""),
                 tmdb_id=use_tmdb_id,
                 tech_info=tech_info,
-                season=str(key_info.get("season", "")) if key_info.get("season") else "",
-                episode=str(key_info.get("episode", "")) if key_info.get("episode") else "",
+                season=normalize_se_number(key_info.get("season")),
+                episode=normalize_se_number(key_info.get("episode")),
             )
             new_name = target.get("filename", "")
 

@@ -71,6 +71,8 @@ def render_template(template: str, variables: Dict[str, Any]) -> str:
     # 清理空的路径段
     result = re.sub(r'/\./', '/', result)
     result = re.sub(r'/\s*/', '/', result)
+    # 无季号时去掉空的 "Season/" 段（Season 00 有数字不会被误删）
+    result = re.sub(r'/Season\s*(?=/|$)', '', result, flags=re.IGNORECASE)
 
     # 清理因空值产生的多余分隔符
     result = re.sub(r'\.-\.', '.', result)     # .-. -> .
@@ -82,6 +84,38 @@ def render_template(template: str, variables: Dict[str, Any]) -> str:
     result = re.sub(r'^[.\-]\s*', '', result)     # 去掉开头的 . 或 -
 
     return result
+
+
+
+def normalize_se_number(value: Any) -> str:
+    """将季/集编号规范为字符串。
+
+    重要：0 / "0" / "00" 都是合法值（特别篇 Season 00 / S00E01），
+    不能用 ``if season`` 这种真值判断，否则会把 0 当成“空”丢掉。
+    只有 None / 空字符串表示缺失。
+    """
+    if value is None:
+        return ""
+    if isinstance(value, bool):
+        return ""
+    if isinstance(value, int):
+        return str(value)
+    text = str(value).strip()
+    if text == "":
+        return ""
+    # "00" / "01" → 先转 int 再转回，后续 zfill 得到 00/01
+    if re.fullmatch(r"\d{1,4}", text):
+        return str(int(text))
+    return text
+
+
+def format_sxxexx(season: str, episode: str) -> str:
+    """生成 S00E01 形式；季或集缺失时返回空串。0 为合法季/集。"""
+    season = normalize_se_number(season)
+    episode = normalize_se_number(episode)
+    if season == "" or episode == "":
+        return ""
+    return f"S{season.zfill(2)}E{episode.zfill(2)}"
 
 
 def _generate_path(template_key: str, title: str, year: str, tmdb_id: str,
@@ -113,6 +147,11 @@ def _generate_path(template_key: str, title: str, year: str, tmdb_id: str,
         default_template = DEFAULT_TV_TEMPLATE
     template = config_service.get(template_key) or default_template
 
+    # 0 是特别篇合法季号，必须先规范化，禁止 if season 判空
+    season = normalize_se_number(season)
+    episode = normalize_se_number(episode)
+    season_year = str(season_year or "").strip()
+
     variables = {
         "title": title,
         "year": year,
@@ -126,9 +165,11 @@ def _generate_path(template_key: str, title: str, year: str, tmdb_id: str,
         "fileExt": tech_info.get("fileExt", ""),
         "seasonYear": season_year,
         "season": season,
-        "seasonPadded": season.zfill(2) if season else "",
+        # "0" → "00"；空串才表示无季
+        "seasonPadded": season.zfill(2) if season != "" else "",
         "episode": episode,
-        "SXXEXX": f"S{season.zfill(2)}E{episode.zfill(2)}" if season and episode else "",
+        "episodePadded": episode.zfill(2) if episode != "" else "",
+        "SXXEXX": format_sxxexx(season, episode),
     }
 
     rendered = render_template(template, variables)

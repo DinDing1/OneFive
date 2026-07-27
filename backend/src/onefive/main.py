@@ -47,6 +47,7 @@ from .api.direct_link import router as direct_link_router
 from .api.share import router as share_router
 from .api.strm import router as strm_router
 from .api.share_wash import router as share_wash_router
+from .api.offline import router as offline_router
 from .db.database import close_db
 
 # 初始化日志
@@ -157,6 +158,7 @@ app.include_router(direct_link_router)
 app.include_router(share_router)
 app.include_router(strm_router)
 app.include_router(share_wash_router)
+app.include_router(offline_router)
 
 # ==================== 前端静态文件 ====================
 # 飞牛网关通过 gatewayPrefix="/app/onefive" 转发请求，
@@ -265,3 +267,4 @@ def start_server():
 
 if __name__ == "__main__":
     start_server()
+

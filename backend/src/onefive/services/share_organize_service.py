@@ -19,7 +19,7 @@ from .file_info_service import (
 )
 from .classify_service import classify_media
 from .tmdb_service import get_tmdb_service
-from .rename_service import generate_movie_path, generate_tv_path
+from .rename_service import generate_movie_path, generate_tv_path, normalize_se_number
 from ..logger import get_logger
 
 logger = get_logger(__name__)
@@ -704,8 +704,11 @@ class ShareOrganizeService:
         """
         title = key_info.get("title", "")
         year = key_info.get("year", "")
-        season = key_info.get("season", 0) or 0
-        episode = key_info.get("episode", "")
+        # 保留原始季/集（含 0）；缺失为 None，禁止 or 0 把“无季”变成特别篇
+        raw_season = key_info.get("season")
+        raw_episode = key_info.get("episode")
+        season = raw_season if raw_season is not None else None
+        episode = raw_episode if raw_episode is not None else None
         tmdb_id = key_info.get("tmdbId", 0)
 
         media_type = ""
@@ -755,15 +758,18 @@ class ShareOrganizeService:
         # tech_info 允许为空（目录名识别场景），只要有 media_type + title 就生成路径
         if media_type and title:
             season_year = ""
-            if media_type == "tv" and season and tmdb_id:
+            season_str = normalize_se_number(season)
+            episode_str = normalize_se_number(episode)
+            # season=0 为特别篇，必须用 != "" 判断，不能用 if season
+            if media_type == "tv" and season_str != "" and tmdb_id:
                 # 缓存 get_tv_season 结果，避免同一季每集都查询 TMDB API
-                season_cache_key = (int(tmdb_id), int(season))
+                season_cache_key = (int(tmdb_id), int(season_str))
                 if season_year_cache and season_cache_key in season_year_cache:
                     season_year = season_year_cache[season_cache_key]
                 else:
                     try:
                         tmdb_service = get_tmdb_service()
-                        season_info = tmdb_service.get_tv_season(int(tmdb_id), int(season))
+                        season_info = tmdb_service.get_tv_season(int(tmdb_id), int(season_str))
                         if season_info:
                             air_date = season_info.get("air_date", "")
                             if air_date:
@@ -778,9 +784,12 @@ class ShareOrganizeService:
             if media_type == "movie":
                 path_info = generate_movie_path(title, year, str(tmdb_id), tech)
             else:
-                path_info = generate_tv_path(title, year, str(tmdb_id), tech,
-                                            season_year=season_year, season=str(season) if season else "",
-                                            episode=str(episode) if episode else "")
+                path_info = generate_tv_path(
+                    title, year, str(tmdb_id), tech,
+                    season_year=season_year,
+                    season=season_str,
+                    episode=episode_str,
+                )
             organized_dir = path_info.get("dir", "")
             organized_name = path_info.get("filename", "")
 
