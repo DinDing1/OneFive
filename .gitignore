@@ -97,3 +97,15 @@ htmlcov/
 debug-*.md
 trae-debug-log-*.ndjson
 .dbg/
+
+# 本地测试与临时产物（不上传）
+backend/tests/
+strm-test/
+tools_test*.py
+tmp_*.txt
+tmp_*.py
+design/
+
+# 本地 STRM 输出目录（不上传）
+云盘STRM/
+分享STRM/
