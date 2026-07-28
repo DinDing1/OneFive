@@ -263,7 +263,8 @@ class ShareWashService:
             "groups": groups,
         }
 
-    def delete_sources(self, source_ids: Sequence[int]) -> Dict[str, Any]:
+    def delete_sources(self, source_ids: Sequence[int], progress=None) -> Dict[str, Any]:
+        """删除分享源（含 STRM）。progress 可选，用于 SSE。"""
         ids = sorted({int(x) for x in source_ids if int(x) > 0})
         if not ids:
             return {
@@ -278,7 +279,7 @@ class ShareWashService:
                 "strm_skip_reason": "",
             }
         share_service = get_share_service()
-        result = share_service.delete_shares_batch(ids)
+        result = share_service.delete_shares_batch(ids, progress=progress)
         logger.info(
             f"[分享洗版] 删除分享链接 total={result.get('total')} "
             f"success={result.get('success')} failed={result.get('failed')} "

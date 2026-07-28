@@ -1,4 +1,5 @@
-﻿import api, { type ApiResult } from './index'
+import api, { type ApiResult } from './index'
+import { openEventSource } from './sse'
 
 export interface RecognizeRequest {
   file_id: string
@@ -93,8 +94,18 @@ export const organizeApi = {
     return api.post('/organize/settings/reset-rules')
   },
 
-  /** 执行整理 */
+  /** @deprecated 优先使用 executeStream，保留同步接口作兼容 */
   execute(req: ExecuteRequest): Promise<ApiResult<any>> {
     return api.post('/organize/execute', req)
+  },
+
+  /** 创建云盘整理任务（SSE 前置） */
+  createExecuteJob(req: ExecuteRequest): Promise<ApiResult<{ job_id: string }>> {
+    return api.post('/organize/execute-job', req)
+  },
+
+  /** 流式执行云盘整理（SSE） */
+  executeStream(jobId: string): EventSource {
+    return openEventSource(`/organize/execute-stream?job_id=${encodeURIComponent(jobId)}`)
   },
 }

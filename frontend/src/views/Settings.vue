@@ -532,6 +532,9 @@
           </div>
         </div>
 
+        <p v-if="strmGenerating && strmProgressMessage" class="strm-hint">{{ strmProgressMessage }}</p>
+        <p v-if="strmCloudGenerating && strmCloudProgressMessage" class="strm-hint">{{ strmCloudProgressMessage }}</p>
+
         <div class="card-actions">
           <button class="btn-ghost-sm" @click.stop="loadStrmAccessiblePaths">刷新授权目录</button>
           <button class="btn-ghost-sm" @click.stop="saveStrmSettings" :disabled="strmSaving">
@@ -636,7 +639,7 @@
 </template>
 
 <script setup lang="ts">
-import { ref, reactive, onMounted } from 'vue'
+import { ref, reactive, onMounted, onUnmounted } from 'vue'
 import { filesApi } from '@/api/files'
 import { organizeApi } from '@/api/organize'
 import { notificationApi } from '@/api/notification'
@@ -732,6 +735,10 @@ const strmGenerating = ref(false)
 const strmCloudGenerating = ref(false)
 const strmResult = ref<StrmGenerateResult | null>(null)
 const strmCloudResult = ref<StrmGenerateResult | null>(null)
+const strmProgressMessage = ref('')
+const strmCloudProgressMessage = ref('')
+let strmEventSource: EventSource | null = null
+let strmCloudEventSource: EventSource | null = null
 
 // STRM 路径选择器弹窗状态（分享/云盘共用）
 const showStrmPathPicker = ref(false)
@@ -1293,27 +1300,93 @@ async function generateStrm(kind: 'share' | 'cloud') {
   }
 }
 
-// 执行 STRM 生成（isShare=true 分享，false 云盘）
-async function doGenerateStrm(isShare: boolean) {
-  // 通过引用统一操作两套状态，避免分支重复
-  const generating = isShare ? strmGenerating : strmCloudGenerating
-  const result = isShare ? strmResult : strmCloudResult
-  generating.value = true
-  result.value = null
-  try {
-    const res = isShare ? await strmApi.generate() : await strmApi.generateCloud()
-    if (res.code === 0 && res.data) {
-      result.value = res.data
-      showToast(`生成完成：成功 ${res.data.created}/${res.data.total}`, 'success')
-    } else {
-      showToast(res.message || '生成失败', 'error')
+function closeStrmStream(isShare: boolean) {
+  if (isShare) {
+    if (strmEventSource) {
+      strmEventSource.close()
+      strmEventSource = null
     }
-  } catch (e: any) {
-    handleApiError(e, '生成失败')
-  } finally {
-    generating.value = false
+  } else if (strmCloudEventSource) {
+    strmCloudEventSource.close()
+    strmCloudEventSource = null
   }
 }
+
+// 执行 STRM 生成（isShare=true 分享，false 云盘）
+// 正式环境走 SSE，避免 axios 30s 超时与飞牛网关空闲断连
+function doGenerateStrm(isShare: boolean) {
+  const generating = isShare ? strmGenerating : strmCloudGenerating
+  const result = isShare ? strmResult : strmCloudResult
+  const progressMessage = isShare ? strmProgressMessage : strmCloudProgressMessage
+  const label = isShare ? '分享' : '云盘'
+
+  closeStrmStream(isShare)
+  generating.value = true
+  result.value = null
+  progressMessage.value = `连接${label} STRM 生成服务…`
+
+  const es = isShare ? strmApi.generateStream() : strmApi.generateCloudStream()
+  if (isShare) strmEventSource = es
+  else strmCloudEventSource = es
+
+  es.onmessage = (event) => {
+    let data: any
+    try {
+      data = JSON.parse(event.data)
+    } catch {
+      return
+    }
+    const t = data?.type
+    if (t === 'start') {
+      progressMessage.value = data.message || `开始生成${label} STRM…`
+      return
+    }
+    if (t === 'progress') {
+      if (data.message) progressMessage.value = data.message
+      return
+    }
+    if (t === 'done') {
+      result.value = {
+        total: Number(data.total || 0),
+        created: Number(data.created || 0),
+        skipped: Number(data.skipped || 0),
+        failed: Number(data.failed || 0),
+        errors: Array.isArray(data.errors) ? data.errors : [],
+        truncated: Boolean(data.truncated),
+      }
+      progressMessage.value = ''
+      generating.value = false
+      showToast(data.message || `生成完成：成功 ${data.created}/${data.total}`, 'success')
+      closeStrmStream(isShare)
+      return
+    }
+    if (t === 'error') {
+      progressMessage.value = ''
+      generating.value = false
+      showToast(data.message || `${label} STRM 生成失败`, 'error')
+      closeStrmStream(isShare)
+    }
+  }
+
+  es.onerror = () => {
+    // 正常结束关闭连接时浏览器也可能触发 error，已完成则忽略
+    if (!generating.value) {
+      closeStrmStream(isShare)
+      return
+    }
+    if (es.readyState === EventSource.CLOSED) {
+      progressMessage.value = ''
+      generating.value = false
+      showToast(`${label} STRM 连接中断（网关或网络），请重试`, 'error')
+      closeStrmStream(isShare)
+    }
+  }
+}
+
+onUnmounted(() => {
+  closeStrmStream(true)
+  closeStrmStream(false)
+})
 </script>
 
 <style scoped>

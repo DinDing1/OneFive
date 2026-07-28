@@ -1,4 +1,5 @@
 import api, { type ApiResult } from './index'
+import { openEventSource } from './sse'
 
 /** STRM 配置 */
 export interface StrmSettings {
@@ -15,6 +16,15 @@ export interface StrmGenerateResult {
   skipped: number
   failed: number
   errors: Array<{ file_id: string; name: string; error: string }>
+  truncated?: boolean
+}
+
+/**
+ * 分享/云盘 STRM 生成：正式环境走飞牛统一网关，长任务用 SSE（与洗版/检测一致），
+ * 不依赖 axios 默认 30s 超时。
+ */
+function openStrmGenerateStream(path: string): EventSource {
+  return openEventSource(path)
 }
 
 export const strmApi = {
@@ -38,13 +48,23 @@ export const strmApi = {
     return api.get('/strm/accessible-paths/children', { params: { path } })
   },
 
-  /** 生成分享 STRM 文件 */
+  /** @deprecated 优先使用 generateStream，保留同步接口作兼容 */
   generate(): Promise<ApiResult<StrmGenerateResult>> {
     return api.post('/strm/generate')
   },
 
-  /** 生成云盘 STRM 文件 */
+  /** @deprecated 优先使用 generateCloudStream，保留同步接口作兼容 */
   generateCloud(): Promise<ApiResult<StrmGenerateResult>> {
     return api.post('/strm/generate-cloud')
+  },
+
+  /** 流式生成分享 STRM（SSE） */
+  generateStream(): EventSource {
+    return openStrmGenerateStream('/strm/generate-stream')
+  },
+
+  /** 流式生成云盘 STRM（SSE） */
+  generateCloudStream(): EventSource {
+    return openStrmGenerateStream('/strm/generate-cloud-stream')
   }
 }

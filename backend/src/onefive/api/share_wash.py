@@ -3,7 +3,9 @@
 
 - POST /api/share-wash/analyze         分析已整理分享中的多版本（同步，兼容）
 - GET  /api/share-wash/analyze-stream  SSE 流式分析（正式环境/网关推荐）
-- POST /api/share-wash/delete          删除劣质分享链接（整源）
+- POST /api/share-wash/delete          删除劣质分享链接（同步，兼容）
+- POST /api/share-wash/delete-job      创建删除任务（SSE 前置）
+- GET  /api/share-wash/delete-stream   SSE 流式删除（正式环境推荐）
 """
 import asyncio
 import json
@@ -18,6 +20,7 @@ from pydantic import BaseModel, Field
 from ..models.schemas import ApiResponse
 from ..services.share_wash_service import get_share_wash_service
 from ..logger import get_logger
+from ..sseutil import job_store, streaming_response_from_thread, SSE_HEADERS
 
 logger = get_logger(__name__)
 
@@ -139,7 +142,10 @@ async def analyze_share_wash_stream(
 
 @router.post("/delete", summary="删除劣质分享链接")
 async def delete_wash_sources(req: DeleteWashRequest):
-    """按 source_id 批量删除整条分享（本地库记录 + 对应分享 STRM）。"""
+    """按 source_id 批量删除整条分享（本地库记录 + 对应分享 STRM）。
+
+    正式环境请改用：POST /delete-job → GET /delete-stream?job_id=...
+    """
     if not req.source_ids:
         return ApiResponse(code=1, message="未指定要删除的分享", data=None)
     service = get_share_wash_service()
@@ -156,4 +162,46 @@ async def delete_wash_sources(req: DeleteWashRequest):
         code=0,
         message=msg,
         data=result,
+    )
+
+
+@router.post("/delete-job", summary="创建洗版删除任务（SSE 前置）")
+async def create_delete_wash_job(req: DeleteWashRequest):
+    """创建删除任务，返回 job_id 供 delete-stream 使用。"""
+    ids = [int(x) for x in (req.source_ids or []) if int(x) > 0]
+    if not ids:
+        return ApiResponse(code=1, message="未指定要删除的分享", data=None)
+    job_id = job_store.create({"source_ids": ids})
+    return ApiResponse(code=0, message="ok", data={"job_id": job_id, "total": len(ids)})
+
+
+@router.get("/delete-stream", summary="流式删除劣质分享（SSE）")
+async def delete_wash_stream(job_id: str = Query(..., description="delete-job 返回的任务 ID")):
+    """SSE 流式删除：绕过 axios 超时，心跳保持飞牛网关连接。"""
+    payload = job_store.pop(job_id)
+    if not payload:
+        async def err_gen():
+            yield 'data: {"type":"error","message":"删除任务不存在或已过期"}\n\n'
+        return StreamingResponse(err_gen(), media_type="text/event-stream", headers=SSE_HEADERS)
+
+    source_ids = list(payload.get("source_ids") or [])
+    logger.info(f"[分享洗版 SSE] 开始删除 count={len(source_ids)}")
+
+    def worker(on_progress):
+        service = get_share_wash_service()
+        result = service.delete_sources(source_ids, progress=on_progress)
+        deleted = int(result.get("success") or 0)
+        total = int(result.get("total") or 0)
+        strm_deleted = int(result.get("strm_deleted") or 0)
+        msg = f"已删除 {deleted}/{total} 条分享链接"
+        if strm_deleted:
+            msg += f"，并清理 {strm_deleted} 个分享 STRM"
+        elif result.get("strm_skip_reason") == "no_output_path":
+            msg += "（未配置分享 STRM 路径，跳过本地文件）"
+        on_progress({"type": "done", "message": msg, **result})
+
+    return streaming_response_from_thread(
+        worker,
+        start_event={"type": "start", "total": len(source_ids), "message": "开始删除劣质分享…"},
+        thread_name="share-wash-delete",
     )

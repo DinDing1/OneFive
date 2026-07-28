@@ -2,14 +2,15 @@
 壹伍（OneFive）启动入口 - 专门用于 Nuitka 打包
 
 为什么要这个文件：
-- Nuitka --onefile 模式下，入口文件被当作顶层 __main__ 执行
+- Nuitka 编译（standalone / 历史 onefile）下，入口文件被当作顶层 __main__ 执行
 - 此时 __package__ 为空，onefive/main.py 中的相对导入（from .xxx import）会失败
 - 通过这个独立入口脚本，从外部用绝对导入调用 onefive.main
 - Python 导入 onefive.main 时会正确设置 __package__ = "onefive"
 - main.py 中的所有相对导入就能正常工作
 
 执行流程：
-1. Nuitka 编译 run.py 为 onefive-server 二进制
+1. Nuitka 以 standalone 编译 run.py，产出 onefive-server 及同目录依赖
+   （飞牛包不再使用 onefile，以降低正式环境常驻内存）
 2. 二进制启动时执行 run.py 的 __main__ 块
 3. run.py 修复 HOME 环境变量（飞牛环境下 onefive 用户可能没有主目录）
 4. run.py 调用 onefive.main.start_server()

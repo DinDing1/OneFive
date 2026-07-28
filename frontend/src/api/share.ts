@@ -1,4 +1,5 @@
 import api, { type ApiResult } from './index'
+import { openEventSource } from './sse'
 import { type RecognizeResult } from './organize'
 
 /** 分享来源 */
@@ -67,8 +68,24 @@ export const shareApi = {
   },
 
   /** 手动纠错整理 */
+  /** @deprecated 优先使用 createManualOrganizeJob + manualOrganizeStream */
   manualOrganizeFile(sourceId: number, fileId: string, tmdbId: number, mediaType: 'movie' | 'tv'): Promise<ApiResult<any>> {
     return api.post('/share/organize/manual', { source_id: sourceId, file_id: fileId, tmdb_id: tmdbId, media_type: mediaType })
+  },
+
+  /** 创建手动纠错整理任务（SSE 前置） */
+  createManualOrganizeJob(sourceId: number, fileId: string, tmdbId: number, mediaType: 'movie' | 'tv'): Promise<ApiResult<{ job_id: string }>> {
+    return api.post('/share/organize/manual-job', {
+      source_id: sourceId,
+      file_id: fileId,
+      tmdb_id: tmdbId,
+      media_type: mediaType,
+    })
+  },
+
+  /** 流式手动纠错整理（SSE） */
+  manualOrganizeStream(jobId: string): EventSource {
+    return openEventSource(`/share/organize/manual-stream?job_id=${encodeURIComponent(jobId)}`)
   },
 
   /** 添加分享链接 */
@@ -99,8 +116,7 @@ export const shareApi = {
 
   /** 批量检测分享链接有效性（SSE 流式） */
   checkAllLinksStream(): EventSource {
-    const baseURL = api.defaults.baseURL || '/app/onefive/api'
-    return new EventSource(`${baseURL}/share/check-stream`)
+    return openEventSource('/share/check-stream')
   },
 
   /** 删除分享 */
@@ -109,8 +125,23 @@ export const shareApi = {
   },
 
   /** 批量删除分享 */
-  deleteSharesBatch(sourceIds: number[]): Promise<ApiResult<any>> {
+  /** @deprecated 优先使用 deleteSharesBatchStream，保留同步接口作兼容 */
+  deleteSharesBatch(sourceIds: number[]): Promise<ApiResult<{
+    total: number
+    success: number
+    failed: number
+  }>> {
     return api.post('/share/delete-batch', { source_ids: sourceIds })
+  },
+
+  /** 创建批量删除任务（SSE 前置） */
+  createDeleteBatchJob(sourceIds: number[]): Promise<ApiResult<{ job_id: string; total: number }>> {
+    return api.post('/share/delete-batch-job', { source_ids: sourceIds })
+  },
+
+  /** 流式批量删除（SSE） */
+  deleteBatchStream(jobId: string): EventSource {
+    return openEventSource(`/share/delete-batch-stream?job_id=${encodeURIComponent(jobId)}`)
   },
 
   /** 获取文件属性（分享信息 + 文件信息 + 可选分类） */
@@ -228,7 +259,7 @@ export const shareApi = {
     })
   },
 
-  /** 自底向上重算目录已整理标记（修复脏数据） */
+  /** @deprecated 优先使用 recomputeOrganizedStream，保留同步接口作兼容 */
   recomputeOrganized(sourceId?: number): Promise<ApiResult<{
     sources: number
     checked_dirs: number
@@ -237,6 +268,12 @@ export const shareApi = {
     return api.post('/share/recompute-organized', null, {
       params: sourceId != null ? { source_id: sourceId } : {},
     })
+  },
+
+  /** 流式重算已整理标记（SSE，大库推荐） */
+  recomputeOrganizedStream(sourceId?: number): EventSource {
+    const q = sourceId != null ? `?source_id=${encodeURIComponent(String(sourceId))}` : ''
+    return openEventSource(`/share/recompute-organized-stream${q}`)
   },
 
   /** 批量整理 */
@@ -254,10 +291,9 @@ export const shareApi = {
    */
   organizeStream(sourceId: number, fileIds: string[]): EventSource {
     const fileIdsParam = fileIds.join(',')
-    // 从 axios 实例读取 baseURL，避免硬编码导致与 index.ts 配置不一致
-    const baseURL = api.defaults.baseURL || '/app/onefive/api'
-    const url = `${baseURL}/share/organize-stream?source_id=${sourceId}&file_ids=${encodeURIComponent(fileIdsParam)}`
-    return new EventSource(url)
+    return openEventSource(
+      `/share/organize-stream?source_id=${sourceId}&file_ids=${encodeURIComponent(fileIdsParam)}`
+    )
   },
 
 }

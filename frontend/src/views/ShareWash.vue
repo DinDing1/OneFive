@@ -527,18 +527,48 @@ async function doDelete() {
   if (!ids.length) return
   deleting.value = true
   try {
-    const res = await shareWashApi.deleteSources(ids)
-    if (res.code !== 0) {
-      showToast(res.message || '删除失败', 'error')
+    // 正式环境删除+STRM 清理可能很慢，走 SSE
+    const jobRes = await shareWashApi.createDeleteJob(ids)
+    if (jobRes.code !== 0 || !jobRes.data?.job_id) {
+      showToast(jobRes.message || '创建删除任务失败', 'error')
+      deleting.value = false
       return
     }
-    showToast(res.message || '删除完成', 'success')
-    showConfirm.value = false
-    runAnalyze()
+    const es = shareWashApi.deleteStream(jobRes.data.job_id)
+    let finished = false
+    const finish = () => {
+      if (finished) return
+      finished = true
+      deleting.value = false
+      try { es.close() } catch { /* ignore */ }
+    }
+    es.onmessage = (event) => {
+      let data: any
+      try { data = JSON.parse(event.data) } catch { return }
+      const typ = data?.type
+      if (typ === 'progress') return
+      if (typ === 'done') {
+        showToast(data.message || '删除完成', 'success')
+        showConfirm.value = false
+        finish()
+        runAnalyze()
+        return
+      }
+      if (typ === 'error') {
+        showToast(data.message || '删除失败', 'error')
+        finish()
+      }
+    }
+    es.onerror = () => {
+      if (finished) { finish(); return }
+      if (es.readyState === EventSource.CLOSED) {
+        showToast('删除连接中断（网关或网络），请重试', 'error')
+        finish()
+      }
+    }
   } catch (e: any) {
-    showToast(e?.message || '删除失败', 'error')
-  } finally {
     deleting.value = false
+    showToast(e?.message || '删除失败', 'error')
   }
 }
 </script>

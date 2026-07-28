@@ -73,6 +73,7 @@ from ..services.config_service import get_config_service
 from time import time as _time
 
 from ..logger import get_logger
+from .direct_link_cache_service import get_direct_link_cache_service
 
 logger = get_logger(__name__)
 
@@ -174,8 +175,6 @@ class DirectLinkDbCacheMiddleware:
             await self.app(scope, receive, send)
             return
 
-        from .direct_link_cache_service import get_direct_link_cache_service
-
         cache = get_direct_link_cache_service()
         req = self._parse_request(scope)
         base_params = {
@@ -193,7 +192,7 @@ class DirectLinkDbCacheMiddleware:
                 **base_params,
             )
             if cached_url:
-                logger.info(
+                logger.debug(
                     f"[直链缓存 HIT] path={req['path']} "
                     f"pickcode={req['pickcode'] or '-'} id={req['file_id'] or '-'} "
                     f"share={req['share_code'] or '-'}"
@@ -230,7 +229,7 @@ class DirectLinkDbCacheMiddleware:
                     **base_params,
                 )
                 if ok:
-                    logger.info(
+                    logger.debug(
                         f"[直链缓存 STORE] path={req['path']} "
                         f"pickcode={req['pickcode'] or '-'} id={req['file_id'] or '-'} "
                         f"share={req['share_code'] or '-'}"
@@ -292,16 +291,19 @@ class PathStripMiddleware:
                     raise
                 else:
                     elapsed_ms = (_time() - start_ts) * 1000
-                    # 按状态码细分日志文案：302 是正常重定向，404 是未找到，其它视为异常
-                    if status_code == 302:
-                        hit = "重定向"
+                    # 302 is normal Emby path -> DEBUG to avoid log storm
+                    if status_code in (301, 302, 303, 307, 308):
+                        logger.debug(
+                            f"[直链] {original_path} → {status_code} ({elapsed_ms:.0f}ms) redirect"
+                        )
                     elif status_code == 404:
-                        hit = "未找到"
+                        logger.info(
+                            f"[直链] {original_path} → 404 ({elapsed_ms:.0f}ms) not found"
+                        )
                     else:
-                        hit = f"异常:{status_code}"
-                    logger.info(
-                        f"[直链] {original_path} → {status_code} ({elapsed_ms:.0f}ms) {hit}"
-                    )
+                        logger.warning(
+                            f"[直链] {original_path} → {status_code} ({elapsed_ms:.0f}ms) error"
+                        )
             else:
                 await self.app(scope, receive, send)
         else:
@@ -312,6 +314,8 @@ CONFIG_ENABLED = "direct_link_enabled"
 CONFIG_PORT = "direct_link_port"
 CONFIG_ALLOW_LAN = "direct_link_allow_lan"
 DEFAULT_PORT = 11581
+# p115nano302 L1 size (library default 65536 inflates RSS; L0+L2 cover persistence)
+NANO_CACHE_SIZE = 2048
 
 
 class DirectLinkService:
@@ -361,13 +365,17 @@ class DirectLinkService:
         allow_lan = self.config_service.get(CONFIG_ALLOW_LAN) == "1"
         # 绑定地址：允许局域网访问时绑定 0.0.0.0，否则仅本机访问
         host = "0.0.0.0" if allow_lan else "127.0.0.1"
-        logger.info(f"启动直链服务: host={host}, port={port}, allow_lan={allow_lan}")
+        logger.info(f"启动直链服务: host={host}, port={port}, allow_lan={allow_lan}, nano_cache={NANO_CACHE_SIZE}")
 
         try:
             import p115nano302
 
             # 创建 ASGI 应用（启用内存 URL 缓存 L1）
-            nano_app = p115nano302.make_application(cookies, cache_url=True)
+            nano_app = p115nano302.make_application(
+                cookies,
+                cache_url=True,
+                cache_size=NANO_CACHE_SIZE,
+            )
 
             # 启动时清理过期 DB 缓存
             try:
@@ -397,6 +405,9 @@ class DirectLinkService:
                 host=host,
                 port=port,
                 log_level="warning",
+                access_log=False,
+                timeout_keep_alive=5,
+                limit_concurrency=256,
             )
             server = uvicorn.Server(config)
 

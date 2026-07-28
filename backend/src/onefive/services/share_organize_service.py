@@ -484,7 +484,11 @@ class ShareOrganizeService:
         # 无论置 1 还是置 0，都继续向上，保证祖先目录与子树一致
         self._sync_parent_organized_state(source_id, parent_id, share_service)
 
-    def recompute_directory_organized(self, source_id: Optional[int] = None) -> Dict[str, Any]:
+    def recompute_directory_organized(
+        self,
+        source_id: Optional[int] = None,
+        progress=None,
+    ) -> Dict[str, Any]:
         """自底向上重算目录 organized 标记（修复历史脏数据）。
 
         规则与整理时一致：目录下所有子目录 + 视频文件都 organized=1 时，
@@ -492,21 +496,40 @@ class ShareOrganizeService:
 
         Args:
             source_id: 指定分享源；None 表示全库所有源。
+            progress: 可选回调 progress(event_dict)，用于 SSE 进度推送。
 
         Returns:
             统计信息：checked_dirs / changed_dirs / sources
         """
+        def emit(stage: str, percent: int, message: str, **extra):
+            if not progress:
+                return
+            try:
+                payload = {
+                    "type": "progress",
+                    "stage": stage,
+                    "percent": max(0, min(100, int(percent))),
+                    "message": message,
+                }
+                payload.update(extra)
+                progress(payload)
+            except Exception:
+                pass
+
         share_service = get_share_service()
+        emit("prepare", 1, "准备重算已整理标记…")
         if source_id is not None:
             source_ids = [int(source_id)]
         else:
             rows = share_service.db.fetchall("SELECT DISTINCT source_id FROM share_file")
             source_ids = [int(r["source_id"]) for r in rows]
 
+        total_src = len(source_ids)
+        emit("scan", 5, f"共 {total_src} 个分享源待重算…", sources=total_src)
         checked = 0
         changed = 0
 
-        for sid in source_ids:
+        for sidx, sid in enumerate(source_ids, 1):
             # 深度优先：先处理深层目录
             dirs = share_service.db.fetchall(
                 """
@@ -561,15 +584,34 @@ class ShareOrganizeService:
             logger.info(
                 f"[重算 organized] source_id={sid}, dirs_checked={len(dirs)}"
             )
+            pct = 5 + int(sidx / max(total_src, 1) * 90)
+            emit(
+                "recompute",
+                pct,
+                f"重算分享源 {sidx}/{total_src}（已检查目录 {checked}）",
+                sources=total_src,
+                current_source=sidx,
+                source_id=sid,
+                checked_dirs=checked,
+                changed_dirs=changed,
+            )
 
         logger.info(
             f"[重算 organized 完成] sources={len(source_ids)}, checked_dirs={checked}, changed_dirs={changed}"
         )
-        return {
+        result = {
             "sources": len(source_ids),
             "checked_dirs": checked,
             "changed_dirs": changed,
         }
+        emit(
+            "finish",
+            99,
+            f"重算完成：检查 {checked} 个目录，变更 {changed} 个",
+            **result,
+        )
+        return result
+
 
     def _organize_batch_files(self, source_id: int, files: list, share_service,
                               tmdb_cache: Dict, forced_tmdb_id: int = 0,

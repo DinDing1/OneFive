@@ -1,4 +1,5 @@
 import api, { type ApiResult } from './index'
+import { openEventSource } from './sse'
 
 export interface WashSourceItem {
   source_id: number
@@ -59,9 +60,7 @@ export interface WashAnalyzeResult {
  * 不依赖 axios 默认 30s 超时。
  */
 export function analyzeShareWashStream(mediaType: 'all' | 'movie' | 'tv' = 'all'): EventSource {
-  const baseURL = api.defaults.baseURL || '/app/onefive/api'
-  const url = `${baseURL}/share-wash/analyze-stream?media_type=${encodeURIComponent(mediaType)}`
-  return new EventSource(url)
+  return openEventSource(`/share-wash/analyze-stream?media_type=${encodeURIComponent(mediaType)}`)
 }
 
 export const shareWashApi = {
@@ -72,7 +71,18 @@ export const shareWashApi = {
   analyzeStream(mediaType: 'all' | 'movie' | 'tv' = 'all'): EventSource {
     return analyzeShareWashStream(mediaType)
   },
+  /** @deprecated 优先使用 deleteStream，保留同步接口作兼容 */
   deleteSources(sourceIds: number[]): Promise<ApiResult<{ total: number; success: number; failed: number; source_ids: number[] }>> {
-    return api.post('/share-wash/delete', { source_ids: sourceIds }, { timeout: 120000 })
+    return api.post('/share-wash/delete', { source_ids: sourceIds })
+  },
+
+  /** 创建洗版删除任务（SSE 前置） */
+  createDeleteJob(sourceIds: number[]): Promise<ApiResult<{ job_id: string; total: number }>> {
+    return api.post('/share-wash/delete-job', { source_ids: sourceIds })
+  },
+
+  /** 流式删除劣质分享（SSE） */
+  deleteStream(jobId: string): EventSource {
+    return openEventSource(`/share-wash/delete-stream?job_id=${encodeURIComponent(jobId)}`)
   }
 }

@@ -4,7 +4,8 @@
 职责：
 - 将 115 下载直链持久化到 SQLite，跨重启复用
 - 在 URL 仍有效时直接命中缓存，避免重复请求 115 触发风控
-- 与 p115nano302 内存缓存（L1）互补：本服务作为 L2 持久层
+- 与 p115nano302 内存缓存（L1）互补：本服务提供 L0 热缓存 + L2 持久层
+- L0 有上限，专供 Emby 播放期高频 302，避免反复抢 SQLite 全局锁抬高 RSS
 
 缓存键策略（与 STRM / p115nano302 请求参数对齐）：
 - pickcode 查询:  pc:{pickcode}
@@ -24,8 +25,10 @@ UA 敏感链接：
 from __future__ import annotations
 
 import hashlib
+import threading
 import time
-from typing import Optional, Dict, Any, List
+from collections import OrderedDict
+from typing import Optional, Dict, Any, List, Tuple
 from urllib.parse import parse_qsl, urlsplit
 
 from ..db.database import get_db
@@ -39,14 +42,26 @@ DEFAULT_TTL_SECONDS = 2 * 60 * 60
 EXPIRE_BUFFER_SECONDS = 5 * 60
 # 惰性清理：每 N 次写入触发一次过期清理
 _CLEANUP_EVERY_N_WRITES = 50
+# L0 进程内热缓存上限（条）：覆盖 Emby 并发播放热路径，避免每次 302 打 SQLite
+# 单条约几百字节 URL，1024 条峰值通常 < 1MB
+_L0_MAXSIZE = 1024
 
 
 class DirectLinkCacheService:
-    """直链 URL 数据库缓存"""
+    """直链 URL 数据库缓存（L2）+ 进程内热缓存（L0）
+
+    层级：
+    - L0：进程内 OrderedDict LRU，服务 Emby 高频 302 命中
+    - L2：SQLite 持久化，跨重启、降风控
+    - L1：由 p115nano302 自身维护（有界 cache_size）
+    """
 
     def __init__(self):
         self.db = get_db()
         self._write_count = 0
+        # key -> (url, expires_at)
+        self._l0: OrderedDict[str, Tuple[str, float]] = OrderedDict()
+        self._l0_lock = threading.Lock()
 
     def _write_with_retry(self, sql: str, params: tuple = (), *, action: str = "write") -> int:
         """原子写入；遇到 readonly/locked 时重连重试一次。
@@ -160,12 +175,62 @@ class DirectLinkCacheService:
             pass
         return now + DEFAULT_TTL_SECONDS - EXPIRE_BUFFER_SECONDS
 
+    # ==================== L0 热缓存 ====================
+
+    def _l0_get(self, cache_key: str) -> Optional[str]:
+        """读取 L0；过期则剔除。"""
+        if not cache_key:
+            return None
+        now = time.time()
+        with self._l0_lock:
+            item = self._l0.get(cache_key)
+            if item is None:
+                return None
+            url, expires_at = item
+            if expires_at <= now:
+                self._l0.pop(cache_key, None)
+                return None
+            self._l0.move_to_end(cache_key)
+            return url
+
+    def _l0_set(self, cache_key: str, url: str, expires_at: float) -> None:
+        """写入 L0，超出上限淘汰最久未用项。"""
+        if not cache_key or not url or expires_at <= time.time():
+            return
+        with self._l0_lock:
+            self._l0[cache_key] = (url, float(expires_at))
+            self._l0.move_to_end(cache_key)
+            while len(self._l0) > _L0_MAXSIZE:
+                self._l0.popitem(last=False)
+
+    def _l0_invalidate(self, cache_key: str) -> None:
+        if not cache_key:
+            return
+        with self._l0_lock:
+            self._l0.pop(cache_key, None)
+
+    def _l0_drop_prefix(self, base_key: str) -> None:
+        """按 base_key 清除 L0（含 UA 变体）。"""
+        if not base_key:
+            return
+        prefix = f"{base_key}|ua:"
+        with self._l0_lock:
+            dead = [k for k in self._l0 if k == base_key or k.startswith(prefix)]
+            for k in dead:
+                self._l0.pop(k, None)
+
     # ==================== CRUD ====================
 
     def get_url(self, cache_key: str) -> Optional[str]:
-        """按精确键查询未过期缓存 URL"""
+        """按精确键查询未过期缓存 URL（先 L0，再 SQLite）"""
         if not cache_key:
             return None
+
+        # L0 热路径：Emby 播放/探测高频命中，避免全局 DB 锁
+        hot = self._l0_get(cache_key)
+        if hot:
+            return hot
+
         now = time.time()
         row = self.db.fetchone(
             "SELECT url, expires_at FROM direct_link_cache WHERE cache_key = ?",
@@ -176,6 +241,7 @@ class DirectLinkCacheService:
         expires_at = float(row["expires_at"] or 0)
         if expires_at <= now:
             # 过期则删除，避免表膨胀
+            self._l0_invalidate(cache_key)
             try:
                 self._write_with_retry(
                     "DELETE FROM direct_link_cache WHERE cache_key = ?",
@@ -185,7 +251,11 @@ class DirectLinkCacheService:
             except Exception as e:
                 logger.debug(f"删除过期直链缓存失败: {e}")
             return None
-        return row["url"]
+
+        url = row["url"]
+        # 回填 L0，后续同键直出
+        self._l0_set(cache_key, url, expires_at)
+        return url
 
     def get_valid_url(
         self,
@@ -274,6 +344,8 @@ class DirectLinkCacheService:
                 ),
                 action="写入",
             )
+            # 同步 L0，播放期立刻可热命中
+            self._l0_set(cache_key, url, float(expires_at))
             self._write_count += 1
             if self._write_count % _CLEANUP_EVERY_N_WRITES == 0:
                 self.cleanup_expired()
@@ -304,6 +376,7 @@ class DirectLinkCacheService:
         )
         if not base_key:
             return 0
+        self._l0_drop_prefix(base_key)
         try:
             return max(
                 0,
@@ -324,11 +397,18 @@ class DirectLinkCacheService:
             删除行数
         """
         try:
+            now = time.time()
+            # 顺带收缩 L0 过期项，避免热表挂死链
+            with self._l0_lock:
+                dead = [k for k, (_, exp) in self._l0.items() if exp <= now]
+                for k in dead:
+                    self._l0.pop(k, None)
+
             count = max(
                 0,
                 self._write_with_retry(
                     "DELETE FROM direct_link_cache WHERE expires_at <= ?",
-                    (time.time(),),
+                    (now,),
                     action="清理过期",
                 ),
             )
@@ -347,9 +427,13 @@ class DirectLinkCacheService:
             "SELECT COUNT(*) AS c FROM direct_link_cache WHERE expires_at > ?",
             (now,),
         )
+        with self._l0_lock:
+            l0_size = len(self._l0)
         return {
             "total": int(total_row["c"]) if total_row else 0,
             "valid": int(valid_row["c"]) if valid_row else 0,
+            "l0": l0_size,
+            "l0_max": _L0_MAXSIZE,
         }
 
 

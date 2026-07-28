@@ -448,7 +448,7 @@ class ShareService:
         """
         return self.delete_shares_batch([int(source_id)])
 
-    def delete_shares_batch(self, source_ids: List[int]) -> Dict:
+    def delete_shares_batch(self, source_ids: List[int], progress=None) -> Dict:
         """批量删除分享来源及其所有文件，并清理对应分享 STRM。
 
         顺序：
@@ -459,6 +459,10 @@ class ShareService:
         每条删除独立事务：成功才 commit，失败立即 rollback，
         避免部分删除被统一 commit 留下不一致状态。
 
+        Args:
+            source_ids: 待删除分享源 ID 列表
+            progress: 可选回调 progress(event_dict)，用于 SSE 进度推送
+
         Returns:
             {
               "total": int, "success": int, "failed": int,
@@ -467,17 +471,34 @@ class ShareService:
               "strm_skip_reason": str,
             }
         """
+        def emit(stage: str, percent: int, message: str, **extra):
+            if not progress:
+                return
+            try:
+                payload = {
+                    "type": "progress",
+                    "stage": stage,
+                    "percent": max(0, min(100, int(percent))),
+                    "message": message,
+                }
+                payload.update(extra)
+                progress(payload)
+            except Exception:
+                pass
+
         ids = [int(x) for x in source_ids if int(x) > 0]
         total = len(ids)
+        emit("prepare", 1, f"准备删除 {total} 个分享…", total=total, current=0)
 
         # 延迟导入，避免与 strm_service 形成循环依赖
         from .strm_service import get_strm_service
         strm_service = get_strm_service()
+        emit("plan", 8, "计算待清理的分享 STRM…", total=total)
         strm_plan = strm_service.plan_share_strm_deletion(ids)
 
         success = 0
         succeeded_ids: List[int] = []
-        for sid in ids:
+        for idx, sid in enumerate(ids, 1):
             try:
                 self.db.execute("DELETE FROM share_file WHERE source_id = ?", (sid,))
                 self.db.execute("DELETE FROM share_source WHERE id = ?", (sid,))
@@ -488,13 +509,27 @@ class ShareService:
                 # 异常时回滚当前 sid 的删除，不影响其它 sid
                 self.db.rollback()
 
+            # 删除库记录阶段占 10%~70%
+            pct = 10 + int(idx / max(total, 1) * 60)
+            emit(
+                "delete_db",
+                pct,
+                f"删除分享记录 {idx}/{total}",
+                total=total,
+                current=idx,
+                success=success,
+                failed=idx - success,
+                source_id=sid,
+            )
+
+        emit("strm", 75, "清理本地分享 STRM 文件…", total=total, success=success)
         strm_stats = strm_service.execute_share_strm_deletion(strm_plan, succeeded_ids)
         logger.info(
             f"批量删除分享: total={total} success={success} failed={total - success} "
             f"strm_deleted={strm_stats.get('strm_deleted', 0)} "
             f"strm_skipped={strm_stats.get('strm_skipped', 0)}"
         )
-        return {
+        result = {
             "total": total,
             "success": success,
             "failed": total - success,
@@ -504,6 +539,13 @@ class ShareService:
             "strm_dirs_removed": int(strm_stats.get("strm_dirs_removed") or 0),
             "strm_skip_reason": str(strm_stats.get("strm_skip_reason") or ""),
         }
+        emit(
+            "finish",
+            99,
+            f"删除完成：{result['success']}/{result['total']}",
+            **{k: result[k] for k in ("total", "success", "failed", "strm_deleted", "strm_skipped")},
+        )
+        return result
 
     def update_share_source(self, source_id: int, share_name: str = None,
                             share_code: str = None, receive_code: str = None) -> bool:

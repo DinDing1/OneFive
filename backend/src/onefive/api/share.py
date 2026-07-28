@@ -13,6 +13,13 @@ from ..services.share_service import get_share_service
 from ..services.share_organize_service import get_share_organize_service
 from ..services.classify_service import DEFAULT_STRATEGY, _get_custom_strategy
 from ..logger import get_logger
+from ..sseutil import (
+    SSE_HEADERS,
+    job_store,
+    streaming_response_from_thread,
+    await_with_heartbeat,
+    aiter_with_heartbeat,
+)
 
 logger = get_logger(__name__)
 
@@ -108,30 +115,52 @@ async def check_link_valid(source_id: int):
 
 @router.get("/check-stream", summary="批量检测分享链接有效性（SSE 流式）")
 async def check_all_links_stream():
-    """批量检测所有分享链接有效性，SSE 流式返回每个检测结果
+    """批量检测所有分享链接有效性，SSE 流式返回每个检测结果。
+
+    单次检测若较慢，期间发送注释心跳，避免飞牛网关空闲断连。
 
     SSE 事件格式：
     - {"type":"start","total":N}            开始检测
     - {"type":"progress","current":i,"total":N,"source_id":id,"share_name":"...","valid":true/false,"error":"..."}
     - {"type":"done","valid_count":X,"invalid_count":Y}  检测完成
+    - 注释行 `: heartbeat` 保活
     """
     service = get_share_service()
 
     async def event_stream():
-        # 获取所有分享
-        shares = await asyncio.to_thread(service.get_all_shares_for_check)
-        total = len(shares)
+        # 获取所有分享（等待期间也心跳）
+        shares = None
+        async for kind, payload in await_with_heartbeat(
+            asyncio.to_thread(service.get_all_shares_for_check)
+        ):
+            if kind == "heartbeat":
+                yield payload
+            elif kind == "error":
+                yield f"data: {json.dumps({'type': 'error', 'message': str(payload)}, ensure_ascii=False)}\n\n"
+                return
+            else:
+                shares = payload
 
+        total = len(shares or [])
         yield f"data: {json.dumps({'type': 'start', 'total': total}, ensure_ascii=False)}\n\n"
 
         valid_count = 0
         invalid_count = 0
         skipped_count = 0
 
-        for i, share in enumerate(shares, 1):
+        for i, share in enumerate(shares or [], 1):
             source_id = share["id"]
-            # 逐个检测（同步方法放线程池）
-            result = await asyncio.to_thread(service.check_link_valid, source_id)
+            result = None
+            async for kind, payload in await_with_heartbeat(
+                asyncio.to_thread(service.check_link_valid, source_id)
+            ):
+                if kind == "heartbeat":
+                    yield payload
+                elif kind == "error":
+                    result = {"valid": False, "error": str(payload), "skipped": False}
+                else:
+                    result = payload
+            result = result or {"valid": False, "error": "检测无结果", "skipped": False}
             skipped = bool(result.get("skipped"))
 
             if skipped:
@@ -160,7 +189,18 @@ async def check_all_links_stream():
                 await asyncio.sleep(3.0 if skipped else 1.5)
 
         # 完成后附带文件级角标计数（与筛选按钮一致）
-        file_counts = await asyncio.to_thread(service.get_root_file_counts)
+        file_counts = {}
+        async for kind, payload in await_with_heartbeat(
+            asyncio.to_thread(service.get_root_file_counts)
+        ):
+            if kind == "heartbeat":
+                yield payload
+            elif kind == "error":
+                logger.warning(f"检测完成后取角标失败: {payload}")
+                file_counts = {}
+            else:
+                file_counts = payload or {}
+
         done_data = {
             "type": "done",
             "valid_count": valid_count,
@@ -170,7 +210,11 @@ async def check_all_links_stream():
         }
         yield f"data: {json.dumps(done_data, ensure_ascii=False)}\n\n"
 
-    return StreamingResponse(event_stream(), media_type="text/event-stream")
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers=SSE_HEADERS,
+    )
 
 
 @router.delete("/{source_id}", summary="删除分享")
@@ -187,7 +231,11 @@ async def delete_share(source_id: int):
 
 @router.post("/delete-batch", summary="批量删除分享")
 async def delete_shares_batch(req: DeleteBatchRequest):
-    """批量删除分享来源及关联的所有文件，并清理对应分享 STRM"""
+    """批量删除分享来源及关联的所有文件，并清理对应分享 STRM。
+
+    正式环境大量删除请改用两段式 SSE：
+    POST /delete-batch-job → GET /delete-batch-stream?job_id=...
+    """
     service = get_share_service()
     result = await asyncio.to_thread(service.delete_shares_batch, req.source_ids)
     msg = f"已删除 {result['success']}/{result['total']} 个分享"
@@ -198,6 +246,44 @@ async def delete_shares_batch(req: DeleteBatchRequest):
         code=0,
         message=msg,
         data=result
+    )
+
+
+@router.post("/delete-batch-job", summary="创建批量删除任务（SSE 前置）")
+async def create_delete_batch_job(req: DeleteBatchRequest):
+    """创建批量删除任务，返回 job_id 供 delete-batch-stream 使用。"""
+    ids = [int(x) for x in (req.source_ids or []) if int(x) > 0]
+    if not ids:
+        return ApiResponse(code=-1, message="未指定要删除的分享", data=None)
+    job_id = job_store.create({"source_ids": ids})
+    return ApiResponse(code=0, message="ok", data={"job_id": job_id, "total": len(ids)})
+
+
+@router.get("/delete-batch-stream", summary="流式批量删除分享（SSE）")
+async def delete_batch_stream(job_id: str = Query(..., description="delete-batch-job 返回的任务 ID")):
+    """SSE 流式批量删除：绕过 axios 超时，心跳保持飞牛网关连接。"""
+    payload = job_store.pop(job_id)
+    if not payload:
+        async def err_gen():
+            yield f"data: {json.dumps({'type': 'error', 'message': '删除任务不存在或已过期'}, ensure_ascii=False)}\n\n"
+        return StreamingResponse(err_gen(), media_type="text/event-stream", headers=SSE_HEADERS)
+
+    source_ids = list(payload.get("source_ids") or [])
+    logger.info(f"[SSE 删除分享] job_id={job_id}, count={len(source_ids)}")
+
+    def worker(on_progress):
+        service = get_share_service()
+        result = service.delete_shares_batch(source_ids, progress=on_progress)
+        msg = f"已删除 {result['success']}/{result['total']} 个分享"
+        strm_deleted = int(result.get("strm_deleted") or 0)
+        if strm_deleted:
+            msg += f"，并清理 {strm_deleted} 个分享 STRM"
+        on_progress({"type": "done", "message": msg, **result})
+
+    return streaming_response_from_thread(
+        worker,
+        start_event={"type": "start", "total": len(source_ids), "message": "开始删除分享…"},
+        thread_name="share-delete-batch",
     )
 
 
@@ -366,6 +452,79 @@ async def manual_organize_file(req: ManualFileActionRequest):
 
 
 
+
+@router.post("/organize/manual-job", summary="创建手动纠错整理任务（SSE 前置）")
+async def create_manual_organize_job(req: ManualFileActionRequest):
+    """创建手动整理任务，返回 job_id 供 organize/manual-stream 使用。
+
+    大文件夹整理可能远超 axios 30s，正式环境请走 SSE。
+    """
+    if req.media_type not in ("movie", "tv"):
+        return ApiResponse(code=-1, message="媒体类型只能是 movie 或 tv")
+    if req.tmdb_id <= 0:
+        return ApiResponse(code=-1, message="TMDB ID 不正确")
+    if not req.file_id:
+        return ApiResponse(code=-1, message="file_id 不能为空")
+
+    job_id = job_store.create({
+        "source_id": int(req.source_id),
+        "file_id": str(req.file_id),
+        "tmdb_id": int(req.tmdb_id),
+        "media_type": str(req.media_type),
+    })
+    return ApiResponse(code=0, message="ok", data={"job_id": job_id})
+
+
+@router.get("/organize/manual-stream", summary="流式手动纠错整理（SSE）")
+async def manual_organize_stream(job_id: str = Query(..., description="manual-job 返回的任务 ID")):
+    """SSE 流式手动整理：绕过 axios 超时，心跳保持飞牛网关连接。"""
+    payload = job_store.pop(job_id)
+    if not payload:
+        async def err_gen():
+            yield f"data: {json.dumps({'type': 'error', 'message': '整理任务不存在或已过期'}, ensure_ascii=False)}\n\n"
+        return StreamingResponse(err_gen(), media_type="text/event-stream", headers=SSE_HEADERS)
+
+    source_id = int(payload.get("source_id") or 0)
+    file_id = str(payload.get("file_id") or "")
+    tmdb_id = int(payload.get("tmdb_id") or 0)
+    media_type = str(payload.get("media_type") or "")
+    logger.info(
+        f"[SSE 手动整理] job_id={job_id}, source_id={source_id}, "
+        f"file_id={file_id}, tmdb_id={tmdb_id}, media_type={media_type}"
+    )
+
+    def worker(on_progress):
+        on_progress({
+            "type": "progress",
+            "stage": "manual_organize",
+            "percent": 5,
+            "message": "开始手动整理…",
+        })
+        service = get_share_organize_service()
+        result = service.manual_organize_file(source_id, file_id, tmdb_id, media_type)
+        if result.get("success"):
+            on_progress({
+                "type": "done",
+                "message": result.get("message") or "整理完成",
+                "success": True,
+                "result": result,
+            })
+        else:
+            on_progress({
+                "type": "error",
+                "message": result.get("error") or result.get("message") or "整理失败",
+                "success": False,
+                "result": result,
+            })
+
+    return streaming_response_from_thread(
+        worker,
+        start_event={"type": "start", "message": "连接手动整理服务…"},
+        thread_name="share-manual-organize",
+    )
+
+
+
 @router.post("/recompute-organized", summary="重算目录已整理标记（修复脏数据）")
 async def recompute_organized(source_id: Optional[int] = None):
     """自底向上重算目录 organized 标记。
@@ -373,10 +532,36 @@ async def recompute_organized(source_id: Optional[int] = None):
     规则：目录下所有子目录 + 视频文件均为已整理时，目录才为已整理；
     附属非视频文件（nfo/srt/海报等）不参与判定。
     不传 source_id 时处理全库。
+
+    正式环境全库请改用 GET /recompute-organized-stream。
     """
     service = get_share_organize_service()
     result = await asyncio.to_thread(service.recompute_directory_organized, source_id)
     return ApiResponse(data=result)
+
+
+@router.get("/recompute-organized-stream", summary="流式重算已整理标记（SSE）")
+async def recompute_organized_stream(source_id: Optional[int] = Query(None, description="可选，限定单个分享源")):
+    """SSE 流式重算：大库场景避免 axios 30s 超时与网关空闲断连。"""
+    logger.info(f"[SSE 重算 organized] source_id={source_id}")
+
+    def worker(on_progress):
+        service = get_share_organize_service()
+        result = service.recompute_directory_organized(source_id, progress=on_progress)
+        on_progress({
+            "type": "done",
+            "message": (
+                f"重算完成：检查 {result.get('checked_dirs', 0)} 个目录，"
+                f"变更 {result.get('changed_dirs', 0)} 个"
+            ),
+            **result,
+        })
+
+    return streaming_response_from_thread(
+        worker,
+        start_event={"type": "start", "message": "开始重算已整理标记…", "source_id": source_id},
+        thread_name="share-recompute-organized",
+    )
 
 
 @router.post("/organize", summary="整理单个文件")
@@ -422,26 +607,29 @@ async def organize_stream(
     source_id: int = Query(..., description="分享来源 ID"),
     file_ids: str = Query(..., description="文件 ID 列表，逗号分隔"),
 ):
-    """SSE 流式批量整理：每完成一个文件推送一次进度，绕过前端 axios 超时限制
+    """SSE 流式批量整理：每完成一个文件推送一次进度；单文件耗时较长时发送心跳。
 
     事件格式：
       data: {"type": "progress", "index": 1, "total": 5, "name": "...", "success": true, ...}
       data: {"type": "done", "total": 5, "success": 4, "failed": 1}
+      注释行 `: heartbeat` 保活
     """
     # 解析 file_ids（逗号分隔 → 列表）
     id_list = [fid.strip() for fid in file_ids.split(",") if fid.strip()]
     if not id_list:
         async def err_gen():
             yield f"data: {json.dumps({'type': 'error', 'message': 'file_ids 不能为空'}, ensure_ascii=False)}\n\n"
-        return StreamingResponse(err_gen(), media_type="text/event-stream")
+        return StreamingResponse(err_gen(), media_type="text/event-stream", headers=SSE_HEADERS)
 
     logger.info(f"[SSE 整理] 开始: source_id={source_id}, 文件数={len(id_list)}")
 
     async def event_generator():
         service = get_share_organize_service()
         try:
-            async for evt in service.organize_batch_stream(source_id, id_list):
-                yield f"data: {json.dumps(evt, ensure_ascii=False)}\n\n"
+            async for chunk in aiter_with_heartbeat(
+                service.organize_batch_stream(source_id, id_list)
+            ):
+                yield chunk
         except Exception as e:
             logger.error(f"[SSE 整理] 异常: {e}")
             err_payload = {"type": "error", "message": str(e)}
@@ -450,11 +638,7 @@ async def organize_stream(
     return StreamingResponse(
         event_generator(),
         media_type="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache",
-            "Connection": "keep-alive",
-            "X-Accel-Buffering": "no",
-        },
+        headers=SSE_HEADERS,
     )
 
 

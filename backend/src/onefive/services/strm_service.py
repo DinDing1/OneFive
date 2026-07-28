@@ -19,8 +19,9 @@ STRM 文件生成服务 - 基于已整理的分享数据库记录生成本地 .s
 - STRM 内容保留原始文件名，方便 Emby 和直链服务按中文路径直接访问
 """
 import os
+import time
 from pathlib import Path
-from typing import List, Dict, Optional, Sequence, Set, Any
+from typing import List, Dict, Optional, Sequence, Set, Any, Callable
 from urllib.parse import urlencode
 
 from ..services.p115_client_factory import get_p115_client_factory
@@ -415,8 +416,11 @@ class StrmService:
             })
             return "failed"
 
-    def generate(self) -> Dict:
-        """生成 STRM 文件到配置的输出目录
+    def generate(self, progress: Optional[Callable[[Dict[str, Any]], None]] = None) -> Dict:
+        """生成分享 STRM 文件到配置的输出目录
+
+        Args:
+            progress: 可选回调 progress(event_dict)，用于 SSE 进度推送。
 
         Returns:
             {
@@ -432,6 +436,22 @@ class StrmService:
             ConfigError: 输出路径未配置
             PathNotAuthorizedError: 输出路径不在授权目录内
         """
+        def emit(stage: str, percent: int, message: str, **extra: Any) -> None:
+            if not progress:
+                return
+            try:
+                payload = {
+                    "type": "progress",
+                    "stage": stage,
+                    "percent": max(0, min(100, int(percent))),
+                    "message": message,
+                }
+                payload.update(extra)
+                progress(payload)
+            except Exception:
+                pass
+
+        emit("prepare", 1, "校验分享 STRM 配置…")
         settings = self.get_settings()
         base_url = settings["direct_link_base_url"]
         output_path = settings["output_path"]
@@ -445,14 +465,18 @@ class StrmService:
             raise PathNotAuthorizedError(output_path, "分享 STRM 输出")
 
         output_root = Path(output_path)
+        emit("scan", 8, "查询已整理分享文件…")
         files = self._query_organized_files()
+        total_files = len(files)
+        emit("scan", 15, f"待生成 {total_files} 个分享 STRM…", total=total_files)
 
         created = 0
         failed = 0
         skipped = 0
         errors: List[Dict] = []
+        last_emit = 0.0
 
-        for file_row in files:
+        for idx, file_row in enumerate(files, start=1):
             # 构建相对路径与直链 URL
             rel_path = self._build_relative_path(
                 file_row.get("category", ""),
@@ -479,17 +503,47 @@ class StrmService:
             else:
                 failed += 1
 
+            now = time.time()
+            if progress and (
+                idx == 1
+                or idx == total_files
+                or idx % 50 == 0
+                or now - last_emit >= 1.5
+            ):
+                # 写入阶段占 15%~95%
+                pct = 15 + int(idx / max(total_files, 1) * 80)
+                emit(
+                    "write",
+                    pct,
+                    f"写入分享 STRM {idx}/{total_files}（成功 {created}）",
+                    total=total_files,
+                    created=created,
+                    skipped=skipped,
+                    failed=failed,
+                    current=idx,
+                )
+                last_emit = now
+
             # 错误信息达到上限后中断循环
             if len(errors) >= MAX_ERRORS:
                 break
 
         logger.info(
-            f"STRM 生成完成：总数 {len(files)}，成功 {created}，"
+            f"STRM 生成完成：总数 {total_files}，成功 {created}，"
             f"跳过 {skipped}，失败 {failed}"
+        )
+        emit(
+            "finish",
+            99,
+            f"分享 STRM 生成完成：成功 {created}/{total_files}",
+            total=total_files,
+            created=created,
+            skipped=skipped,
+            failed=failed,
         )
 
         return {
-            "total": len(files),
+            "total": total_files,
             "created": created,
             "skipped": skipped,
             "failed": failed,
@@ -626,26 +680,20 @@ class StrmService:
 
         return Path(*parts)
 
-    def generate_cloud(self) -> Dict:
-        """基于云盘目录生成 STRM 文件
+    def generate_cloud(self, progress: Optional[Callable[[Dict[str, Any]], None]] = None) -> Dict:
+        """根据云盘媒体库目录生成 STRM 文件到配置的输出目录
 
-        遍历 media_library_path 配置指定的云盘目录，为其中所有视频文件
-        生成 STRM 文件到 cloud_output_path 配置的输出目录。
-
-        流程：
-        1. 读取并校验 cloud_output_path 配置
-        2. 读取 media_library_path 配置
-        3. 解析 media_library_path 为 cid
-        4. 通过 export_dir 遍历云盘目录（带完整路径）
-        5. 对每个视频文件生成 STRM 文件
+        Args:
+            progress: 可选回调 progress(event_dict)，用于 SSE 进度推送。
 
         Returns:
             {
-                "total": 视频文件总数,
-                "created": 成功生成数,
-                "skipped": 跳过数,
-                "failed": 失败数,
-                "errors": [{"file_id": "...", "name": "...", "error": "..."}]
+                "total": N,
+                "created": N,
+                "skipped": N,
+                "failed": N,
+                "errors": [{"file_id": "...", "name": "...", "error": "..."}],
+                "truncated": false
             }
 
         Raises:
@@ -653,6 +701,22 @@ class StrmService:
             PathNotAuthorizedError: 输出路径不在授权目录内
             NotLoggedInError: 未登录
         """
+        def emit(stage: str, percent: int, message: str, **extra: Any) -> None:
+            if not progress:
+                return
+            try:
+                payload = {
+                    "type": "progress",
+                    "stage": stage,
+                    "percent": max(0, min(100, int(percent))),
+                    "message": message,
+                }
+                payload.update(extra)
+                progress(payload)
+            except Exception:
+                pass
+
+        emit("prepare", 1, "校验云盘 STRM 配置…")
         settings = self.get_settings()
         base_url = settings["direct_link_base_url"]
         cloud_output_path = settings["cloud_output_path"]
@@ -686,6 +750,13 @@ class StrmService:
             f"开始生成云盘 STRM：源目录={media_library_path or '/'}(cid={root_cid})，"
             f"输出目录={cloud_output_path}"
         )
+        emit(
+            "scan",
+            5,
+            f"扫描云盘媒体库（cid={root_cid}）…",
+            media_library_path=media_library_path or "/",
+            root_cid=root_cid,
+        )
 
         # 读取视频扩展名配置（已缓存，不会频繁读数据库）
         video_exts = get_video_extensions()
@@ -695,9 +766,16 @@ class StrmService:
         failed = 0
         skipped = 0
         errors: List[Dict] = []
+        last_emit = 0.0
+        scanned = 0
 
         # 遍历云盘目录（iter_files_with_path_skim 一次拉取 name/pickcode/path）
+        # 大库扫描本身可能很久，先推一次进度，再在写入阶段持续心跳式上报
         for file_row in self._iter_cloud_files_with_path(root_cid, media_library_path):
+            scanned += 1
+            if progress and scanned == 1:
+                emit("scan", 12, "已开始遍历云盘文件，过滤视频并写入 STRM…")
+
             name = file_row.get("name", "")
             pick_code = file_row.get("pick_code", "")
             file_path = file_row.get("path", "")
@@ -734,13 +812,45 @@ class StrmService:
             else:
                 failed += 1
 
+            now = time.time()
+            if progress and (
+                total == 1
+                or total % 30 == 0
+                or now - last_emit >= 1.5
+            ):
+                # 云盘总量未知，用缓升百分比（最高 95）
+                pct = min(95, 15 + int((total ** 0.5) * 3))
+                emit(
+                    "write",
+                    pct,
+                    f"写入云盘 STRM：已处理视频 {total}（成功 {created}）",
+                    total=total,
+                    created=created,
+                    skipped=skipped,
+                    failed=failed,
+                    scanned=scanned,
+                )
+                last_emit = now
+
             # 错误信息达到上限后中断循环
             if len(errors) >= MAX_ERRORS:
                 break
 
+        if scanned == 0:
+            emit("scan", 40, "云盘媒体库未扫描到可生成文件")
+
         logger.info(
             f"云盘 STRM 生成完成：视频总数 {total}，成功 {created}，"
             f"跳过 {skipped}，失败 {failed}"
+        )
+        emit(
+            "finish",
+            99,
+            f"云盘 STRM 生成完成：成功 {created}/{total}",
+            total=total,
+            created=created,
+            skipped=skipped,
+            failed=failed,
         )
 
         return {

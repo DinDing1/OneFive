@@ -57,8 +57,10 @@ start_process() {
     export TRIM_APPDEST="${TRIM_APPDEST}"
     export ONEFIVE_SOCKET="${SOCKET_PATH}"
 
-    # 运行 Nuitka 编译的二进制文件
-    SERVER_BIN="${TRIM_APPDEST}/server/onefive-server"
+    # 运行 Nuitka standalone 目录分发（非 onefile，降低飞牛常驻内存）
+    # 依赖库与入口二进制同目录；用 $ORIGIN rpath，在 server 目录下 exec 启动更稳妥
+    SERVER_DIR="${TRIM_APPDEST}/server"
+    SERVER_BIN="${SERVER_DIR}/onefive-server"
     if [ ! -f "${SERVER_BIN}" ]; then
         echo "错误: 找不到服务端程序 ${SERVER_BIN}" > ${TRIM_TEMP_LOGFILE}
         log_msg "错误: 找不到服务端程序 ${SERVER_BIN}"
@@ -66,10 +68,15 @@ start_process() {
     fi
 
     chmod +x "${SERVER_BIN}" 2>/dev/null
+    # 确保同目录依赖可读、可执行（升级后偶发丢权限）
+    chmod -R a+rX "${SERVER_DIR}" 2>/dev/null
 
-    "${SERVER_BIN}" >> ${LOG_FILE} 2>&1 &
+    (
+        cd "${SERVER_DIR}" || exit 1
+        exec ./onefive-server
+    ) >> ${LOG_FILE} 2>&1 &
     printf "%s" "$!" > ${PID_FILE}
-    log_msg "OneFive started with PID $!"
+    log_msg "OneFive started with PID $! (standalone)"
 
     # 等待 socket 就绪，确保 fnOS 网关能立即连接
     if ! wait_socket_ready; then

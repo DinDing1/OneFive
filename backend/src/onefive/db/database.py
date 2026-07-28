@@ -80,19 +80,23 @@ class Database:
             self._clear_readonly_attr(Path(str(self.db_path) + suffix))
 
     def _apply_pragmas(self, conn: sqlite3.Connection) -> None:
-        """应用性能与并发相关 PRAGMA。"""
+        """应用性能与并发相关 PRAGMA。
+
+        飞牛正式环境按 cgroup 统计内存，cache/mmap 过大会明显抬高面板占用。
+        此处在「够用」与「省内存」之间取保守值（原 cache~64MB / mmap 256MB）。
+        """
         # WAL: 读写并发更好
         # synchronous=NORMAL: WAL 下足够安全且更快
-        # cache_size=-64000: ~64MB page cache
-        # temp_store=MEMORY: 临时表/排序走内存
-        # mmap_size: Windows 上过大 mmap 偶发异常，保守一些
+        # cache_size=-16000: ~16MB page cache（分享库浏览足够，显著低于原 64MB）
+        # temp_store=MEMORY: 临时表/排序走内存（体量通常不大）
+        # mmap_size: Linux/飞牛 64MB；Windows 禁用（过大易异常）
         # busy_timeout: 降低 database is locked
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA synchronous=NORMAL")
-        conn.execute("PRAGMA cache_size=-64000")
+        conn.execute("PRAGMA cache_size=-16000")
         conn.execute("PRAGMA temp_store=MEMORY")
-        # Windows 上 mmap 有时会触发奇怪的 IO/只读错误，使用较小映射
-        mmap = 0 if os.name == "nt" else 268435456
+        # Windows 上 mmap 有时会触发奇怪的 IO/只读错误；飞牛 Linux 用 64MB 封顶
+        mmap = 0 if os.name == "nt" else (64 * 1024 * 1024)
         conn.execute(f"PRAGMA mmap_size={mmap}")
         conn.execute("PRAGMA busy_timeout=15000")
         conn.execute("PRAGMA foreign_keys=ON")

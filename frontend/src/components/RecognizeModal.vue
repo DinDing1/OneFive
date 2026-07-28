@@ -145,6 +145,7 @@
 <script setup lang="ts">
 import { ref, computed, watch } from 'vue'
 import { organizeApi, type RecognizeResult } from '@/api/organize'
+import { listenSse } from '@/api/sse'
 import { filesApi, type FileItem } from '@/api/files'
 
 const props = defineProps<{
@@ -335,7 +336,8 @@ async function doOrganize() {
       }
     } catch (e) { /* 使用默认 move */ }
 
-    const res = await organizeApi.execute({
+    // 正式环境大文件夹/网关会超过 axios 30s，走 POST 建任务 + SSE 拉流
+    const jobRes = await organizeApi.createExecuteJob({
       file_id: props.item.file_id,
       file_name: props.item.name,
       is_dir: props.item.is_dir,
@@ -353,14 +355,40 @@ async function doOrganize() {
       tmdb_rating: result.value.tmdb_rating || 0,
       tech_info: result.value.tech_info || {},
     })
-    if (res.code === 0) {
-      execSuccess.value = res.message || '整理完成'
-    } else {
-      execError.value = res.message || '整理失败'
+    if (jobRes.code !== 0 || !jobRes.data?.job_id) {
+      execError.value = jobRes.message || '创建整理任务失败'
+      executing.value = false
+      return
     }
+
+    await new Promise<void>((resolve) => {
+      const es = organizeApi.executeStream(jobRes.data!.job_id)
+      listenSse(es, {
+        onProgress: (data) => {
+          if (data?.message) execSuccess.value = String(data.message)
+        },
+        onDone: (data) => {
+          execSuccess.value = data?.message || '整理完成'
+          execError.value = ''
+          executing.value = false
+          resolve()
+        },
+        onError: (message) => {
+          execError.value = message || '整理失败'
+          execSuccess.value = ''
+          executing.value = false
+          resolve()
+        },
+        onConnectionError: (message) => {
+          execError.value = message || '连接中断，请重试'
+          execSuccess.value = ''
+          executing.value = false
+          resolve()
+        },
+      })
+    })
   } catch (e: any) {
     execError.value = e.message || '整理失败'
-  } finally {
     executing.value = false
   }
 }

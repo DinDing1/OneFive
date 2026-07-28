@@ -67,10 +67,10 @@ jobs:
             python:3.12-slim-bookworm \
             bash -c "
               apt-get update -qq && apt-get install -y -qq patchelf gcc > /dev/null &&
-              pip install 'nuitka[onefile]' ordered-set --quiet &&
+              pip install nuitka ordered-set --quiet &&
               pip install -r /build/requirements.txt --quiet &&
               cd /build/src &&
-              python -m nuitka --standalone --onefile \
+              python -m nuitka --standalone \
                 --lto=no \
                 --include-package=onefive \
                 --include-package=onefive.api \
@@ -123,13 +123,31 @@ jobs:
               echo '编译完成'
             "
           echo "x86 编译完成"
-          ls -lh /tmp/nuitka-out/onefive-server
+          # standalone 产出为 *.dist 目录（内含 onefive-server 与依赖），规范化到 server-dist 便于打包
+          DIST_DIR=$(find /tmp/nuitka-out -maxdepth 1 -type d -name '*.dist' | head -n 1)
+          if [ -z "$DIST_DIR" ] || [ ! -d "$DIST_DIR" ]; then
+            echo "错误: 未找到 Nuitka standalone 输出目录 (*.dist)"
+            ls -la /tmp/nuitka-out || true
+            exit 1
+          fi
+          rm -rf /tmp/server-dist
+          mkdir -p /tmp/server-dist
+          cp -a "$DIST_DIR"/. /tmp/server-dist/
+          if [ ! -f /tmp/server-dist/onefive-server ]; then
+            echo "错误: standalone 目录中缺少 onefive-server"
+            ls -la /tmp/server-dist | head -n 50
+            exit 1
+          fi
+          chmod +x /tmp/server-dist/onefive-server
+          echo "standalone 入口与依赖："
+          ls -lh /tmp/server-dist/onefive-server
+          du -sh /tmp/server-dist
 
       - name: 上传后端产物
         uses: actions/upload-artifact@v4
         with:
           name: backend-x86_64
-          path: /tmp/nuitka-out/onefive-server
+          path: /tmp/server-dist/
           retention-days: 1
 
   # ========== Job 3: 编译 ARM 后端 ==========
@@ -150,10 +168,10 @@ jobs:
             python:3.12-slim-bookworm \
             bash -c "
               apt-get update -qq && apt-get install -y -qq patchelf gcc > /dev/null &&
-              pip install 'nuitka[onefile]' ordered-set --quiet &&
+              pip install nuitka ordered-set --quiet &&
               pip install -r /build/requirements.txt --quiet &&
               cd /build/src &&
-              python -m nuitka --standalone --onefile \
+              python -m nuitka --standalone \
                 --lto=no \
                 --include-package=onefive \
                 --include-package=onefive.api \
@@ -206,13 +224,31 @@ jobs:
               echo '编译完成'
             "
           echo "ARM 编译完成"
-          ls -lh /tmp/nuitka-out/onefive-server
+          # standalone 产出为 *.dist 目录（内含 onefive-server 与依赖），规范化到 server-dist 便于打包
+          DIST_DIR=$(find /tmp/nuitka-out -maxdepth 1 -type d -name '*.dist' | head -n 1)
+          if [ -z "$DIST_DIR" ] || [ ! -d "$DIST_DIR" ]; then
+            echo "错误: 未找到 Nuitka standalone 输出目录 (*.dist)"
+            ls -la /tmp/nuitka-out || true
+            exit 1
+          fi
+          rm -rf /tmp/server-dist
+          mkdir -p /tmp/server-dist
+          cp -a "$DIST_DIR"/. /tmp/server-dist/
+          if [ ! -f /tmp/server-dist/onefive-server ]; then
+            echo "错误: standalone 目录中缺少 onefive-server"
+            ls -la /tmp/server-dist | head -n 50
+            exit 1
+          fi
+          chmod +x /tmp/server-dist/onefive-server
+          echo "standalone 入口与依赖："
+          ls -lh /tmp/server-dist/onefive-server
+          du -sh /tmp/server-dist
 
       - name: 上传后端产物
         uses: actions/upload-artifact@v4
         with:
           name: backend-arm64
-          path: /tmp/nuitka-out/onefive-server
+          path: /tmp/server-dist/
           retention-days: 1
 
   # ========== Job 4: 组装并打包 FPK ==========
@@ -282,16 +318,40 @@ jobs:
           rm -rf onefive/app/ui/images
           cp -r /tmp/onefive-ui-images onefive/app/ui/images
 
-          # 后端二进制 -> onefive/app/server/
-          # 安装后路径会变成 ${TRIM_APPDEST}/server/onefive-server
+          # 后端 standalone 目录 -> onefive/app/server/
+          # 安装后：${TRIM_APPDEST}/server/onefive-server + 同目录依赖
+          # 下载产物在 /tmp/nuitka-out/（upload 的 server-dist 内容）
+          rm -rf onefive/app/server
           mkdir -p onefive/app/server
-          rm -rf onefive/app/server/__pycache__
-          cp /tmp/nuitka-out/onefive-server onefive/app/server/onefive-server
+          # artifact 可能是扁平文件，或带一层目录，这里兼容两种布局
+          if [ -f /tmp/nuitka-out/onefive-server ]; then
+            cp -a /tmp/nuitka-out/. onefive/app/server/
+          elif [ -f /tmp/nuitka-out/server-dist/onefive-server ]; then
+            cp -a /tmp/nuitka-out/server-dist/. onefive/app/server/
+          else
+            # 再尝试任意子目录中的入口
+            FOUND=$(find /tmp/nuitka-out -type f -name onefive-server | head -n 1)
+            if [ -z "$FOUND" ]; then
+              echo "错误: 下载的后端产物中找不到 onefive-server"
+              find /tmp/nuitka-out -maxdepth 3 -type f | head -n 80 || true
+              exit 1
+            fi
+            cp -a "$(dirname "$FOUND")"/. onefive/app/server/
+          fi
           chmod +x onefive/app/server/onefive-server
+          # 去掉可能混入的构建垃圾
+          rm -rf onefive/app/server/__pycache__
 
-          echo "应用文件组装完成"
-          ls -la onefive/app/server/
-          ls -la onefive/app/ui/
+          if [ ! -f onefive/app/server/onefive-server ]; then
+            echo "错误: 组装后缺少 onefive/app/server/onefive-server"
+            ls -la onefive/app/server/ | head -n 50
+            exit 1
+          fi
+
+          echo "应用文件组装完成（standalone）"
+          ls -lh onefive/app/server/onefive-server
+          du -sh onefive/app/server
+          ls -la onefive/app/ui/ | head -n 30
 
       - name: 更新 manifest
         run: |

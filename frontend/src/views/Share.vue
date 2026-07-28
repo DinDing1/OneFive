@@ -952,27 +952,51 @@ function resolveShareName(sourceId: number): string {
 async function handleRecomputeOrganized() {
   if (recomputingOrganized.value) return
   recomputingOrganized.value = true
-  try {
-    const res = await shareApi.recomputeOrganized()
-    if (res.code === 0 && res.data) {
-      const d = res.data
+  // 正式环境全库目录可能上万，走 SSE + 心跳，避免 axios 30s / 网关空闲断连
+  const es = shareApi.recomputeOrganizedStream()
+  let finished = false
+  const finish = () => {
+    if (finished) return
+    finished = true
+    recomputingOrganized.value = false
+    try { es.close() } catch { /* ignore */ }
+  }
+  es.onmessage = async (event) => {
+    let data: any
+    try { data = JSON.parse(event.data) } catch { return }
+    const typ = data?.type
+    if (typ === 'progress') {
+      // 可选：后续可在 UI 展示 data.message
+      return
+    }
+    if (typ === 'done') {
       showToast(
-        `重算完成：${d.sources} 个分享，检查 ${d.checked_dirs} 个目录，修正 ${d.changed_dirs} 个`,
+        data.message ||
+          `重算完成：${data.sources || 0} 个分享，检查 ${data.checked_dirs || 0} 个目录，修正 ${data.changed_dirs || 0} 个`,
         'success'
       )
-      if (!isInSubDir.value && !isSearching.value) {
-        await fetchRootPage({ keepPage: true, includeCounts: true })
-      } else if (isInSubDir.value) {
-        const last = currentDirBreadcrumbs.value[currentDirBreadcrumbs.value.length - 1]
-        await loadSubDirFiles(last.sourceId, last.parentId, { keepPage: true })
-      }
-    } else {
-      showToast(res.message || '重算失败', 'error')
+      try {
+        if (!isInSubDir.value && !isSearching.value) {
+          await fetchRootPage({ keepPage: true, includeCounts: true })
+        } else if (isInSubDir.value) {
+          const last = currentDirBreadcrumbs.value[currentDirBreadcrumbs.value.length - 1]
+          await loadSubDirFiles(last.sourceId, last.parentId, { keepPage: true })
+        }
+      } catch { /* ignore refresh errors */ }
+      finish()
+      return
     }
-  } catch (e: any) {
-    handleApiError(e, '重算失败')
-  } finally {
-    recomputingOrganized.value = false
+    if (typ === 'error') {
+      showToast(data.message || '重算失败', 'error')
+      finish()
+    }
+  }
+  es.onerror = () => {
+    if (finished) { finish(); return }
+    if (es.readyState === EventSource.CLOSED) {
+      showToast('重算连接中断（网关或网络），请重试', 'error')
+      finish()
+    }
   }
 }
 
@@ -1109,33 +1133,56 @@ function handleDeleteShare(sourceId: number) {
 
 /** 确认删除分享（支持单条和批量） */
 async function confirmDeleteShare() {
+  // 单条/批量统一走 SSE，删除附带 STRM 清理时可能远超 30s
+  const ids = deletingBatchIds.value.length > 0
+    ? [...deletingBatchIds.value]
+    : (deletingShareId.value ? [deletingShareId.value] : [])
+  if (!ids.length) return
+
   try {
-    // 批量删除
-    if (deletingBatchIds.value.length > 0) {
-      const res = await shareApi.deleteSharesBatch(deletingBatchIds.value)
-      if (res.code === 0) {
-        showToast(`已删除 ${res.data?.success || 0} 个分享`, 'success')
-        showDeleteConfirm.value = false
-        deletingBatchIds.value = []
-        clearSelection()
-        await loadShares()
-        await loadFiles()
-      } else {
-        showToast(res.message || '删除失败', 'error')
-      }
+    const jobRes = await shareApi.createDeleteBatchJob(ids)
+    if (jobRes.code !== 0 || !jobRes.data?.job_id) {
+      showToast(jobRes.message || '创建删除任务失败', 'error')
       return
     }
-    // 单条删除
-    if (!deletingShareId.value) return
-    const res = await shareApi.deleteShare(deletingShareId.value)
-    if (res.code === 0) {
-      showToast('分享已删除', 'success')
-      showDeleteConfirm.value = false
-      deletingShareId.value = null
-      await loadShares()
-      await loadFiles()
-    } else {
-      showToast(res.message || '删除失败', 'error')
+
+    const es = shareApi.deleteBatchStream(jobRes.data.job_id)
+    let finished = false
+    const finish = () => {
+      if (finished) return
+      finished = true
+      try { es.close() } catch { /* ignore */ }
+    }
+
+    es.onmessage = async (event) => {
+      let data: any
+      try { data = JSON.parse(event.data) } catch { return }
+      const typ = data?.type
+      if (typ === 'progress') return
+      if (typ === 'done') {
+        showToast(data.message || `已删除 ${data.success || 0} 个分享`, 'success')
+        showDeleteConfirm.value = false
+        deletingBatchIds.value = []
+        deletingShareId.value = null
+        clearSelection()
+        try {
+          await loadShares()
+          await loadFiles()
+        } catch { /* ignore */ }
+        finish()
+        return
+      }
+      if (typ === 'error') {
+        showToast(data.message || '删除失败', 'error')
+        finish()
+      }
+    }
+    es.onerror = () => {
+      if (finished) { finish(); return }
+      if (es.readyState === EventSource.CLOSED) {
+        showToast('删除连接中断（网关或网络），请重试', 'error')
+        finish()
+      }
     }
   } catch (e: any) {
     handleApiError(e, '删除失败')
@@ -1970,15 +2017,53 @@ async function executeOrganize() {
     let failCount = 0
 
     for (const [sourceId, fileIds] of groups) {
-      // 手动纠错（单文件）：走 axios 调用 manualOrganizeFile，不走 SSE
+      // 手动纠错（单文件）：POST 建任务 + SSE 拉流，避免大文件夹超 axios 30s
       if (manualOverride.value && pendingOrganizeIds.value.length === 1) {
         organizeProgressName.value = recognizeItem.value?.name || fileIds[0]
         const tmdbId = Number(manualTmdbId.value)
         try {
-          const res = await shareApi.manualOrganizeFile(sourceId, fileIds[0], tmdbId, manualMediaType.value)
-          const ok = res.code === 0
-          if (ok) successCount += 1
-          else failCount += 1
+          const jobRes = await shareApi.createManualOrganizeJob(
+            sourceId,
+            fileIds[0],
+            tmdbId,
+            manualMediaType.value,
+          )
+          if (jobRes.code !== 0 || !jobRes.data?.job_id) {
+            failCount += 1
+          } else {
+            const ok = await new Promise<boolean>((resolve) => {
+              const es = shareApi.manualOrganizeStream(jobRes.data!.job_id)
+              let finished = false
+              const finish = (success: boolean) => {
+                if (finished) return
+                finished = true
+                try { es.close() } catch { /* ignore */ }
+                resolve(success)
+              }
+              es.onmessage = (event) => {
+                let data: any
+                try { data = JSON.parse(event.data) } catch { return }
+                const typ = data?.type
+                if (typ === 'progress') {
+                  if (data?.message) organizeProgressName.value = String(data.message)
+                  return
+                }
+                if (typ === 'done') {
+                  finish(true)
+                  return
+                }
+                if (typ === 'error') {
+                  finish(false)
+                }
+              }
+              es.onerror = () => {
+                if (finished) return
+                if (es.readyState === EventSource.CLOSED) finish(false)
+              }
+            })
+            if (ok) successCount += 1
+            else failCount += 1
+          }
         } catch (e: any) {
           failCount += 1
         }
