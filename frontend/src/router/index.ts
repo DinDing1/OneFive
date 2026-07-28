@@ -38,6 +38,11 @@ const router = createRouter({
           component: () => import('@/views/ShareWash.vue')
         },
         {
+          path: 'tasks',
+          name: 'Tasks',
+          component: () => import('@/views/Tasks.vue')
+        },
+        {
           path: 'about',
           name: 'About',
           component: () => import('@/views/About.vue')

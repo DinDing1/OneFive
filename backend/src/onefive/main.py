@@ -48,11 +48,21 @@ from .api.share import router as share_router
 from .api.strm import router as strm_router
 from .api.share_wash import router as share_wash_router
 from .api.offline import router as offline_router
+from .api.tasks import router as tasks_router
 from .db.database import close_db
 
 # 初始化日志
 setup_logging()
 logger = get_logger(__name__)
+
+
+async def _start_scheduler() -> None:
+    """后台启动定时任务调度器，失败不阻塞 HTTP。"""
+    try:
+        from .scheduler import get_scheduler_service
+        await get_scheduler_service().start()
+    except Exception as e:
+        logger.warning(f"定时任务调度器启动失败: {e}")
 
 
 async def _auto_connect_notifications() -> None:
@@ -74,6 +84,12 @@ async def lifespan(app: FastAPI):
     auto_connect_task = asyncio.create_task(
         _auto_connect_notifications(),
         name="notification-auto-connect",
+    )
+
+    # 定时任务后台启动，失败不阻塞 HTTP
+    scheduler_task = asyncio.create_task(
+        _start_scheduler(),
+        name="scheduler-start",
     )
 
     # 自动启动直链服务
@@ -98,6 +114,21 @@ async def lifespan(app: FastAPI):
             pass
         except Exception as e:
             logger.debug(f"取消通知自动连接任务: {e}")
+
+    # 取消调度器启动任务并关闭调度器
+    if not scheduler_task.done():
+        scheduler_task.cancel()
+        try:
+            await scheduler_task
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            logger.debug(f"取消调度器启动任务: {e}")
+    try:
+        from .scheduler import get_scheduler_service
+        await get_scheduler_service().shutdown()
+    except Exception as e:
+        logger.debug(f"调度器关闭: {e}")
 
     # 断开通知渠道
     try:
@@ -159,6 +190,7 @@ app.include_router(share_router)
 app.include_router(strm_router)
 app.include_router(share_wash_router)
 app.include_router(offline_router)
+app.include_router(tasks_router)
 
 # ==================== 前端静态文件 ====================
 # 飞牛网关通过 gatewayPrefix="/app/onefive" 转发请求，

@@ -17,18 +17,6 @@ from ...logger import get_logger
 logger = get_logger(__name__)
 
 
-def format_size(size: int) -> str:
-    """将字节数格式化为可读的文件大小字符串"""
-    if size < 1024:
-        return f"{size} B"
-    elif size < 1024 ** 2:
-        return f"{size / 1024:.1f} KB"
-    elif size < 1024 ** 3:
-        return f"{size / 1024 ** 2:.1f} MB"
-    else:
-        return f"{size / 1024 ** 3:.2f} GB"
-
-
 # 配置键名常量
 CFG_ENABLED = "tg_enabled"
 CFG_BOT_ENABLED = "tg_bot_enabled"
@@ -303,6 +291,7 @@ class TelegramChannel(NotificationChannel):
                 return
 
             replies: list[str] = []
+            from ..format import format_share_add_notify, format_offline_add_notify
 
             # ---- 115 分享链接 → 虚拟库 ----
             has_share = ("115.com/s/" in message_text) or ("115cdn.com/s/" in message_text)
@@ -320,18 +309,18 @@ class TelegramChannel(NotificationChannel):
                     result = await asyncio.to_thread(
                         share_service.add_share, share_url, source_type="bot"
                     )
-                    if result.get("success"):
-                        replies.append(
-                            "✅ 分享添加成功\n"
-                            f"📦 {result.get('share_name', '')}\n"
-                            f"📁 {result.get('file_count', 0)} 个文件\n"
-                            f"💾 {format_size(result.get('total_size', 0))}\n"
-                            f"🆔 source_id: {result.get('source_id')}"
+                    # 与离线转存共用统一字段风格模板
+                    replies.append(
+                        format_share_add_notify(
+                            bool(result.get("success")),
+                            share_name=result.get("share_name", "") or "",
+                            file_count=int(result.get("file_count") or 0),
+                            total_size=result.get("total_size", 0),
+                            source_id=result.get("source_id"),
+                            share_code=result.get("share_code", "") or "",
+                            error=result.get("error", "") or "未知错误",
                         )
-                    else:
-                        replies.append(
-                            f"❌ 分享添加失败: {result.get('error', '未知错误')}"
-                        )
+                    )
 
             # ---- ed2k / magnet → 115 离线转存 ----
             from ...services.offline_link_parser import extract_offline_links_from_text
@@ -350,51 +339,24 @@ class TelegramChannel(NotificationChannel):
                     None,
                     "bot",
                 )
-                if off_result.get("success"):
-                    accepted = off_result.get("accepted", 0)
-                    total = off_result.get("total", 0)
-                    exists = off_result.get("exists", 0) or 0
-                    if exists and exists == accepted:
-                        title = f"ℹ️ 离线任务已存在 {accepted}/{total}"
-                    elif exists:
-                        title = f"✅ 离线转存已提交 {accepted}/{total}（其中已存在 {exists}）"
-                    else:
-                        title = f"✅ 离线转存已提交 {accepted}/{total}"
-                    lines = [
-                        title,
-                        f"📂 保存路径: {off_result.get('save_path') or '-'}",
-                    ]
-                    if off_result.get("failed"):
-                        lines.append(f"⚠️ 失败 {off_result.get('failed')} 条")
-                    # 展示前几条明细
-                    for item in (off_result.get("items") or [])[:5]:
-                        name = item.get("name") or item.get("url_type") or "link"
-                        extra = ""
-                        if item.get("renamed"):
-                            extra = "（已恢复空格文件名）"
-                        elif item.get("rename_pending"):
-                            extra = "（下载完成后将尝试恢复文件名）"
-                        if item.get("status") == "exists":
-                            lines.append(f"• 已存在 {name}{extra}")
-                        elif item.get("ok"):
-                            lines.append(f"✓ {name}{extra}")
-                        else:
-                            lines.append(f"✗ {name}: {item.get('error') or '失败'}")
-                    if len(off_result.get("items") or []) > 5:
-                        lines.append(f"... 共 {len(off_result.get('items') or [])} 条")
-                    replies.append("\n".join(lines))
-                else:
-                    err = off_result.get("error", "未知错误")
-                    # 兜底：若错误文案是任务已存在，也按友好提示输出
-                    if any(k in str(err) for k in ("任务已存在", "重复的链接", "请勿输入重复")):
-                        replies.append(f"ℹ️ 离线任务已存在: {err}")
-                    else:
-                        replies.append(f"❌ 离线转存失败: {err}")
+                replies.append(
+                    format_offline_add_notify(
+                        bool(off_result.get("success")),
+                        accepted=int(off_result.get("accepted") or 0),
+                        total=int(off_result.get("total") or 0),
+                        exists=int(off_result.get("exists") or 0),
+                        failed=int(off_result.get("failed") or 0),
+                        save_path=off_result.get("save_path") or "",
+                        items=off_result.get("items") or [],
+                        error=off_result.get("error", "") or "未知错误",
+                    )
+                )
 
             if not replies:
                 return
 
-            await event.reply("\n\n".join(replies))
+            # HTML 模板，与整理通知 send_message(parse_mode=html) 一致
+            await event.reply("\n\n".join(replies), parse_mode="html")
 
         except Exception as e:
             logger.error(f"Bot: 处理消息时出错: {e}")

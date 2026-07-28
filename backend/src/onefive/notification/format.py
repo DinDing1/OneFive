@@ -1,14 +1,18 @@
 """
 通知消息格式化模块
 
-从 organize_service 和 share_organize_service 的 _send_notify 方法中
-提取共同的消息构建逻辑，统一管理通知消息格式。
+统一管理各业务通知的消息模板，保证 Telegram 等渠道展示风格一致：
+- 整理/入库：organize_service / share_organize_service
+- 分享添加：Bot 收到 115 分享链接
+- 离线转存：Bot 收到 ed2k / magnet
 
-两个服务的消息模板几乎一样，区别仅在：
-- 状态标题不同：整理完成/整理失败 vs 分享入库完成/分享入库失败
-- organize_service 额外显示"📦 整理方式"行
+模板约定（HTML，配合 parse_mode=html）：
+- 首行：状态 emoji + <b>标题</b>
+- 空一行后，字段行：emoji + <b>标签</b>：值
 """
-from typing import Any, Dict, Optional
+from __future__ import annotations
+
+from typing import Any, Dict, List, Optional, Sequence
 
 
 def _build_episode_str(season: int, episode_range: Optional[list]) -> Optional[str]:
@@ -161,3 +165,248 @@ def format_organize_notify(
         msg += f"📦 <b>整理方式</b>：{action}"
 
     return msg
+
+
+def _html_escape(value: Any) -> str:
+    """转义 HTML 特殊字符，避免文件名中的 <>& 破坏 Telegram HTML。"""
+    text = "" if value is None else str(value)
+    return (
+        text.replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+    )
+
+
+def _format_bytes(size: Any) -> str:
+    """将字节数格式化为可读大小；无效值返回空串。"""
+    try:
+        n = int(size or 0)
+    except (TypeError, ValueError):
+        return ""
+    if n <= 0:
+        return ""
+    if n < 1024:
+        return f"{n} B"
+    if n < 1024 ** 2:
+        return f"{n / 1024:.1f} KB"
+    if n < 1024 ** 3:
+        return f"{n / 1024 ** 2:.1f} MB"
+    return f"{n / 1024 ** 3:.2f} GB"
+
+
+def _line(emoji: str, label: str, value: Any) -> str:
+    """构建统一字段行：emoji + 加粗标签 + 值。"""
+    return f"{emoji} <b>{_html_escape(label)}</b>：{_html_escape(value)}"
+
+
+def format_share_add_notify(
+    success: bool,
+    *,
+    share_name: str = "",
+    file_count: int = 0,
+    total_size: Any = 0,
+    source_id: Any = None,
+    share_code: str = "",
+    error: str = "",
+) -> str:
+    """格式化「115 分享链接添加」通知，与离线转存模板字段风格一致。"""
+    if not success:
+        lines = [
+            "❌ <b>分享添加失败</b>",
+            "",
+            _line("📝", "原因", error or "未知错误"),
+        ]
+        if share_name:
+            lines.append(_line("📦", "名称", share_name))
+        if share_code:
+            lines.append(_line("🔗", "分享码", share_code))
+        return "\n".join(lines)
+
+    lines = [
+        "✅ <b>分享添加成功</b>",
+        "",
+        _line("📦", "名称", share_name or "-"),
+        _line("📁", "文件数", f"{int(file_count or 0)} 个"),
+    ]
+    size_str = _format_bytes(total_size)
+    if size_str:
+        lines.append(_line("💾", "大小", size_str))
+    lines.append(_line("🔗", "类型", "115 分享"))
+    if source_id is not None and str(source_id) != "":
+        lines.append(_line("🆔", "来源 ID", source_id))
+    if share_code:
+        lines.append(_line("🔖", "分享码", share_code))
+    return "\n".join(lines)
+
+
+def format_offline_add_notify(
+    success: bool,
+    *,
+    accepted: int = 0,
+    total: int = 0,
+    exists: int = 0,
+    failed: int = 0,
+    save_path: str = "",
+    items: Optional[Sequence[Dict[str, Any]]] = None,
+    error: str = "",
+) -> str:
+    """格式化「ed2k / magnet 离线转存」通知，与分享添加模板字段风格一致。"""
+    items = list(items or [])
+    exists = int(exists or 0)
+    accepted = int(accepted or 0)
+    total = int(total or 0) or len(items)
+    failed = int(failed or 0)
+
+    if not success:
+        # 任务已存在类错误，用中性提示而非失败红叉
+        err = error or "未知错误"
+        if any(k in str(err) for k in ("任务已存在", "重复的链接", "请勿输入重复")):
+            title = "ℹ️ <b>离线任务已存在</b>"
+        else:
+            title = "❌ <b>离线转存失败</b>"
+        lines = [title, "", _line("📝", "原因", err)]
+        if save_path:
+            lines.append(_line("📂", "保存路径", save_path))
+        return "\n".join(lines)
+
+    if exists and exists == accepted and failed == 0:
+        title = f"ℹ️ <b>离线任务已存在</b> {accepted}/{total}"
+    elif exists:
+        title = f"✅ <b>离线转存已提交</b> {accepted}/{total}（其中已存在 {exists}）"
+    else:
+        title = f"✅ <b>离线转存已提交</b> {accepted}/{total}"
+
+    lines = [title, ""]
+
+    # 单条时突出名称，与分享添加「名称」行对齐
+    if total == 1 and items:
+        only = items[0]
+        name = only.get("name") or only.get("url_type") or "link"
+        if only.get("renamed"):
+            name = f"{name}（已恢复空格文件名）"
+        elif only.get("rename_pending"):
+            name = f"{name}（下载完成后将尝试恢复文件名）"
+        elif only.get("status") == "exists":
+            name = f"{name}（任务已存在）"
+        lines.append(_line("📦", "名称", name))
+    else:
+        lines.append(_line("📦", "数量", f"{accepted}/{total}"))
+
+    if save_path:
+        lines.append(_line("📂", "保存路径", save_path or "-"))
+
+    types = sorted({
+        str(x.get("url_type") or "").lower()
+        for x in items
+        if x.get("url_type")
+    })
+    if types:
+        lines.append(_line("🔗", "类型", " / ".join(types)))
+    else:
+        lines.append(_line("🔗", "类型", "离线转存"))
+
+    if failed:
+        lines.append(_line("⚠️", "失败", f"{failed} 条"))
+
+    # 多条时输出明细；单条失败时也补一行错误，避免只有标题
+    show_detail = total > 1 or (
+        total == 1 and items and not items[0].get("ok")
+    )
+    if show_detail and items:
+        lines.append("")
+        lines.append("📄 <b>明细</b>：")
+        for item in items[:5]:
+            name = _html_escape(item.get("name") or item.get("url_type") or "link")
+            extra = ""
+            if item.get("renamed"):
+                extra = "（已恢复空格文件名）"
+            elif item.get("rename_pending"):
+                extra = "（下载完成后将尝试恢复文件名）"
+            if item.get("status") == "exists":
+                lines.append(f"  • 已存在 {name}{extra}")
+            elif item.get("ok"):
+                lines.append(f"  ✓ {name}{extra}")
+            else:
+                err = _html_escape(item.get("error") or "失败")
+                lines.append(f"  ✗ {name}: {err}")
+        if len(items) > 5:
+            lines.append(f"  … 共 {len(items)} 条")
+
+    return "\n".join(lines)
+
+def format_task_summary_notify(
+    *,
+    task_name: str,
+    success: bool,
+    result: Optional[Dict[str, Any]] = None,
+) -> str:
+    """格式化定时任务结束汇总通知。
+
+    视觉与手动整理通知（format_organize_notify）保持一致：
+    首行状态标题 + 空行 + emoji 加粗字段行。
+    云盘整理成功项本身走 format_organize_notify，通常不再调用本函数。
+    """
+    data = result or {}
+    name = (task_name or "定时任务").strip() or "定时任务"
+    trigger = str(data.get("trigger") or "manual")
+    trigger_label = {
+        "manual": "手动执行",
+        "scheduled": "定时调度",
+        "cron": "定时调度",
+    }.get(trigger, trigger)
+
+    # 与 format_organize_notify 一致的标题风格
+    if success:
+        msg = f"✅ <b>{_html_escape(name)}完成</b>\n\n"
+    else:
+        msg = (
+            f"━━━━━━━━━━━━━━━━\n"
+            f"  ❌  {_html_escape(name)}失败\n"
+            f"━━━━━━━━━━━━━━━━\n\n"
+        )
+
+    message = data.get("message") or ("完成" if success else "执行失败")
+    msg += f"📋 <b>结果</b>：{_html_escape(message)}\n"
+    msg += f"⏱ <b>触发</b>：{_html_escape(trigger_label)}\n"
+
+    success_count = data.get("success_count")
+    skipped = data.get("skipped")
+    failed = data.get("failed")
+    scanned = data.get("scanned")
+
+    if success_count is not None:
+        msg += f"✅ <b>成功</b>：{int(success_count or 0)} 个\n"
+    if skipped is not None and int(skipped or 0) > 0:
+        msg += f"⏭ <b>跳过</b>：{int(skipped or 0)} 个\n"
+    if failed is not None and int(failed or 0) > 0:
+        msg += f"⚠️ <b>失败</b>：{int(failed or 0)} 个\n"
+    if scanned is not None:
+        msg += f"🔍 <b>扫描</b>：{int(scanned or 0)} 个视频\n"
+
+    source_path = data.get("source_path")
+    media_path = data.get("media_library_path")
+    if source_path:
+        msg += f"📁 <b>来源</b>：{_html_escape(source_path)}\n"
+    if media_path:
+        msg += f"📚 <b>媒体库</b>：{_html_escape(media_path)}\n"
+
+    # 整理方式（与手动整理字段对齐，有则显示）
+    organize_mode = data.get("organize_mode")
+    if organize_mode:
+        mode_label = {"move": "移动", "copy": "复制"}.get(str(organize_mode), str(organize_mode))
+        msg += f"📦 <b>整理方式</b>：{_html_escape(mode_label)}\n"
+
+    errors = data.get("errors") or []
+    if isinstance(errors, list) and errors:
+        msg += "\n📎 <b>明细</b>：\n"
+        for item in errors[:5]:
+            if isinstance(item, dict):
+                n = _html_escape(item.get("name") or "-")
+                reason = _html_escape(item.get("reason") or item.get("error") or "未知")
+                msg += f"  • {n}: {reason}\n"
+            else:
+                msg += f"  • {_html_escape(item)}\n"
+        if len(errors) > 5:
+            msg += f"  … 共 {len(errors)} 条\n"
+
+    return msg.rstrip()

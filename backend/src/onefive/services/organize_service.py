@@ -64,6 +64,8 @@ class OrganizeService:
         # 子线程无法通过 asyncio.get_event_loop() 获取循环，
         # 必须在主线程初始化时保存引用
         self._main_loop: Optional[asyncio.AbstractEventLoop] = None
+        # 批量场景可置 True 抑制逐条通知；云盘整理默认不压制，走手动整理同款模板
+        self._suppress_notify: bool = False
 
     def recognize_file(self, file_info: Dict[str, Any],
                        folder_files: Optional[List[str]] = None) -> Dict[str, Any]:
@@ -836,6 +838,8 @@ class OrganizeService:
         直接用 asyncio.create_task 会报 RuntimeError。
         通过 run_coroutine_threadsafe 提交到主线程事件循环。
         """
+        if getattr(self, "_suppress_notify", False):
+            return
         coro = self._send_notify(**notify_kwargs)
         # 优先使用初始化时保存的主线程事件循环
         loop = self._main_loop

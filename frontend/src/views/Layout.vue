@@ -53,6 +53,13 @@
           </svg>
           <span>分享洗版</span>
         </router-link>
+        <router-link to="/tasks" class="nav-item" @click="showSidebar = false">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <circle cx="12" cy="12" r="9"/>
+            <polyline points="12 7 12 12 15 14"/>
+          </svg>
+          <span>定时任务</span>
+        </router-link>
         <router-link to="/settings" class="nav-item" @click="showSidebar = false">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
             <circle cx="12" cy="12" r="3" />
@@ -174,6 +181,7 @@ const currentTitle = computed(() => {
     'Files': '文件管理',
     'Share': '分享管理',
     'ShareWash': '分享洗版',
+    'Tasks': '定时任务',
     'Settings': '设置',
     'About': '关于'
   }

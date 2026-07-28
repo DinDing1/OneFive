@@ -47,6 +47,7 @@ MODULE_NAMES = {
     "onefive.api.notification": "通知",
     "onefive.api.direct_link": "直链",
     "onefive.api.offline": "离线转存",
+    "onefive.api.tasks": "定时任务",
 
     # ---- Services ----
     "onefive.services.auth_service": "认证",
@@ -68,6 +69,14 @@ MODULE_NAMES = {
     "onefive.services.offline_link_parser": "离线解析",
     "onefive.services.p115_client_factory": "115客户端",
     "onefive.services.quality_score": "质量评分",
+
+    # ---- 定时任务 ----
+    "onefive.scheduler": "定时任务",
+    "onefive.scheduler.service": "定时任务",
+    "onefive.scheduler.cronutil": "定时任务",
+    "onefive.scheduler.registry": "定时任务",
+    "onefive.scheduler.runners.auto_organize": "云盘整理",
+    "onefive.scheduler.runners.base": "定时任务",
 
     # ---- 通知 ----
     "onefive.notification": "通知",

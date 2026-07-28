@@ -14,6 +14,7 @@ dependencies = [
     "guessit>=3.8.0",
     "telethon>=1.36.0",
     "python-socks[asyncio]>=2.0.0",
+    "apscheduler>=3.10,<4",
 ]
 
 [project.optional-dependencies]
