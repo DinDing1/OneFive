@@ -394,14 +394,16 @@ class StrmService:
                 })
                 return "failed"
 
-            # 跳过已存在且内容相同的 STRM 文件，避免重复写入
+            # skip existing identical STRM; size check first to cut IO
+            # 跳过已存在且内容相同的 STRM；先比大小再读全文
             if full_path.exists():
                 try:
-                    existing = full_path.read_text(encoding="utf-8")
+                    if full_path.stat().st_size == len(url.encode("utf-8")):
+                        existing = full_path.read_text(encoding="utf-8")
+                        if existing == url:
+                            return "skipped"
                 except Exception:
-                    existing = ""
-                if existing == url:
-                    return "skipped"
+                    pass
 
             full_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -555,21 +557,23 @@ class StrmService:
     # ==================== 云盘 STRM 生成 ====================
 
     def _iter_cloud_files_with_path(self, cid: int, current_path: str):
-        """遍历云盘目录，生成带完整路径的文件信息
+        """流式遍历云盘目录，生成带完整路径的文件信息。
 
-        FileService.iter_all_files_strm 使用 iter_files_with_path_skim 获取
-        name/pickcode/path，本方法只负责透传字段。
+        直接透传 FileService.iter_all_files_strm 生成器，禁止再 list 化整库结果，
+        以便大媒体库边扫边写 STRM，控制内存峰值。
         """
         try:
             file_service = get_file_service()
-            items = file_service.iter_all_files_strm(cid)
-            logger.info(f"云盘 STRM 扁平扫描结果: cid={cid}, path={current_path}, files={len(items)}")
-            for item in items:
+            logger.info(f"云盘 STRM 开始流式扫描: cid={cid}, path={current_path or '/'}")
+            for item in file_service.iter_all_files_strm(cid):
                 name = item.get("name", "")
                 pick_code = item.get("pick_code", "")
                 rel_path = item.get("path") or name
                 if not name or not pick_code or not rel_path:
-                    logger.warning(f"云盘 STRM 跳过无效文件: root_cid={cid}, root_path={current_path}, raw={item}")
+                    logger.warning(
+                        f"云盘 STRM 跳过无效文件: root_cid={cid}, "
+                        f"root_path={current_path}, raw={item}"
+                    )
                     continue
                 yield {
                     "name": name,
@@ -773,9 +777,24 @@ class StrmService:
         # 大库扫描本身可能很久，先推一次进度，再在写入阶段持续心跳式上报
         for file_row in self._iter_cloud_files_with_path(root_cid, media_library_path):
             scanned += 1
-            if progress and scanned == 1:
-                emit("scan", 12, "已开始遍历云盘文件，过滤视频并写入 STRM…")
-
+            if progress and (
+                scanned == 1
+                or scanned % 500 == 0
+                or (scanned > 1 and time.time() - last_emit >= 1.5)
+            ):
+                # 扫描阶段心跳：大库非视频也要持续推进度，避免前端久不动
+                pct = min(14, 5 + int((scanned ** 0.5) * 0.15))
+                emit(
+                    "scan",
+                    pct,
+                    f"扫描云盘文件：已遍历 {scanned}（视频 {total}）",
+                    scanned=scanned,
+                    total=total,
+                    created=created,
+                    skipped=skipped,
+                    failed=failed,
+                )
+                last_emit = time.time()
             name = file_row.get("name", "")
             pick_code = file_row.get("pick_code", "")
             file_path = file_row.get("path", "")
@@ -801,7 +820,7 @@ class StrmService:
 
             url = self._build_cloud_strm_url(base_url, name, pick_code)
             # 错误上报用的标识
-            file_id = file_row.get("id") or file_row.get("fid") or ""
+            file_id = file_row.get("file_id") or file_row.get("id") or file_row.get("fid") or ""
 
             # 公共写入逻辑：校验→跳过→创建→写入→异常收集
             result = self._write_strm_file(output_root, rel_path, url, file_id, name, errors)

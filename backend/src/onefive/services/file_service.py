@@ -12,7 +12,7 @@
 - list_files 例外：直接调用 client.fs_files 原生 API 以保证分页语义准确
 """
 import time
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, Iterator
 
 from p115client import P115Client, P115OpenClient
 from p115client.exception import P115BusyOSError
@@ -373,27 +373,35 @@ class FileService:
                 result.append(self._parse_file_item(f))
         return result
 
-    def iter_all_files_strm(self, cid: int = 0) -> List[Dict[str, Any]]:
-        """使用 p115client.tool.iterdir.iter_files_with_path_skim 遍历云盘 STRM 文件
+    def iter_all_files_strm(self, cid: int = 0) -> Iterator[Dict[str, Any]]:
+        """流式遍历云盘文件，供云盘 STRM 生成使用。
 
-        该函数通过下载清单接口一次返回 name/pickcode/path，适合生成云盘 STRM。
-        需要 P115Client（Web Cookie），OpenAPI 客户端不支持。
+        使用 p115client.tool.iterdir.iter_files_with_path_skim：
+        - 一次拿到 name / pickcode / path，适合边扫边写 STRM
+        - 需要 P115Client（Web Cookie），OpenAPI 客户端不支持
+
+        内存要点：
+        - 禁止整库 list 物化；调用方应边迭代边处理
+        - id_to_dirnode=... 使用局部目录表，避免写入进程级 ID_TO_DIRNODE_CACHE
+        - 只 yield 生成 STRM 所需的精简字段
         """
         client = self._get_client()
         if not isinstance(client, P115Client):
             raise RuntimeError("iter_files_with_path_skim 需要 P115Client，请关闭 OpenAPI 后重试")
-
-        result: List[Dict[str, Any]] = []
         # max_workers=0 强制串行，降低并发风控概率
         app = "chrome"
         logger.info(
-            f"云盘 STRM 使用 iter_files_with_path_skim: cid={cid}, "
+            f"云盘 STRM 使用 iter_files_with_path_skim(流式): cid={cid}, "
             f"client={type(client).__name__}, app={app}"
         )
+
+        yielded = 0
+        # Ellipsis → p115client 内部新建局部 {} 目录表，生成结束后可被 GC
         for item in iter_files_with_path_skim(
             client,
             cid,
             escape=None,
+            id_to_dirnode=...,
             max_workers=0,
             app=app,
         ):
@@ -402,20 +410,19 @@ class FileService:
             path = str(item.get("path") or item.get("relpath") or name).strip("/")
             if not name or not pick_code or not path:
                 continue
-            result.append({
+
+            yielded += 1
+            if yielded == 1 or yielded % 2000 == 0:
+                logger.info(f"云盘 STRM 扫描进度: cid={cid}, files={yielded}")
+
+            yield {
                 "file_id": str(item.get("id") or item.get("file_id") or ""),
                 "name": name,
-                "is_dir": False,
-                "size": int(item.get("size") or item.get("file_size") or 0),
-                "file_type": item.get("file_type") or 0,
                 "pick_code": pick_code,
-                "parent_id": str(item.get("parent_id") or "0"),
-                "created_at": str(item.get("created_at") or ""),
-                "updated_at": str(item.get("updated_at") or ""),
                 "path": path,
-            })
-        logger.info(f"云盘 STRM iter_files_with_path_skim 完成: cid={cid}, files={len(result)}")
-        return result
+            }
+
+        logger.info(f"云盘 STRM iter_files_with_path_skim 完成: cid={cid}, files={yielded}")
 
     # ==================== 批量操作 ====================
 
