@@ -12,7 +12,7 @@
 - list_files 例外：直接调用 client.fs_files 原生 API 以保证分页语义准确
 """
 import time
-from typing import Optional, Dict, Any, List, Iterator
+from typing import Optional, Dict, Any, List, Iterator, Callable
 
 from p115client import P115Client, P115OpenClient
 from p115client.exception import P115BusyOSError
@@ -27,6 +27,8 @@ from p115client.tool import (
     update_name,
 )
 from p115client.tool.iterdir import iter_files_with_path_skim
+from p115client.tool.download import iter_download_nodes
+from p115client.tool.attr import get_ancestors
 
 from .p115_client_factory import get_p115_client_factory
 from ..logger import get_logger
@@ -373,56 +375,154 @@ class FileService:
                 result.append(self._parse_file_item(f))
         return result
 
-    def iter_all_files_strm(self, cid: int = 0) -> Iterator[Dict[str, Any]]:
+    def iter_all_files_strm(
+        self,
+        cid: int = 0,
+        on_scan_progress: Optional[Callable[[Dict[str, Any]], None]] = None,
+    ) -> Iterator[Dict[str, Any]]:
         """流式遍历云盘文件，供云盘 STRM 生成使用。
 
-        使用 p115client.tool.iterdir.iter_files_with_path_skim：
-        - 一次拿到 name / pickcode / path，适合边扫边写 STRM
-        - 需要 P115Client（Web Cookie），OpenAPI 客户端不支持
+        两阶段策略（解决飞牛大库卡在「扫描云盘媒体库」）：
+        1) 先拉目录树填充局部 id_to_dirnode，并推送目录阶段进度
+        2) path_already=True 再拉文件，立即 yield，避免 p115client
+           在目录未就绪时把全部文件塞进内部 cache
 
-        内存要点：
-        - 禁止整库 list 物化；调用方应边迭代边处理
-        - id_to_dirnode=... 使用局部目录表，避免写入进程级 ID_TO_DIRNODE_CACHE
-        - 只 yield 生成 STRM 所需的精简字段
+        需要 P115Client（Web Cookie），OpenAPI 客户端不支持。
         """
         client = self._get_client()
         if not isinstance(client, P115Client):
-            raise RuntimeError("iter_files_with_path_skim 需要 P115Client，请关闭 OpenAPI 后重试")
-        # max_workers=0 强制串行，降低并发风控概率
-        app = "chrome"
-        logger.info(
-            f"云盘 STRM 使用 iter_files_with_path_skim(流式): cid={cid}, "
-            f"client={type(client).__name__}, app={app}"
-        )
+            raise RuntimeError(
+                "iter_files_with_path_skim 需要 P115Client，请关闭 OpenAPI 后重试"
+            )
 
-        yielded = 0
-        # Ellipsis → p115client 内部新建局部 {} 目录表，生成结束后可被 GC
-        for item in iter_files_with_path_skim(
+        # 下载清单分页接口：适度并发加速首屏；过高易风控
+        max_workers = 8
+        file_app = "chrome"
+        # p115client 内部拉目录树固定走 os_windows
+        dir_app = "os_windows"
+
+        def _progress(payload: Dict[str, Any]) -> None:
+            if not on_scan_progress:
+                return
+            try:
+                on_scan_progress(payload)
+            except Exception:
+                pass
+
+        id_to_dirnode: Dict[int, tuple] = {}
+        t0 = time.time()
+        logger.info(
+            f"云盘 STRM 阶段1/目录树: cid={cid}, max_workers={max_workers}, app={dir_app}"
+        )
+        _progress({"phase": "dirs", "dirs": 0, "files": 0, "elapsed": 0.0, "message": "start_dirs"})
+
+        dir_count = 0
+        last_dir_log = 0.0
+        for _node in iter_download_nodes(
             client,
             cid,
-            escape=None,
-            id_to_dirnode=...,
-            max_workers=0,
-            app=app,
+            files=False,
+            id_to_dirnode=id_to_dirnode,
+            max_workers=max_workers,
+            app=dir_app,
         ):
-            name = item.get("name", "") or item.get("file_name", "")
-            pick_code = item.get("pickcode", "") or item.get("pick_code", "")
-            path = str(item.get("path") or item.get("relpath") or name).strip("/")
-            if not name or not pick_code or not path:
-                continue
+            dir_count += 1
+            now = time.time()
+            if dir_count == 1 or dir_count % 1000 == 0 or now - last_dir_log >= 1.5:
+                elapsed = now - t0
+                logger.info(
+                    f"云盘 STRM 目录树进度: cid={cid}, dirs={dir_count}, "
+                    f"map={len(id_to_dirnode)}, elapsed={elapsed:.1f}s"
+                )
+                _progress({
+                    "phase": "dirs",
+                    "dirs": dir_count,
+                    "files": 0,
+                    "map_size": len(id_to_dirnode),
+                    "elapsed": elapsed,
+                })
+                last_dir_log = now
 
-            yielded += 1
-            if yielded == 1 or yielded % 2000 == 0:
-                logger.info(f"云盘 STRM 扫描进度: cid={cid}, files={yielded}")
+        # 补齐顶层祖先（走 web，避免 chrome 端点在部分环境 405/卡死）
+        try:
+            get_ancestors(
+                client,
+                cid,
+                id_to_dirnode=id_to_dirnode,
+                ensure_file=False,
+                app="web",
+            )
+        except Exception as e:
+            logger.warning(f"云盘 STRM get_ancestors 失败（继续尝试绑定路径）: cid={cid}, {e}")
 
-            yield {
-                "file_id": str(item.get("id") or item.get("file_id") or ""),
-                "name": name,
-                "pick_code": pick_code,
-                "path": path,
-            }
+        t_dirs = time.time() - t0
+        logger.info(
+            f"云盘 STRM 目录树完成: cid={cid}, dirs={dir_count}, "
+            f"map={len(id_to_dirnode)}, elapsed={t_dirs:.1f}s"
+        )
+        _progress({
+            "phase": "dirs_done",
+            "dirs": dir_count,
+            "files": 0,
+            "map_size": len(id_to_dirnode),
+            "elapsed": t_dirs,
+        })
 
-        logger.info(f"云盘 STRM iter_files_with_path_skim 完成: cid={cid}, files={yielded}")
+        # 阶段2：路径已就绪，文件清单立即流式 yield
+        logger.info(
+            f"云盘 STRM 阶段2/文件清单: cid={cid}, max_workers={max_workers}, "
+            f"app={file_app}, path_already=True"
+        )
+        yielded = 0
+        t_files0 = time.time()
+        try:
+            for item in iter_files_with_path_skim(
+                client,
+                cid,
+                escape=None,
+                id_to_dirnode=id_to_dirnode,
+                path_already=True,
+                max_workers=max_workers,
+                app=file_app,
+            ):
+                name = item.get("name", "") or item.get("file_name", "")
+                pick_code = item.get("pickcode", "") or item.get("pick_code", "")
+                path = str(item.get("path") or item.get("relpath") or name).strip("/")
+                if not name or not pick_code or not path:
+                    continue
+
+                yielded += 1
+                if yielded == 1:
+                    logger.info(
+                        f"云盘 STRM 首个文件已出站: cid={cid}, "
+                        f"after_dirs={t_dirs:.1f}s, name={name}"
+                    )
+                if yielded == 1 or yielded % 2000 == 0:
+                    elapsed = time.time() - t0
+                    logger.info(
+                        f"云盘 STRM 文件扫描进度: cid={cid}, files={yielded}, elapsed={elapsed:.1f}s"
+                    )
+                    _progress({
+                        "phase": "files",
+                        "dirs": dir_count,
+                        "files": yielded,
+                        "elapsed": elapsed,
+                    })
+
+                yield {
+                    "file_id": str(item.get("id") or item.get("file_id") or ""),
+                    "name": name,
+                    "pick_code": pick_code,
+                    "path": path,
+                }
+        finally:
+            # 释放局部目录表，避免生成结束后仍占内存
+            id_to_dirnode.clear()
+
+        logger.info(
+            f"云盘 STRM 扫描完成: cid={cid}, dirs={dir_count}, files={yielded}, "
+            f"elapsed={time.time() - t0:.1f}s, files_phase={time.time() - t_files0:.1f}s"
+        )
 
     # ==================== 批量操作 ====================
 

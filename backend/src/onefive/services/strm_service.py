@@ -556,16 +556,26 @@ class StrmService:
 
     # ==================== 云盘 STRM 生成 ====================
 
-    def _iter_cloud_files_with_path(self, cid: int, current_path: str):
+    def _iter_cloud_files_with_path(
+        self,
+        cid: int,
+        current_path: str,
+        on_scan_progress=None,
+    ):
         """流式遍历云盘目录，生成带完整路径的文件信息。
 
-        直接透传 FileService.iter_all_files_strm 生成器，禁止再 list 化整库结果，
-        以便大媒体库边扫边写 STRM，控制内存峰值。
+        透传 FileService.iter_all_files_strm 两阶段扫描（目录树 -> 文件清单），
+        并把 on_scan_progress 下传以便 SSE 能显示目录树进度。
         """
         try:
             file_service = get_file_service()
-            logger.info(f"云盘 STRM 开始流式扫描: cid={cid}, path={current_path or '/'}")
-            for item in file_service.iter_all_files_strm(cid):
+            logger.info(
+                f"云盘 STRM 开始流式扫描: cid={cid}, path={current_path or '/'}"
+            )
+            for item in file_service.iter_all_files_strm(
+                cid,
+                on_scan_progress=on_scan_progress,
+            ):
                 name = item.get("name", "")
                 pick_code = item.get("pick_code", "")
                 rel_path = item.get("path") or name
@@ -583,6 +593,7 @@ class StrmService:
                 }
         except Exception as e:
             logger.error(f"云盘目录遍历失败: cid={cid}, path={current_path}, {e}")
+            raise
 
     def _resolve_cid_by_path(self, path: str) -> Optional[int]:
         """将云盘路径字符串转为 cid
@@ -757,7 +768,7 @@ class StrmService:
         emit(
             "scan",
             5,
-            f"扫描云盘媒体库（cid={root_cid}）…",
+            f"正在拉取 115 目录树（cid={root_cid}）…",
             media_library_path=media_library_path or "/",
             root_cid=root_cid,
         )
@@ -772,18 +783,64 @@ class StrmService:
         errors: List[Dict] = []
         last_emit = 0.0
         scanned = 0
+        dir_count_seen = 0
 
-        # 遍历云盘目录（iter_files_with_path_skim 一次拉取 name/pickcode/path）
-        # 大库扫描本身可能很久，先推一次进度，再在写入阶段持续心跳式上报
-        for file_row in self._iter_cloud_files_with_path(root_cid, media_library_path):
+        def on_scan_progress(evt: Dict[str, Any]) -> None:
+            """把 FileService 两阶段扫描进度转发为 SSE，避免飞牛端卡在首条提示。"""
+            nonlocal last_emit, dir_count_seen
+            if not progress:
+                return
+            phase = str(evt.get("phase") or "")
+            dirs = int(evt.get("dirs") or 0)
+            files = int(evt.get("files") or 0)
+            elapsed = float(evt.get("elapsed") or 0.0)
+            dir_count_seen = max(dir_count_seen, dirs)
+            now = time.time()
+            # 目录阶段至少 1.2s 推一次；文件阶段由主循环报
+            if phase in ("dirs", "dirs_done"):
+                if phase != "dirs_done" and now - last_emit < 1.2 and dirs not in (0, 1) and dirs % 1000 != 0:
+                    return
+                pct = 6 if phase == "dirs" else 12
+                if dirs > 0:
+                    pct = min(12, 6 + int((dirs ** 0.5) * 0.08))
+                msg = (
+                    f"正在拉取 115 目录树：已获取 {dirs} 个目录"
+                    f"（{elapsed:.0f}s）…"
+                )
+                if phase == "dirs_done":
+                    msg = (
+                        f"目录树完成（{dirs} 个，{elapsed:.0f}s），"
+                        f"开始流式拉取文件清单…"
+                    )
+                    pct = 12
+                emit("scan", pct, msg, dirs=dirs, scanned=files, elapsed=elapsed, root_cid=root_cid)
+                last_emit = now
+            elif phase == "files" and files:
+                # 首批文件到达时提示一下；细节由主循环继续
+                if files == 1 or now - last_emit >= 1.5:
+                    emit(
+                        "scan",
+                        14,
+                        f"已开始流式扫描文件：{files}（目录 {dir_count_seen}）",
+                        dirs=dir_count_seen,
+                        scanned=files,
+                        elapsed=elapsed,
+                    )
+                    last_emit = now
+
+        # 两阶段流式扫描：先目录树（有进度），再 path_already 文件清单
+        for file_row in self._iter_cloud_files_with_path(
+            root_cid,
+            media_library_path,
+            on_scan_progress=on_scan_progress,
+        ):
             scanned += 1
             if progress and (
                 scanned == 1
                 or scanned % 500 == 0
                 or (scanned > 1 and time.time() - last_emit >= 1.5)
             ):
-                # 扫描阶段心跳：大库非视频也要持续推进度，避免前端久不动
-                pct = min(14, 5 + int((scanned ** 0.5) * 0.15))
+                pct = min(14, 12 + int((scanned ** 0.5) * 0.05))
                 emit(
                     "scan",
                     pct,
@@ -793,6 +850,7 @@ class StrmService:
                     created=created,
                     skipped=skipped,
                     failed=failed,
+                    dirs=dir_count_seen,
                 )
                 last_emit = time.time()
             name = file_row.get("name", "")
