@@ -83,6 +83,8 @@ def _collect_videos_deep(
                     continue
                 row = dict(item)
                 row["_rel_path"] = f"{rel}/{name}" if rel else name
+                # 记录直属父目录，移动整理后用于清理空文件夹
+                row["_parent_cid"] = str(cur_cid)
                 results.append(row)
 
     return results
@@ -198,6 +200,7 @@ def run(trigger: str = "manual") -> Dict[str, Any]:
                     "tmdb_rating": recog.get("tmdb_rating") or 0,
                     "tech_info": recog.get("tech_info") or {},
                 },
+                source_parent_id=str(item.get("_parent_cid") or "") or None,
             )
             if result.get("success"):
                 success_count += 1
@@ -247,6 +250,15 @@ def run(trigger: str = "manual") -> Dict[str, Any]:
             f"（扫描 {total_found} 个）"
         )
         ok = True
+
+    # 移动模式兜底：再清一遍保存路径下残留空目录（不删待整理自身）
+    if organize_mode != "copy" and success_count > 0:
+        try:
+            pruned = organize_service.prune_empty_dirs_under(scan_cid)
+            if pruned:
+                logger.info(f"云盘整理空目录兜底清理: {pruned} 个")
+        except Exception as e:
+            logger.warning(f"云盘整理空目录兜底清理失败: {e}")
 
     logger.info(f"云盘整理结束: {message}")
     # 汇总通知关闭：成功项已按手动整理模板逐条发送

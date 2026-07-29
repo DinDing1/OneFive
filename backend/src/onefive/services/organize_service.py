@@ -321,7 +321,8 @@ class OrganizeService:
                          category: str = "",
                          target_title: str = "",
                          tmdb_id: int = 0,
-                         media_info: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+                         media_info: Optional[Dict[str, Any]] = None,
+                         source_parent_id: Optional[str] = None) -> Dict[str, Any]:
         """执行整理：创建目录 → 移动/复制 → 重命名
 
         完整路径 = 媒体库路径 + 分类 + target_path.dir
@@ -335,6 +336,7 @@ class OrganizeService:
             category: 分类路径，如 "电影/国产电影"
             target_title: TMDB 中文标题（用于内部文件重命名）
             tmdb_id: TMDB ID（用于内部文件重命名）
+            source_parent_id: 移动前父目录 ID（可选；移动成功后用于清理空目录）
         """
         dir_path = target_path.get("dir", "")
         target_filename = target_path.get("filename", "")
@@ -367,6 +369,15 @@ class OrganizeService:
             logger.info(f"目标目录就绪: {full_dir} (cid={target_cid})")
 
             # 步骤2：移动或复制文件
+            # 移动前记录原父目录，便于事后清理「待整理」下因挪走视频留下的空文件夹
+            parent_for_cleanup: Optional[str] = None
+            if organize_mode != "copy":
+                parent_for_cleanup = (
+                    str(source_parent_id).strip()
+                    if source_parent_id not in (None, "")
+                    else self.file_service.get_parent_id(file_id)
+                )
+
             file_ids = [file_id]
             if organize_mode == "copy":
                 self.file_service.copy_files(file_ids, str(target_cid))
@@ -502,6 +513,11 @@ class OrganizeService:
             # 异步发送通知（不阻塞返回）
             # execute_organize 在线程池中执行，没有运行中的事件循环，
             # 必须用 run_coroutine_threadsafe 提交到主线程事件循环
+            # 移动模式：清理原路径上的空文件夹（不删除「待整理」本身）
+            cleaned_dirs = 0
+            if organize_mode != "copy" and parent_for_cleanup:
+                cleaned_dirs = self.cleanup_empty_ancestors(parent_for_cleanup)
+
             self._submit_notify(
                 success=True, file_name=file_name,
                 title=target_title or file_name, category=category,
@@ -509,14 +525,18 @@ class OrganizeService:
                 media_info=media_info or {},
             )
 
+            details = {
+                "action": action,
+                "target_dir": full_dir,
+                "target_filename": target_filename or file_name,
+            }
+            if cleaned_dirs:
+                details["cleaned_empty_dirs"] = cleaned_dirs
+
             return {
                 "success": True,
                 "message": f"整理完成：已{action}到 {full_dir}",
-                "details": {
-                    "action": action,
-                    "target_dir": full_dir,
-                    "target_filename": target_filename or file_name,
-                }
+                "details": details,
             }
 
         except Exception as e:
@@ -528,6 +548,127 @@ class OrganizeService:
                 media_info=media_info or {},
             )
             return {"success": False, "message": f"整理失败: {str(e)}"}
+
+    def cleanup_empty_ancestors(
+        self,
+        start_cid: str | int,
+        stop_cid: Optional[str | int] = None,
+    ) -> int:
+        """从 start_cid 向上删除空祖先目录，直到 stop_cid（不含）或无法再删。
+
+        规则：
+        - 仅删除“当前完全为空”的目录（有 nfo/jpg/子项则停止）
+        - 不删除 stop_cid 自身；stop 缺省取配置 source_cid（待整理）
+        - 未提供 stop 时，最多只尝试删除 start 自身一层
+        - 根目录 / 0 永不删除
+        """
+        try:
+            cur = str(int(start_cid))
+        except (TypeError, ValueError):
+            return 0
+
+        if stop_cid is None:
+            stop_cid = (self.config_service.get("source_cid") or "").strip()
+        try:
+            stop_s = str(int(stop_cid)) if str(stop_cid).strip() not in ("", "None") else ""
+        except (TypeError, ValueError):
+            stop_s = str(stop_cid).strip() if stop_cid not in (None, "") else ""
+
+        deleted = 0
+        seen: set[str] = set()
+        # 有 stop 时最多向上 32 层；无 stop 时只处理 start 自身
+        max_steps = 32 if stop_s else 1
+        # 115 移动后元数据偶发延迟，稍等再判断是否为空
+        time.sleep(0.3)
+
+        for _ in range(max_steps):
+            if not cur or cur == "0" or cur in seen:
+                break
+            seen.add(cur)
+            # 到达待整理（或指定 stop）本层即停止，不删该层
+            if stop_s and cur == stop_s:
+                break
+
+            empty = False
+            # 空目录判断失败时保守处理：不删
+            for attempt in range(2):
+                try:
+                    empty = self.file_service.is_dir_empty(cur)
+                except Exception as e:
+                    logger.warning(f"检查空目录失败: cid={cur}, err={e}")
+                    empty = False
+                    break
+                if empty:
+                    break
+                if attempt == 0:
+                    time.sleep(0.5)
+            if not empty:
+                break
+
+            parent = self.file_service.get_parent_id(cur)
+            try:
+                self.file_service.delete_files([cur])
+                deleted += 1
+                logger.info(f"删除空目录: cid={cur}")
+            except Exception as e:
+                logger.warning(f"删除空目录失败: cid={cur}, err={e}")
+                break
+
+            if not parent or parent == "0":
+                break
+            # 继续向上检查 parent（下一轮若等于 stop 会 break）
+            cur = str(parent)
+
+        if deleted:
+            logger.info(f"空祖先目录清理完成: deleted={deleted}, stop_cid={stop_s or '-'}")
+        return deleted
+
+    def prune_empty_dirs_under(self, root_cid: str | int) -> int:
+        """递归清理 root 下所有空目录，不删除 root 自身。
+
+        用于批量云盘整理结束后做一次兜底清扫。
+        """
+        try:
+            root = int(root_cid)
+        except (TypeError, ValueError):
+            return 0
+        if root == 0:
+            return 0
+
+        deleted = 0
+
+        def _walk(cid: int, is_root: bool) -> None:
+            nonlocal deleted
+            try:
+                items = self.file_service.iter_all_files(cid)
+            except Exception as e:
+                logger.warning(f"遍历清理空目录失败: cid={cid}, err={e}")
+                return
+
+            for item in items:
+                if not item.get("is_dir"):
+                    continue
+                try:
+                    sub_id = int(item.get("file_id"))
+                except (TypeError, ValueError):
+                    continue
+                _walk(sub_id, False)
+
+            if is_root:
+                return
+            try:
+                if self.file_service.is_dir_empty(cid):
+                    self.file_service.delete_files([str(cid)])
+                    deleted += 1
+                    logger.info(f"兜底删除空目录: cid={cid}")
+            except Exception as e:
+                logger.warning(f"兜底删除空目录失败: cid={cid}, err={e}")
+
+        _walk(root, True)
+        if deleted:
+            logger.info(f"批量空目录兜底清理完成: root={root}, deleted={deleted}")
+        return deleted
+
 
     def _ensure_directory(self, dir_path: str) -> Optional[int]:
         """确保目录路径存在，使用 makedir 一次性创建多级目录

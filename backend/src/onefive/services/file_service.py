@@ -423,7 +423,7 @@ class FileService:
         # chrome 走明文 GET proapi.115.com/app/2.0/chrome/downfolders|downfiles
         app = "chrome"
         max_workers = 0
-        request_timeout = (10, 45)
+        request_timeout = 45  # urllib3_future 不支持 (connect, read) 元组
 
         id_to_dirnode: Dict[int, tuple] = {}
         t0 = time.time()
@@ -607,6 +607,44 @@ class FileService:
             f"files_phase={time.time() - t_files0:.1f}s"
         )
 
+
+
+    def is_dir_empty(self, cid: int | str) -> bool:
+        """判断目录是否为空（无任何直属文件/子目录）。
+
+        不确定或列举失败时返回 False，避免误删。
+        """
+        try:
+            cid_i = int(cid)
+        except (TypeError, ValueError):
+            return False
+        if cid_i == 0:
+            return False
+        try:
+            page = self.list_files(cid=cid_i, limit=1, offset=0)
+            items = page.get("items") or []
+            return len(items) == 0
+        except Exception as e:
+            logger.warning(f"检查目录是否为空失败: cid={cid}, err={e}")
+            return False
+
+    def get_parent_id(self, file_id: str | int) -> Optional[str]:
+        """获取文件/目录的父目录 ID。
+
+        使用 p115client.tool.attr.get_attr（含 parent_id），
+        比 get_info 更轻，且不统计整棵子树。
+        """
+        try:
+            from p115client.tool.attr import get_attr
+            client = self._get_client()
+            info = get_attr(client, file_id)
+            pid = info.get("parent_id")
+            if pid is None:
+                return None
+            return str(pid)
+        except Exception as e:
+            logger.warning(f"获取父目录失败: id={file_id}, err={e}")
+            return None
 
     def move_files(self, file_ids: List[str], to_cid: str) -> None:
         """批量移动文件/目录到目标目录
