@@ -402,6 +402,21 @@ class FileService:
         4) 显式 HTTP 超时，避免无超时永久挂起
         5) 首包前心跳进度，避免前端长期无反馈
         """
+        # 诊断：正式 FPK 打包的 p115client 版本/路径，便于核对是否为旧依赖
+        try:
+            import importlib.metadata as _imd
+            import p115client as _p115
+            _ver = None
+            try:
+                _ver = _imd.version("p115client")
+            except Exception:
+                _ver = getattr(_p115, "__version__", None)
+            logger.info(
+                f"云盘 STRM p115client 版本: {_ver}, file={getattr(_p115, '__file__', '')}"
+            )
+        except Exception as e:
+            logger.warning(f"云盘 STRM 读取 p115client 版本失败: {e}")
+
         client = self.client_factory.get_web_client()
         if not isinstance(client, P115Client):
             raise RuntimeError(

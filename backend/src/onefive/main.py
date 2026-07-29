@@ -80,6 +80,20 @@ async def lifespan(app: FastAPI):
     """应用生命周期管理"""
     logger.info("壹伍（OneFive）服务启动中...")
 
+    # 启动时打印关键依赖版本，便于飞牛正式包核对是否打进最新 p115client
+    try:
+        import importlib.metadata as _imd
+        import p115client as _p115
+        try:
+            _p115_ver = _imd.version("p115client")
+        except Exception:
+            _p115_ver = getattr(_p115, "__version__", "unknown")
+        logger.info(
+            f"依赖诊断: p115client={_p115_ver}, path={getattr(_p115, '__file__', '')}"
+        )
+    except Exception as e:
+        logger.warning(f"依赖诊断失败(p115client): {e}")
+
     # 通知渠道放到后台连接：网络/Telegram 超时不得阻塞 HTTP 就绪
     auto_connect_task = asyncio.create_task(
         _auto_connect_notifications(),
