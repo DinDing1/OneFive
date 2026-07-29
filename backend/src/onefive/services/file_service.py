@@ -11,7 +11,9 @@
 - fs_files_iter 支持自动分页目录列表
 - list_files 例外：直接调用 client.fs_files 原生 API 以保证分页语义准确
 """
+import threading
 import time
+from collections import deque
 from typing import Optional, Dict, Any, List, Iterator, Callable
 
 from p115client import P115Client, P115OpenClient
@@ -382,68 +384,144 @@ class FileService:
     ) -> Iterator[Dict[str, Any]]:
         """流式遍历云盘文件，供云盘 STRM 生成使用。
 
-        两阶段策略（解决飞牛大库卡在「扫描云盘媒体库」）：
-        1) 先拉目录树填充局部 id_to_dirnode，并推送目录阶段进度
-        2) path_already=True 再拉文件，立即 yield，避免 p115client
-           在目录未就绪时把全部文件塞进内部 cache
+        与其它路径的关键差异（也是飞牛卡住的根因所在）：
+        - 分享 STRM：只读本地 DB，不访问 115 清单
+        - 云盘整理：webapi.115.com 的 fs_files 分页
+        - 云盘 STRM：proapi.115.com 的 downfolders/downfiles 下载清单
 
-        需要 P115Client（Web Cookie），OpenAPI 客户端不支持。
+        p115client 默认 `iter_files_with_path_skim(path_already=False)` 会：
+        1) 后台用 app="os_windows" 拉全量目录树（/ufile/downfolders + ecdh_encrypt）
+        2) 目录未就绪前把文件结果塞进内存 cache，不对外 yield
+        3) 无 HTTP 超时 → 飞牛上 proapi 半开连接时会永久挂起
+        大媒体库（数万目录）时，前端长期停在「扫描云盘媒体库」，本地因网络/规模差异往往正常。
+
+        本实现显式两阶段，并针对飞牛差异做加固：
+        1) 强制 Web Cookie 客户端（download 清单不支持 OpenAPI 客户端）
+        2) 目录/文件统一 app=chrome，避免 os_windows 的 /ufile + ECDH
+        3) max_workers=0 串行，降低飞牛出网并发卡死
+        4) 显式 HTTP 超时，避免无超时永久挂起
+        5) 首包前心跳进度，避免前端长期无反馈
         """
-        client = self._get_client()
+        client = self.client_factory.get_web_client()
         if not isinstance(client, P115Client):
             raise RuntimeError(
-                "iter_files_with_path_skim 需要 P115Client，请关闭 OpenAPI 后重试"
+                "云盘 STRM 需要 P115Client（Web Cookie）。"
+                "请确认已登录；OpenAPI 客户端不支持 download 清单接口。"
             )
-
-        # 下载清单分页接口：适度并发加速首屏；过高易风控
-        max_workers = 8
-        file_app = "chrome"
-        # p115client 内部拉目录树固定走 os_windows
-        dir_app = "os_windows"
 
         def _progress(payload: Dict[str, Any]) -> None:
             if not on_scan_progress:
                 return
+            # 统一标记走 download/proapi 链路，便于前端与日志区分
+            payload = {"strategy": "download", **payload}
             try:
                 on_scan_progress(payload)
             except Exception:
                 pass
 
+        # 关键：不用 os_windows（/ufile/downfolders + ecdh_encrypt）
+        # chrome 走明文 GET proapi.115.com/app/2.0/chrome/downfolders|downfiles
+        app = "chrome"
+        max_workers = 0
+        request_timeout = (10, 45)
+
         id_to_dirnode: Dict[int, tuple] = {}
         t0 = time.time()
         logger.info(
-            f"云盘 STRM 阶段1/目录树: cid={cid}, max_workers={max_workers}, app={dir_app}"
+            f"云盘 STRM 阶段1/目录树: cid={cid}, app={app}, "
+            f"max_workers={max_workers}, timeout={request_timeout}, "
+            f"client=P115Client(web)"
         )
-        _progress({"phase": "dirs", "dirs": 0, "files": 0, "elapsed": 0.0, "message": "start_dirs"})
+        _progress({
+            "phase": "dirs",
+            "dirs": 0,
+            "files": 0,
+            "elapsed": 0.0,
+            "message": "start_dirs",
+            "waiting": True,
+        })
 
-        dir_count = 0
-        last_dir_log = 0.0
-        for _node in iter_download_nodes(
-            client,
-            cid,
-            files=False,
-            id_to_dirnode=id_to_dirnode,
-            max_workers=max_workers,
-            app=dir_app,
-        ):
-            dir_count += 1
-            now = time.time()
-            if dir_count == 1 or dir_count % 1000 == 0 or now - last_dir_log >= 1.5:
-                elapsed = now - t0
-                logger.info(
-                    f"云盘 STRM 目录树进度: cid={cid}, dirs={dir_count}, "
-                    f"map={len(id_to_dirnode)}, elapsed={elapsed:.1f}s"
-                )
+        stop_hb = threading.Event()
+        dir_count_box = {"n": 0}
+
+        def _heartbeat() -> None:
+            # 首包前每 2s 推一次，避免飞牛网关/前端看起来像死锁
+            while not stop_hb.wait(2.0):
+                elapsed = time.time() - t0
                 _progress({
                     "phase": "dirs",
-                    "dirs": dir_count,
+                    "dirs": dir_count_box["n"],
                     "files": 0,
                     "map_size": len(id_to_dirnode),
                     "elapsed": elapsed,
+                    "waiting": dir_count_box["n"] == 0,
                 })
-                last_dir_log = now
 
-        # 补齐顶层祖先（走 web，避免 chrome 端点在部分环境 405/卡死）
+        threading.Thread(
+            target=_heartbeat,
+            name=f"strm-dir-hb-{cid}",
+            daemon=True,
+        ).start()
+
+        dir_count = 0
+        last_dir_log = 0.0
+        try:
+            # pickcode 解析可能触发一次网络；先单独打点，区分「登录/解析」与「目录清单」
+            try:
+                t_sp = time.time()
+                _ = client.pickcode_stable_point
+                logger.info(
+                    f"云盘 STRM pickcode_stable_point 就绪: "
+                    f"{time.time() - t_sp:.1f}s"
+                )
+            except Exception as e:
+                logger.warning(
+                    f"云盘 STRM pickcode_stable_point 预热失败（继续）: {e}"
+                )
+
+            logger.info(
+                f"云盘 STRM 开始拉取目录树: cid={cid}, app={app}"
+            )
+            for _node in iter_download_nodes(
+                client,
+                cid,
+                files=False,
+                id_to_dirnode=id_to_dirnode,
+                max_workers=max_workers,
+                app=app,
+                timeout=request_timeout,
+            ):
+                dir_count += 1
+                dir_count_box["n"] = dir_count
+                now = time.time()
+                if dir_count == 1 or dir_count % 5000 == 0 or now - last_dir_log >= 3.0:
+                    elapsed = now - t0
+                    # 进度回调给前端；目录节点明细不再逐条刷日志
+                    if dir_count == 1 or dir_count % 5000 == 0:
+                        logger.info(
+                            f"云盘 STRM 目录树进度: cid={cid}, dirs={dir_count}, "
+                            f"elapsed={elapsed:.1f}s"
+                        )
+                    _progress({
+                        "phase": "dirs",
+                        "dirs": dir_count,
+                        "files": 0,
+                        "map_size": len(id_to_dirnode),
+                        "elapsed": elapsed,
+                        "waiting": False,
+                    })
+                    last_dir_log = now
+        except Exception as e:
+            logger.error(
+                f"云盘 STRM 目录树失败: cid={cid}, "
+                f"elapsed={time.time() - t0:.1f}s, "
+                f"err={type(e).__name__}: {e}"
+            )
+            raise
+        finally:
+            stop_hb.set()
+
+        # 补齐顶层祖先，保证相对路径可绑定；走 web 属性接口，不走 download 清单
         try:
             get_ancestors(
                 client,
@@ -451,9 +529,10 @@ class FileService:
                 id_to_dirnode=id_to_dirnode,
                 ensure_file=False,
                 app="web",
+                timeout=request_timeout,
             )
         except Exception as e:
-            logger.warning(f"云盘 STRM get_ancestors 失败（继续尝试绑定路径）: cid={cid}, {e}")
+            logger.warning(f"云盘 STRM get_ancestors 失败（继续）: cid={cid}, {e}")
 
         t_dirs = time.time() - t0
         logger.info(
@@ -468,10 +547,11 @@ class FileService:
             "elapsed": t_dirs,
         })
 
-        # 阶段2：路径已就绪，文件清单立即流式 yield
+        # 阶段2：path_already=True，避免 p115 再后台硬编码 os_windows 拉目录
         logger.info(
-            f"云盘 STRM 阶段2/文件清单: cid={cid}, max_workers={max_workers}, "
-            f"app={file_app}, path_already=True"
+            f"云盘 STRM 阶段2/文件清单: cid={cid}, app={app}, "
+            f"path_already=True, max_workers={max_workers}, "
+            f"path_ready=1"
         )
         yielded = 0
         t_files0 = time.time()
@@ -483,24 +563,26 @@ class FileService:
                 id_to_dirnode=id_to_dirnode,
                 path_already=True,
                 max_workers=max_workers,
-                app=file_app,
+                app=app,
+                timeout=request_timeout,
             ):
                 name = item.get("name", "") or item.get("file_name", "")
                 pick_code = item.get("pickcode", "") or item.get("pick_code", "")
-                path = str(item.get("path") or item.get("relpath") or name).strip("/")
-                if not name or not pick_code or not path:
+                path_s = str(item.get("path") or item.get("relpath") or name).strip("/")
+                if not name or not pick_code or not path_s:
                     continue
 
                 yielded += 1
                 if yielded == 1:
                     logger.info(
-                        f"云盘 STRM 首个文件已出站: cid={cid}, "
+                        f"云盘 STRM 首个文件出站: cid={cid}, "
                         f"after_dirs={t_dirs:.1f}s, name={name}"
                     )
                 if yielded == 1 or yielded % 2000 == 0:
                     elapsed = time.time() - t0
                     logger.info(
-                        f"云盘 STRM 文件扫描进度: cid={cid}, files={yielded}, elapsed={elapsed:.1f}s"
+                        f"云盘 STRM 文件进度: cid={cid}, files={yielded}, "
+                        f"elapsed={elapsed:.1f}s"
                     )
                     _progress({
                         "phase": "files",
@@ -513,7 +595,7 @@ class FileService:
                     "file_id": str(item.get("id") or item.get("file_id") or ""),
                     "name": name,
                     "pick_code": pick_code,
-                    "path": path,
+                    "path": path_s,
                 }
         finally:
             # 释放局部目录表，避免生成结束后仍占内存
@@ -521,10 +603,10 @@ class FileService:
 
         logger.info(
             f"云盘 STRM 扫描完成: cid={cid}, dirs={dir_count}, files={yielded}, "
-            f"elapsed={time.time() - t0:.1f}s, files_phase={time.time() - t_files0:.1f}s"
+            f"elapsed={time.time() - t0:.1f}s, "
+            f"files_phase={time.time() - t_files0:.1f}s"
         )
 
-    # ==================== 批量操作 ====================
 
     def move_files(self, file_ids: List[str], to_cid: str) -> None:
         """批量移动文件/目录到目标目录

@@ -564,8 +564,8 @@ class StrmService:
     ):
         """流式遍历云盘目录，生成带完整路径的文件信息。
 
-        透传 FileService.iter_all_files_strm 两阶段扫描（目录树 -> 文件清单），
-        并把 on_scan_progress 下传以便 SSE 能显示目录树进度。
+        透传 FileService.iter_all_files_strm（proapi 两阶段扫描），
+        可选下传 on_scan_progress 供 SSE 进度使用。
         """
         try:
             file_service = get_file_service()
@@ -768,7 +768,7 @@ class StrmService:
         emit(
             "scan",
             5,
-            f"正在拉取 115 目录树（cid={root_cid}）…",
+            f"准备扫描云盘媒体库（cid={root_cid}）…",
             media_library_path=media_library_path or "/",
             root_cid=root_cid,
         )
@@ -786,7 +786,7 @@ class StrmService:
         dir_count_seen = 0
 
         def on_scan_progress(evt: Dict[str, Any]) -> None:
-            """把 FileService 两阶段扫描进度转发为 SSE，避免飞牛端卡在首条提示。"""
+            """把 FileService 扫描进度转发为简洁 SSE（不暴露内部节点细节）。"""
             nonlocal last_emit, dir_count_seen
             if not progress:
                 return
@@ -796,32 +796,33 @@ class StrmService:
             elapsed = float(evt.get("elapsed") or 0.0)
             dir_count_seen = max(dir_count_seen, dirs)
             now = time.time()
-            # 目录阶段至少 1.2s 推一次；文件阶段由主循环报
+
+            # 目录阶段：只保留一条稳定文案，避免刷屏
             if phase in ("dirs", "dirs_done"):
-                if phase != "dirs_done" and now - last_emit < 1.2 and dirs not in (0, 1) and dirs % 1000 != 0:
+                if phase == "dirs" and now - last_emit < 2.0:
                     return
-                pct = 6 if phase == "dirs" else 12
-                if dirs > 0:
-                    pct = min(12, 6 + int((dirs ** 0.5) * 0.08))
-                msg = (
-                    f"正在拉取 115 目录树：已获取 {dirs} 个目录"
-                    f"（{elapsed:.0f}s）…"
-                )
-                if phase == "dirs_done":
-                    msg = (
-                        f"目录树完成（{dirs} 个，{elapsed:.0f}s），"
-                        f"开始流式拉取文件清单…"
-                    )
+                if phase == "dirs":
+                    pct = 8
+                    msg = f"正在扫描云盘媒体库（cid={root_cid}）…"
+                else:
                     pct = 12
-                emit("scan", pct, msg, dirs=dirs, scanned=files, elapsed=elapsed, root_cid=root_cid)
+                    msg = "正在扫描云盘文件…"
+                emit(
+                    "scan",
+                    pct,
+                    msg,
+                    dirs=dirs,
+                    scanned=files,
+                    elapsed=elapsed,
+                    root_cid=root_cid,
+                )
                 last_emit = now
             elif phase == "files" and files:
-                # 首批文件到达时提示一下；细节由主循环继续
                 if files == 1 or now - last_emit >= 1.5:
                     emit(
                         "scan",
                         14,
-                        f"已开始流式扫描文件：{files}（目录 {dir_count_seen}）",
+                        f"扫描云盘文件：已遍历 {files}",
                         dirs=dir_count_seen,
                         scanned=files,
                         elapsed=elapsed,
