@@ -69,8 +69,7 @@ jobs:
               apt-get update -qq && apt-get install -y -qq patchelf gcc > /dev/null &&
               pip install nuitka ordered-set --quiet &&
               pip install --no-cache-dir -U -r /build/requirements.txt &&
-              python -c 'import importlib.metadata as m; print("BUILD p115client", m.version("p115client"))' &&
-              python -c 'import p115client, p115client.tool.download as d; print("BUILD p115 path", p115client.__file__); print("BUILD download", d.__file__)' &&
+              pip show p115client &&
               cd /build/src &&
               python -m nuitka --standalone \
                 --lto=no \
@@ -174,8 +173,7 @@ jobs:
               apt-get update -qq && apt-get install -y -qq patchelf gcc > /dev/null &&
               pip install nuitka ordered-set --quiet &&
               pip install --no-cache-dir -U -r /build/requirements.txt &&
-              python -c 'import importlib.metadata as m; print("BUILD p115client", m.version("p115client"))' &&
-              python -c 'import p115client, p115client.tool.download as d; print("BUILD p115 path", p115client.__file__); print("BUILD download", d.__file__)' &&
+              pip show p115client &&
               cd /build/src &&
               python -m nuitka --standalone \
                 --lto=no \
