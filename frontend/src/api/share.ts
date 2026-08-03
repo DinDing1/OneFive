@@ -289,10 +289,21 @@ export const shareApi = {
    *   {type: "done", total, success, failed}
    *   {type: "error", message}
    */
-  organizeStream(sourceId: number, fileIds: string[]): EventSource {
-    const fileIdsParam = fileIds.join(',')
+  /** 创建批量整理任务（SSE 前置），返回 job_id */
+  createOrganizeJob(sourceId: number, fileIds: string[]) {
+    return api.post('/share/organize-job', {
+      source_id: sourceId,
+      file_ids: fileIds,
+    }) as Promise<ApiResult<{ job_id: string }>>
+  },
+
+  /**
+   * 流式批量整理（SSE）
+   * 推荐：createOrganizeJob 后再用 job_id 拉流。
+   */
+  organizeStream(jobId: string): EventSource {
     return openEventSource(
-      `/share/organize-stream?source_id=${sourceId}&file_ids=${encodeURIComponent(fileIdsParam)}`
+      `/share/organize-stream?job_id=${encodeURIComponent(jobId)}`
     )
   },
 

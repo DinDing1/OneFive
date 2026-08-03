@@ -564,14 +564,11 @@ class StrmService:
     ):
         """流式遍历云盘目录，生成带完整路径的文件信息。
 
-        透传 FileService.iter_all_files_strm（proapi 两阶段扫描），
+        透传 FileService.iter_all_files_strm（chrome 自管分页 downfolders+downfiles），
         可选下传 on_scan_progress 供 SSE 进度使用。
         """
         try:
             file_service = get_file_service()
-            logger.info(
-                f"云盘 STRM 开始流式扫描: cid={cid}, path={current_path or '/'}"
-            )
             for item in file_service.iter_all_files_strm(
                 cid,
                 on_scan_progress=on_scan_progress,
@@ -580,7 +577,7 @@ class StrmService:
                 pick_code = item.get("pick_code", "")
                 rel_path = item.get("path") or name
                 if not name or not pick_code or not rel_path:
-                    logger.warning(
+                    logger.debug(
                         f"云盘 STRM 跳过无效文件: root_cid={cid}, "
                         f"root_path={current_path}, raw={item}"
                     )

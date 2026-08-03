@@ -13,7 +13,6 @@
 """
 import threading
 import time
-from collections import deque
 from typing import Optional, Dict, Any, List, Iterator, Callable
 
 from p115client import P115Client, P115OpenClient
@@ -28,8 +27,6 @@ from p115client.tool import (
     makedir,
     update_name,
 )
-from p115client.tool.iterdir import iter_files_with_path_skim
-from p115client.tool.download import iter_download_nodes
 from p115client.tool.attr import get_ancestors
 
 from .p115_client_factory import get_p115_client_factory
@@ -377,234 +374,686 @@ class FileService:
                 result.append(self._parse_file_item(f))
         return result
 
+
+
+
+
+
+
+    @staticmethod
+    def _is_http_method_not_allowed(exc: BaseException) -> bool:
+        """识别 HTTP 405 / Method Not Allowed（含包装异常）。"""
+        cur: BaseException | None = exc
+        seen: set[int] = set()
+        while cur is not None and id(cur) not in seen:
+            seen.add(id(cur))
+            code = getattr(cur, "code", None) or getattr(cur, "status", None)
+            try:
+                if int(code) == 405:
+                    return True
+            except (TypeError, ValueError):
+                pass
+            msg = str(cur).lower()
+            if "405" in msg and (
+                "method not allowed" in msg or "not allowed" in msg
+            ):
+                return True
+            cur = cur.__cause__ or cur.__context__
+        return False
+
+    def _install_download_list_retry(
+        self,
+        client: P115Client,
+        *,
+        max_retries: int = 5,
+        base_sleep: float = 1.5,
+    ):
+        """给 download_folders_app / download_files_app 包 405/忙 退避重试。
+
+        云盘 STRM 自管分页仍走这两类接口；此处统一加固。
+        返回还原函数，务必在 finally 调用。
+        """
+        method_names = ("download_folders_app", "download_files_app")
+        originals: dict[str, Any] = {}
+        for name in method_names:
+            originals[name] = getattr(client, name)
+
+        def _make_wrapper(method_name: str):
+            bound = originals[method_name]
+
+            def _wrapped(payload, /, *args, **kwargs):
+                last_exc: BaseException | None = None
+                attempts = max(0, int(max_retries)) + 1
+                for attempt in range(attempts):
+                    try:
+                        return bound(payload, *args, **kwargs)
+                    except P115BusyOSError as e:
+                        last_exc = e
+                        if attempt >= attempts - 1:
+                            raise
+                        sleep_s = base_sleep * (attempt + 1)
+                        logger.warning(
+                            f"云盘 STRM {method_name} 忙，"
+                            f"{sleep_s:.1f}s 后重试 ({attempt + 1}/{attempts - 1})"
+                        )
+                        time.sleep(sleep_s)
+                    except Exception as e:
+                        last_exc = e
+                        retryable = self._is_http_method_not_allowed(e) or any(
+                            x in str(e).lower()
+                            for x in ("429", "502", "503", "504", "timeout")
+                        )
+                        if not retryable or attempt >= attempts - 1:
+                            raise
+                        sleep_s = base_sleep * (2 ** attempt) + 0.2 * attempt
+                        logger.warning(
+                            f"云盘 STRM {method_name} 遇可重试错误，"
+                            f"{sleep_s:.1f}s 后重试 ({attempt + 1}/{attempts - 1}): "
+                            f"{type(e).__name__}: {e}"
+                        )
+                        time.sleep(sleep_s)
+                assert last_exc is not None
+                raise last_exc
+
+            return _wrapped
+
+        for name in method_names:
+            setattr(client, name, _make_wrapper(name))
+
+        def _restore() -> None:
+            for name, orig in originals.items():
+                try:
+                    setattr(client, name, orig)
+                except Exception:
+                    pass
+
+        return _restore
+
+
+
+
+    def _iter_chrome_download_folders(
+        self,
+        client: P115Client,
+        cid: int,
+        id_to_dirnode: Dict[int, tuple],
+        *,
+        page_size: int = 3000,
+        cooldown: float = 0.6,
+        timeout: float = 60,
+    ):
+        """安全分页拉取 chrome downfolders，写入 id_to_dirnode，并 yield 目录节点。
+
+        不使用 iter_download_nodes 的分页器：concurrenttools 在 has_next_page=False
+        时可能不 break，导致同一页死循环（dirs 暴涨、map 不变，最终 405）。
+
+        停止条件（任一满足即结束）：
+        1) 本页 list 为空
+        2) has_next_page 明确为假
+        3) 本页没有任何「新目录 id」（重复页）
+        4) 本页条数 < page_size（通常已是末页）
+        """
+        # 解析目录 pickcode
+        try:
+            pickcode = client.to_pickcode(cid)
+        except Exception:
+            pickcode = ""
+        if not pickcode and cid:
+            # 兜底：部分版本用 to_pickcode 失败时再试属性
+            try:
+                from p115client.tool.attr import get_attr
+                attr = get_attr(client, cid, app="web", timeout=timeout)
+                pickcode = (
+                    (attr or {}).get("pickcode")
+                    or (attr or {}).get("pick_code")
+                    or ""
+                )
+            except Exception as e:
+                raise RuntimeError(f"无法解析目录 pickcode: cid={cid}, {e}") from e
+        if not pickcode and cid:
+            raise RuntimeError(f"目录无 pickcode，无法拉 downfolders: cid={cid}")
+
+        page = 1
+        last_call_ts = 0.0
+        total_yielded = 0
+        while True:
+            if cooldown > 0 and last_call_ts > 0:
+                delta = last_call_ts + cooldown - time.time()
+                if delta > 0:
+                    time.sleep(delta)
+
+            payload = {
+                "pickcode": pickcode,
+                "page": page,
+                "per_page": page_size,
+            }
+            last_call_ts = time.time()
+            resp = client.download_folders_app(
+                payload,
+                app="chrome",
+                timeout=timeout,
+            )
+            if not isinstance(resp, dict):
+                raise RuntimeError(f"downfolders 响应异常: type={type(resp)}")
+
+            if resp.get("state") is False:
+                err = resp.get("error") or resp.get("message") or resp
+                raise RuntimeError(f"downfolders 业务失败: {err}")
+
+            data = resp.get("data")
+            if isinstance(data, dict):
+                raw_list = data.get("list") or []
+                has_next_src = data
+            elif isinstance(data, list):
+                raw_list = data
+                has_next_src = resp
+            else:
+                raw_list = resp.get("list") or []
+                has_next_src = resp
+                data = resp
+            if not isinstance(raw_list, list):
+                raw_list = []
+
+            has_next = None
+            if isinstance(has_next_src, dict):
+                has_next = has_next_src.get("has_next_page")
+            if has_next is None:
+                has_next = resp.get("has_next_page")
+
+            new_in_page = 0
+            for info in raw_list:
+                if not isinstance(info, dict):
+                    continue
+                # 原始 chrome 字段 fid/fn/pid 或已规范化
+                try:
+                    fid = int(info.get("fid") or info.get("id") or 0)
+                except (TypeError, ValueError):
+                    continue
+                if not fid:
+                    continue
+                name = str(info.get("fn") or info.get("name") or "")
+                try:
+                    pid = int(info.get("pid") or info.get("parent_id") or 0)
+                except (TypeError, ValueError):
+                    pid = 0
+
+                is_new = fid not in id_to_dirnode
+                id_to_dirnode[fid] = (name, pid)
+                if is_new:
+                    new_in_page += 1
+                total_yielded += 1
+                yield {
+                    "is_dir": True,
+                    "id": fid,
+                    "name": name,
+                    "parent_id": pid,
+                }
+
+            # 分页明细仅 debug，正式环境 INFO 只保留起止摘要
+            logger.debug(
+                f"云盘 STRM downfolders 页: page={page}, raw={len(raw_list)}, "
+                f"new={new_in_page}, map={len(id_to_dirnode)}, "
+                f"has_next={has_next}"
+            )
+
+            # 停止条件
+            if not raw_list:
+                break
+            if has_next is False or has_next == 0 or has_next == "0":
+                break
+            if new_in_page == 0:
+                # 本页无新 id，视为重复/空转，防止死循环
+                logger.warning(
+                    f"云盘 STRM downfolders 第 {page} 页无新增目录，停止分页 "
+                    f"(map={len(id_to_dirnode)})"
+                )
+                break
+            if len(raw_list) < page_size:
+                break
+
+            page += 1
+            # 硬顶：防止异常 has_next 一直为真
+            if page > 100000:
+                logger.warning("云盘 STRM downfolders 页数超过硬顶，停止")
+                break
+
+
+    def _iter_chrome_download_files(
+        self,
+        client: P115Client,
+        cid: int,
+        id_to_dirnode: Dict[int, tuple],
+        *,
+        page_size: int = 3000,
+        cooldown: float = 0.6,
+        timeout: float = 60,
+    ):
+        """安全分页拉取 chrome downfiles，拼 path 后 yield 文件。
+
+        与目录侧相同：不用 iter_download_nodes / skim 内部分页器，
+        避免 has_next_page 异常时死循环（files 涨到十几万仍不结束）。
+
+        停止条件：空页 / has_next 假 / 本页无新 pickcode / 条数 < page_size。
+        """
+        try:
+            pickcode = client.to_pickcode(cid)
+        except Exception:
+            pickcode = ""
+        if not pickcode and cid:
+            try:
+                from p115client.tool.attr import get_attr
+                attr = get_attr(client, cid, app="web", timeout=timeout)
+                pickcode = (
+                    (attr or {}).get("pickcode")
+                    or (attr or {}).get("pick_code")
+                    or ""
+                )
+            except Exception as e:
+                raise RuntimeError(f"无法解析目录 pickcode: cid={cid}, {e}") from e
+        if not pickcode and cid:
+            raise RuntimeError(f"目录无 pickcode，无法拉 downfiles: cid={cid}")
+
+        # 路径绑定
+        try:
+            from p115client.tool.iterdir import make_path_binder
+            bind = make_path_binder(
+                id_to_dirnode, escape=None, with_ancestors=False
+            )
+        except Exception:
+            bind = None
+
+        top_id = int(cid or 0)
+        top_prefix_len = 0
+        seen_pc: set[str] = set()
+
+        def _build_path(parent_id: int, name: str, item_for_bind: dict | None = None) -> str:
+            nonlocal top_prefix_len
+            if bind is not None and item_for_bind is not None:
+                try:
+                    if not top_prefix_len:
+                        if top_id:
+                            top_path = bind.get_path(top_id) or ""
+                            top_prefix_len = (
+                                1 if top_path == "/" else len(str(top_path)) + 1
+                            )
+                        else:
+                            top_prefix_len = 1
+                    bind(item_for_bind)
+                    path_full = str(item_for_bind.get("path") or "")
+                    if path_full and top_prefix_len:
+                        return path_full[top_prefix_len:].strip("/") or name
+                    return path_full.strip("/") or name
+                except Exception:
+                    pass
+            # 手工拼相对路径
+            parts = [name]
+            seen: set[int] = set()
+            pid = int(parent_id or 0)
+            while pid and pid != top_id and pid not in seen:
+                seen.add(pid)
+                node = id_to_dirnode.get(pid)
+                if not node:
+                    break
+                parts.append(str(node[0]))
+                pid = int(node[1])
+            parts.reverse()
+            return "/".join(p for p in parts if p)
+
+        page = 1
+        last_call_ts = 0.0
+        # ensure_name：批量用 fs_file_skim 补文件名（与 p115 ensure_name 类似，按页）
+        while True:
+            if cooldown > 0 and last_call_ts > 0:
+                delta = last_call_ts + cooldown - time.time()
+                if delta > 0:
+                    time.sleep(delta)
+
+            payload = {
+                "pickcode": pickcode,
+                "page": page,
+                "per_page": page_size,
+            }
+            last_call_ts = time.time()
+            resp = client.download_files_app(
+                payload,
+                app="chrome",
+                timeout=timeout,
+            )
+            if not isinstance(resp, dict):
+                raise RuntimeError(f"downfiles 响应异常: type={type(resp)}")
+            if resp.get("state") is False:
+                err = resp.get("error") or resp.get("message") or resp
+                raise RuntimeError(f"downfiles 业务失败: {err}")
+
+            data = resp.get("data")
+            if isinstance(data, dict):
+                raw_list = data.get("list") or []
+                has_next_src = data
+            elif isinstance(data, list):
+                raw_list = data
+                has_next_src = resp
+            else:
+                raw_list = resp.get("list") or []
+                has_next_src = resp
+
+            has_next = None
+            if isinstance(has_next_src, dict):
+                has_next = has_next_src.get("has_next_page")
+            if has_next is None:
+                has_next = resp.get("has_next_page")
+
+            # 规范化本页节点
+            page_items: list[dict] = []
+            for info in raw_list:
+                if not isinstance(info, dict):
+                    continue
+                pc = str(info.get("pc") or info.get("pickcode") or info.get("pick_code") or "")
+                if not pc:
+                    continue
+                try:
+                    pid = int(info.get("pid") or info.get("parent_id") or 0)
+                except (TypeError, ValueError):
+                    pid = 0
+                try:
+                    size = int(info.get("fs") or info.get("size") or 0)
+                except (TypeError, ValueError):
+                    size = 0
+                # id 常由 pickcode 推导；先占位
+                try:
+                    from p115pickcode import to_id as _to_id
+                    fid = int(_to_id(pc))
+                except Exception:
+                    try:
+                        fid = int(info.get("id") or info.get("file_id") or 0)
+                    except (TypeError, ValueError):
+                        fid = 0
+                page_items.append({
+                    "is_dir": False,
+                    "id": fid,
+                    "pickcode": pc,
+                    "parent_id": pid,
+                    "size": size,
+                    "name": str(info.get("fn") or info.get("name") or info.get("file_name") or ""),
+                    "sha1": info.get("sha1") or "",
+                })
+
+            # 补文件名（chrome downfiles 常无 name）
+            need_name = [x for x in page_items if not x.get("name") and x.get("id")]
+            if need_name:
+                try:
+                    ids = [x["id"] for x in need_name if x["id"]]
+                    # 分批 1000
+                    for off in range(0, len(ids), 1000):
+                        batch_ids = ids[off: off + 1000]
+                        skim = client.fs_file_skim(batch_ids, method="POST", timeout=timeout)
+                        if not isinstance(skim, dict):
+                            continue
+                        rows = skim.get("data") or []
+                        if not isinstance(rows, list):
+                            continue
+                        by_pc = {}
+                        for node in rows:
+                            if not isinstance(node, dict):
+                                continue
+                            k = str(node.get("pick_code") or node.get("pc") or "")
+                            if k:
+                                by_pc[k] = node
+                        for it in need_name:
+                            node = by_pc.get(it["pickcode"])
+                            if not node:
+                                continue
+                            fn = node.get("file_name") or node.get("fn") or node.get("name")
+                            if fn:
+                                it["name"] = str(fn)
+                            if not it.get("sha1") and node.get("sha1"):
+                                it["sha1"] = node.get("sha1")
+                except Exception as e:
+                    logger.warning(
+                        f"云盘 STRM fs_file_skim 补名失败(页 {page}): {e}"
+                    )
+
+            new_in_page = 0
+            for it in page_items:
+                pc = it["pickcode"]
+                if pc in seen_pc:
+                    continue
+                seen_pc.add(pc)
+                new_in_page += 1
+                name = it.get("name") or pc
+                path_s = _build_path(
+                    int(it.get("parent_id") or 0),
+                    name,
+                    {
+                        "id": it.get("id"),
+                        "name": name,
+                        "parent_id": it.get("parent_id"),
+                        "is_dir": False,
+                    },
+                )
+                if not path_s:
+                    path_s = name
+                yield {
+                    "id": it.get("id") or "",
+                    "name": name,
+                    "pickcode": pc,
+                    "pick_code": pc,
+                    "parent_id": it.get("parent_id") or 0,
+                    "path": path_s,
+                    "size": it.get("size") or 0,
+                }
+
+            logger.debug(
+                f"云盘 STRM downfiles 页: page={page}, raw={len(raw_list)}, "
+                f"new={new_in_page}, seen={len(seen_pc)}, has_next={has_next}"
+            )
+
+            if not raw_list:
+                break
+            if has_next is False or has_next == 0 or has_next == "0":
+                break
+            if new_in_page == 0:
+                logger.warning(
+                    f"云盘 STRM downfiles 第 {page} 页无新增文件，停止分页 "
+                    f"(seen={len(seen_pc)})"
+                )
+                break
+            if len(raw_list) < page_size:
+                break
+            page += 1
+            if page > 100000:
+                logger.warning("云盘 STRM downfiles 页数超过硬顶，停止")
+                break
+
     def iter_all_files_strm(
         self,
         cid: int = 0,
         on_scan_progress: Optional[Callable[[Dict[str, Any]], None]] = None,
     ) -> Iterator[Dict[str, Any]]:
-        """流式遍历云盘文件，供云盘 STRM 生成使用。
+        """流式遍历云盘文件，供云盘 STRM 生成。
 
-        与其它路径的关键差异（也是飞牛卡住的根因所在）：
-        - 分享 STRM：只读本地 DB，不访问 115 清单
-        - 云盘整理：webapi.115.com 的 fs_files 分页
-        - 云盘 STRM：proapi.115.com 的 downfolders/downfiles 下载清单
+        正确用法（对照 p115client iterdir/download 实现）：
 
-        p115client 默认 `iter_files_with_path_skim(path_already=False)` 会：
-        1) 后台用 app="os_windows" 拉全量目录树（/ufile/downfolders + ecdh_encrypt）
-        2) 目录未就绪前把文件结果塞进内存 cache，不对外 yield
-        3) 无 HTTP 超时 → 飞牛上 proapi 半开连接时会永久挂起
-        大媒体库（数万目录）时，前端长期停在「扫描云盘媒体库」，本地因网络/规模差异往往正常。
+        1) 先自管分页 ``download_folders_app(app=chrome)`` 拉全量目录表（防 nodes 分页死循环）
+           填入 ``id_to_dirnode``（可 progress：目录数）。
+        2) 再自管分页 ``download_files_app(app=chrome)`` 拉文件并拼 path
+           （同样不用 nodes 分页器，避免文件侧死循环不结束）。
 
-        本实现显式两阶段，并针对飞牛差异做加固：
-        1) 强制 Web Cookie 客户端（download 清单不支持 OpenAPI 客户端）
-        2) 目录/文件统一 app=chrome，避免 os_windows 的 /ufile + ECDH
-        3) max_workers=0 串行，降低飞牛出网并发卡死
-        4) 显式 HTTP 超时，避免无超时永久挂起
-        5) 首包前心跳进度，避免前端长期无反馈
+        固定 app=chrome；对 download_* 做 405/忙退避；串行 + 分页冷却 + 超时。
         """
-        # 诊断：正式 FPK 打包的 p115client 版本/路径，便于核对是否为旧依赖
-        try:
-            import importlib.metadata as _imd
-            import p115client as _p115
-            _ver = None
-            try:
-                _ver = _imd.version("p115client")
-            except Exception:
-                _ver = getattr(_p115, "__version__", None)
-            logger.info(
-                f"云盘 STRM p115client 版本: {_ver}, file={getattr(_p115, '__file__', '')}"
-            )
-        except Exception as e:
-            logger.warning(f"云盘 STRM 读取 p115client 版本失败: {e}")
-
         client = self.client_factory.get_web_client()
         if not isinstance(client, P115Client):
             raise RuntimeError(
                 "云盘 STRM 需要 P115Client（Web Cookie）。"
-                "请确认已登录；OpenAPI 客户端不支持 download 清单接口。"
+                "download 清单不支持纯 OpenAPI 客户端。"
             )
 
         def _progress(payload: Dict[str, Any]) -> None:
             if not on_scan_progress:
                 return
-            # 统一标记走 download/proapi 链路，便于前端与日志区分
-            payload = {"strategy": "download", **payload}
             try:
                 on_scan_progress(payload)
             except Exception:
                 pass
 
-        # 关键：不用 os_windows（/ufile/downfolders + ecdh_encrypt）
-        # chrome 走明文 GET proapi.115.com/app/2.0/chrome/downfolders|downfiles
         app = "chrome"
-        max_workers = 0
-        request_timeout = 45  # urllib3_future 不支持 (connect, read) 元组
+        request_timeout = 60
+        # 批量接口 per_page 上限 5000；略降 + 冷却，降低连翻页 405
+        page_size = 3000
+        page_cooldown = 0.6
+        strategy = f"chrome_downfolders_downfiles"
 
+        restore_retry = self._install_download_list_retry(client)
         id_to_dirnode: Dict[int, tuple] = {}
         t0 = time.time()
-        logger.info(
-            f"云盘 STRM 阶段1/目录树: cid={cid}, app={app}, "
-            f"max_workers={max_workers}, timeout={request_timeout}, "
-            f"client=P115Client(web)"
-        )
-        _progress({
-            "phase": "dirs",
-            "dirs": 0,
-            "files": 0,
-            "elapsed": 0.0,
-            "message": "start_dirs",
-            "waiting": True,
-        })
 
         stop_hb = threading.Event()
-        dir_count_box = {"n": 0}
+        stat = {"phase": "dirs", "dirs": 0, "files": 0}
 
         def _heartbeat() -> None:
-            # 首包前每 2s 推一次，避免飞牛网关/前端看起来像死锁
             while not stop_hb.wait(2.0):
-                elapsed = time.time() - t0
                 _progress({
-                    "phase": "dirs",
-                    "dirs": dir_count_box["n"],
-                    "files": 0,
+                    "strategy": strategy,
+                    "phase": stat["phase"],
+                    "dirs": stat["dirs"],
+                    "files": stat["files"],
                     "map_size": len(id_to_dirnode),
-                    "elapsed": elapsed,
-                    "waiting": dir_count_box["n"] == 0,
+                    "elapsed": time.time() - t0,
+                    "waiting": stat["dirs"] == 0 and stat["files"] == 0,
+                    "app": app,
                 })
 
         threading.Thread(
             target=_heartbeat,
-            name=f"strm-dir-hb-{cid}",
+            name=f"strm-chrome-hb-{cid}",
             daemon=True,
         ).start()
+
+        logger.debug(
+            f"云盘 STRM 扫描参数: cid={cid}, page_size={page_size}, "
+            f"cooldown={page_cooldown}, timeout={request_timeout}"
+        )
+        _progress({
+            "strategy": strategy,
+            "phase": "dirs",
+            "dirs": 0,
+            "files": 0,
+            "elapsed": 0.0,
+            "waiting": True,
+            "app": app,
+            "message": "start_dirs",
+        })
 
         dir_count = 0
         last_dir_log = 0.0
         try:
-            # pickcode 解析可能触发一次网络；先单独打点，区分「登录/解析」与「目录清单」
             try:
-                t_sp = time.time()
                 _ = client.pickcode_stable_point
-                logger.info(
-                    f"云盘 STRM pickcode_stable_point 就绪: "
-                    f"{time.time() - t_sp:.1f}s"
-                )
-            except Exception as e:
-                logger.warning(
-                    f"云盘 STRM pickcode_stable_point 预热失败（继续）: {e}"
-                )
+            except Exception:
+                # 预热失败不影响主流程，不打 INFO 噪音
+                pass
 
-            logger.info(
-                f"云盘 STRM 开始拉取目录树: cid={cid}, app={app}"
-            )
-            for _node in iter_download_nodes(
+            # ---------- 阶段1：chrome 目录清单（自管分页，防死循环）----------
+            for _node in self._iter_chrome_download_folders(
                 client,
                 cid,
-                files=False,
-                id_to_dirnode=id_to_dirnode,
-                max_workers=max_workers,
-                app=app,
+                id_to_dirnode,
+                page_size=page_size,
+                cooldown=page_cooldown,
                 timeout=request_timeout,
             ):
                 dir_count += 1
-                dir_count_box["n"] = dir_count
+                stat["dirs"] = dir_count
                 now = time.time()
-                if dir_count == 1 or dir_count % 5000 == 0 or now - last_dir_log >= 3.0:
-                    elapsed = now - t0
-                    # 进度回调给前端；目录节点明细不再逐条刷日志
-                    if dir_count == 1 or dir_count % 5000 == 0:
-                        logger.info(
-                            f"云盘 STRM 目录树进度: cid={cid}, dirs={dir_count}, "
-                            f"elapsed={elapsed:.1f}s"
-                        )
+                # 进度只走 SSE，避免目录树刷屏日志
+                if (
+                    dir_count == 1
+                    or dir_count % 5000 == 0
+                    or now - last_dir_log >= 3.0
+                ):
                     _progress({
+                        "strategy": strategy,
                         "phase": "dirs",
                         "dirs": dir_count,
                         "files": 0,
                         "map_size": len(id_to_dirnode),
-                        "elapsed": elapsed,
+                        "elapsed": now - t0,
                         "waiting": False,
+                        "app": app,
                     })
                     last_dir_log = now
-        except Exception as e:
-            logger.error(
-                f"云盘 STRM 目录树失败: cid={cid}, "
-                f"elapsed={time.time() - t0:.1f}s, "
-                f"err={type(e).__name__}: {e}"
-            )
-            raise
-        finally:
-            stop_hb.set()
 
-        # 补齐顶层祖先，保证相对路径可绑定；走 web 属性接口，不走 download 清单
-        try:
-            get_ancestors(
+            # 补祖先，保证相对 path 可绑定
+            try:
+                get_ancestors(
+                    client,
+                    cid,
+                    id_to_dirnode=id_to_dirnode,
+                    ensure_file=False,
+                    app="web",
+                    timeout=request_timeout,
+                )
+            except Exception as e:
+                logger.warning(
+                    f"云盘 STRM get_ancestors 失败（继续）: cid={cid}, {e}"
+                )
+
+            t_dirs = time.time() - t0
+            logger.debug(
+                f"云盘 STRM 目录树完成: cid={cid}, dirs={dir_count}, "
+                f"map={len(id_to_dirnode)}, elapsed={t_dirs:.1f}s"
+            )
+            stat["phase"] = "files"
+            _progress({
+                "strategy": strategy,
+                "phase": "dirs_done",
+                "dirs": dir_count,
+                "files": 0,
+                "map_size": len(id_to_dirnode),
+                "elapsed": t_dirs,
+                "app": app,
+            })
+
+            # ---------- 阶段2：chrome downfiles 自管分页（防死循环）----------
+            yielded = 0
+            last_log = 0.0
+
+            for item in self._iter_chrome_download_files(
                 client,
                 cid,
-                id_to_dirnode=id_to_dirnode,
-                ensure_file=False,
-                app="web",
-                timeout=request_timeout,
-            )
-        except Exception as e:
-            logger.warning(f"云盘 STRM get_ancestors 失败（继续）: cid={cid}, {e}")
-
-        t_dirs = time.time() - t0
-        logger.info(
-            f"云盘 STRM 目录树完成: cid={cid}, dirs={dir_count}, "
-            f"map={len(id_to_dirnode)}, elapsed={t_dirs:.1f}s"
-        )
-        _progress({
-            "phase": "dirs_done",
-            "dirs": dir_count,
-            "files": 0,
-            "map_size": len(id_to_dirnode),
-            "elapsed": t_dirs,
-        })
-
-        # 阶段2：path_already=True，避免 p115 再后台硬编码 os_windows 拉目录
-        logger.info(
-            f"云盘 STRM 阶段2/文件清单: cid={cid}, app={app}, "
-            f"path_already=True, max_workers={max_workers}, "
-            f"path_ready=1"
-        )
-        yielded = 0
-        t_files0 = time.time()
-        try:
-            for item in iter_files_with_path_skim(
-                client,
-                cid,
-                escape=None,
-                id_to_dirnode=id_to_dirnode,
-                path_already=True,
-                max_workers=max_workers,
-                app=app,
+                id_to_dirnode,
+                page_size=page_size,
+                cooldown=page_cooldown,
                 timeout=request_timeout,
             ):
-                name = item.get("name", "") or item.get("file_name", "")
-                pick_code = item.get("pickcode", "") or item.get("pick_code", "")
-                path_s = str(item.get("path") or item.get("relpath") or name).strip("/")
+                name = item.get("name", "") or ""
+                pick_code = (
+                    item.get("pickcode", "")
+                    or item.get("pick_code", "")
+                    or ""
+                )
+                path_s = str(item.get("path") or name).strip("/")
                 if not name or not pick_code or not path_s:
                     continue
 
                 yielded += 1
-                if yielded == 1:
-                    logger.info(
-                        f"云盘 STRM 首个文件出站: cid={cid}, "
-                        f"after_dirs={t_dirs:.1f}s, name={name}"
-                    )
-                if yielded == 1 or yielded % 2000 == 0:
-                    elapsed = time.time() - t0
-                    logger.info(
-                        f"云盘 STRM 文件进度: cid={cid}, files={yielded}, "
-                        f"elapsed={elapsed:.1f}s"
-                    )
+                stat["files"] = yielded
+                now = time.time()
+                # 进度只走 SSE，避免文件清单刷屏日志
+                if (
+                    yielded == 1
+                    or yielded % 2000 == 0
+                    or now - last_log >= 3.0
+                ):
                     _progress({
+                        "strategy": strategy,
                         "phase": "files",
                         "dirs": dir_count,
                         "files": yielded,
-                        "elapsed": elapsed,
+                        "elapsed": now - t0,
+                        "waiting": False,
+                        "app": app,
                     })
+                    last_log = now
 
                 yield {
                     "file_id": str(item.get("id") or item.get("file_id") or ""),
@@ -612,16 +1061,24 @@ class FileService:
                     "pick_code": pick_code,
                     "path": path_s,
                 }
+
+            logger.info(
+                f"云盘 STRM 扫描完成: 目录 {dir_count}，文件 {yielded}，"
+                f"耗时 {time.time() - t0:.1f}s"
+            )
+        except Exception as e:
+            logger.error(
+                f"云盘 STRM 失败: cid={cid}, "
+                f"phase={stat.get('phase')}, dirs={stat.get('dirs')}, "
+                f"files={stat.get('files')}, "
+                f"elapsed={time.time() - t0:.1f}s, "
+                f"err={type(e).__name__}: {e}"
+            )
+            raise
         finally:
-            # 释放局部目录表，避免生成结束后仍占内存
+            stop_hb.set()
             id_to_dirnode.clear()
-
-        logger.info(
-            f"云盘 STRM 扫描完成: cid={cid}, dirs={dir_count}, files={yielded}, "
-            f"elapsed={time.time() - t0:.1f}s, "
-            f"files_phase={time.time() - t_files0:.1f}s"
-        )
-
+            restore_retry()
 
 
     def is_dir_empty(self, cid: int | str) -> bool:

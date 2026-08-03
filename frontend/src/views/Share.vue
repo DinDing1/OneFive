@@ -2077,9 +2077,19 @@ async function executeOrganize() {
       await runOrganizeStream(sourceId, fileIds, (evt) => {
         if (evt.type === 'progress') {
           // 用后端推送的 total/index（文件夹已展开为真实文件数），覆盖前端初始值
-          organizeProgressTotal.value = evt.total
-          organizeProgressIndex.value = evt.index
-          organizeProgressName.value = evt.name
+          if (typeof evt.total === 'number' && evt.total > 0) {
+            organizeProgressTotal.value = evt.total
+          }
+          if (typeof evt.index === 'number') {
+            organizeProgressIndex.value = evt.index
+          }
+          if (evt.name) organizeProgressName.value = evt.name
+          // preparing 只是连通/预统计提示，不计入成功失败
+          if (evt.preparing) {
+            organizeProgressSuccess.value = successCount
+            organizeProgressFailed.value = failCount
+            return
+          }
           if (evt.success) successCount += 1
           else failCount += 1
           organizeProgressSuccess.value = successCount
@@ -2116,49 +2126,124 @@ async function executeOrganize() {
  * @param fileIds 文件 ID 列表
  * @param onProgress 收到 progress 事件时的回调
  */
-function runOrganizeStream(
+async function runOrganizeStream(
   sourceId: number,
   fileIds: string[],
   onProgress: (evt: any) => void
 ): Promise<void> {
+  // 先 POST 建任务，再 GET SSE；避免 EventSource 仅 GET 导致参数/首包问题
+  const jobRes: any = await shareApi.createOrganizeJob(sourceId, fileIds)
+  if (jobRes?.code !== 0 || !jobRes?.data?.job_id) {
+    throw new Error(jobRes?.message || '创建整理任务失败')
+  }
+  const jobId = String(jobRes.data.job_id)
+
   return new Promise((resolve, reject) => {
-    // 关闭旧的连接（如有）
     if (organizeEventSource) {
-      organizeEventSource.close()
+      try { organizeEventSource.close() } catch { /* ignore */ }
+      organizeEventSource = null
     }
-    const es = shareApi.organizeStream(sourceId, fileIds)
+
+    const es = shareApi.organizeStream(jobId)
     organizeEventSource = es
+    let finished = false
+    let sawEvent = false
+    // 连接抖动宽限：收到 start/progress 前短暂 onerror 不立刻失败（浏览器会自动重连）
+    let softErrorTimer: number | null = null
+
+    const cleanup = () => {
+      if (softErrorTimer != null) {
+        window.clearTimeout(softErrorTimer)
+        softErrorTimer = null
+      }
+      try { es.close() } catch { /* ignore */ }
+      if (organizeEventSource === es) organizeEventSource = null
+    }
+
+    const finishOk = () => {
+      if (finished) return
+      finished = true
+      cleanup()
+      resolve()
+    }
+
+    const finishErr = (msg: string) => {
+      if (finished) return
+      finished = true
+      cleanup()
+      reject(new Error(msg))
+    }
 
     es.onmessage = (event) => {
+      let data: any
       try {
-        const data = JSON.parse(event.data)
-        if (data.type === 'progress') {
-          onProgress(data)
-        } else if (data.type === 'done') {
-          es.close()
-          organizeEventSource = null
-          resolve()
-        } else if (data.type === 'error') {
-          es.close()
-          organizeEventSource = null
-          reject(new Error(data.message || '整理失败'))
-        }
+        data = JSON.parse(event.data)
       } catch (err) {
-        // JSON 解析失败，忽略此条消息
         console.error('SSE 消息解析失败:', err)
+        return
+      }
+      sawEvent = true
+      if (softErrorTimer != null) {
+        window.clearTimeout(softErrorTimer)
+        softErrorTimer = null
+      }
+
+      const typ = data?.type
+      if (typ === 'start') {
+        // 仅更新当前状态文案，绝不带 success，避免外层把“连通”算作整理成功
+        if (data?.message) {
+          organizeProgressName.value = String(data.message)
+        }
+        return
+      }
+      if (typ === 'progress') {
+        onProgress(data)
+        return
+      }
+      if (typ === 'done') {
+        // 用后端汇总校正成功/失败数（若有）
+        if (typeof data.success === 'number') {
+          // 交由外层 successCount 逻辑；这里只保证流正常结束
+        }
+        finishOk()
+        return
+      }
+      if (typ === 'error') {
+        finishErr(data?.message || '整理失败')
       }
     }
+
     es.onerror = () => {
-      // 浏览器自动重连可能会触发 onerror，若已完成或连接已关闭则视为正常结束
-      if (organizeProgressDone.value || es.readyState === EventSource.CLOSED) {
-        es.close()
-        organizeEventSource = null
-        resolve()
-      } else {
-        // 流式过程中发生错误且未完成：必须 reject，否则 Promise 永远悬挂
-        es.close()
-        organizeEventSource = null
-        reject(new Error('整理流连接异常，请重试'))
+      if (finished || organizeProgressDone.value) {
+        finishOk()
+        return
+      }
+      // CONNECTING：浏览器自动重连中，忽略
+      if (es.readyState === EventSource.CONNECTING) {
+        return
+      }
+      if (es.readyState === EventSource.CLOSED) {
+        // 已有业务事件：通常是 done 后网关断开，或中途断连但后台仍在跑
+        if (sawEvent) {
+          finishOk()
+          return
+        }
+        // 从未收到事件：宽限等待自动重连/首包，避免「后台已开始、前端秒失败」
+        if (softErrorTimer == null) {
+          softErrorTimer = window.setTimeout(() => {
+            if (!finished && !sawEvent) {
+              finishErr('整理进度连接中断（后台可能仍在整理，请稍后刷新列表查看）')
+            }
+          }, 8000)
+        }
+        return
+      }
+      if (softErrorTimer == null) {
+        softErrorTimer = window.setTimeout(() => {
+          if (!finished && !sawEvent) {
+            finishErr('整理进度连接中断（后台可能仍在整理，请稍后刷新列表查看）')
+          }
+        }, 8000)
       }
     }
   })

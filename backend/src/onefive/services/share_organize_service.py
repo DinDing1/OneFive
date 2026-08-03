@@ -1018,6 +1018,19 @@ class ShareOrganizeService:
         关键：文件夹会展开统计内部文件数作为进度总数，整理文件夹时
         每完成一个子文件就推送一次进度，避免"一部剧永远是 1/1"的问题。
         """
+        # 先让 SSE 有业务事件，避免预统计过久时前端只靠心跳/误判断连
+        yield {
+            "type": "progress",
+            "index": 0,
+            "total": max(len(file_ids), 1),
+            "name": "正在准备整理任务…",
+            "success": True,
+            "title": "",
+            "category": "",
+            "error": "",
+            "preparing": True,
+        }
+
         share_service = get_share_service()
 
         # 预查文件信息 + 统计每个 file_id 的实际工作量（文件夹展开统计内部文件数）

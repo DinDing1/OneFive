@@ -602,38 +602,124 @@ async def organize_batch(req: OrganizeBatchRequest):
     )
 
 
+@router.post("/organize-job", summary="创建批量整理任务（SSE 前置）")
+async def create_organize_job(req: OrganizeBatchRequest):
+    """创建批量整理任务，返回 job_id 供 organize-stream 使用。
+
+    说明：
+    - EventSource 只能 GET，复杂/较长 file_ids 不宜全塞进 URL。
+    - 正式环境（飞牛网关）长任务统一：POST 建任务 → GET SSE 拉流。
+    """
+    id_list = [str(fid).strip() for fid in (req.file_ids or []) if str(fid).strip()]
+    if not id_list:
+        return ApiResponse(code=-1, message="file_ids 不能为空")
+    if int(req.source_id or 0) <= 0:
+        return ApiResponse(code=-1, message="source_id 不正确")
+
+    job_id = job_store.create({
+        "source_id": int(req.source_id),
+        "file_ids": id_list,
+    })
+    logger.info(
+        f"[SSE 整理] 创建任务: job_id={job_id}, source_id={req.source_id}, 文件数={len(id_list)}"
+    )
+    return ApiResponse(code=0, message="ok", data={"job_id": job_id})
+
+
 @router.get("/organize-stream", summary="流式批量整理（SSE 实时进度）")
 async def organize_stream(
-    source_id: int = Query(..., description="分享来源 ID"),
-    file_ids: str = Query(..., description="文件 ID 列表，逗号分隔"),
+    job_id: Optional[str] = Query(None, description="organize-job 返回的任务 ID"),
+    # 兼容旧前端：仍接受 source_id + file_ids 直连（不推荐，URL 易过长）
+    source_id: Optional[int] = Query(None, description="兼容旧参数：分享来源 ID"),
+    file_ids: Optional[str] = Query(None, description="兼容旧参数：文件 ID 逗号分隔"),
 ):
-    """SSE 流式批量整理：每完成一个文件推送一次进度；单文件耗时较长时发送心跳。
+    """SSE 流式批量整理：连接后立即发 start，再推 progress/done；空闲时注释心跳保活。
 
-    事件格式：
+    推荐流程：POST /organize-job → GET /organize-stream?job_id=...
+    事件：
+      data: {"type": "start", ...}
       data: {"type": "progress", "index": 1, "total": 5, "name": "...", "success": true, ...}
       data: {"type": "done", "total": 5, "success": 4, "failed": 1}
-      注释行 `: heartbeat` 保活
+      注释行 `: heartbeat`
     """
-    # 解析 file_ids（逗号分隔 → 列表）
-    id_list = [fid.strip() for fid in file_ids.split(",") if fid.strip()]
-    if not id_list:
-        async def err_gen():
-            yield f"data: {json.dumps({'type': 'error', 'message': 'file_ids 不能为空'}, ensure_ascii=False)}\n\n"
-        return StreamingResponse(err_gen(), media_type="text/event-stream", headers=SSE_HEADERS)
+    id_list: list[str] = []
+    sid = 0
 
-    logger.info(f"[SSE 整理] 开始: source_id={source_id}, 文件数={len(id_list)}")
+    if job_id:
+        payload = job_store.pop(job_id)
+        if payload:
+            sid = int(payload.get("source_id") or 0)
+            raw_ids = payload.get("file_ids") or []
+            id_list = [str(x).strip() for x in raw_ids if str(x).strip()]
+        elif source_id is None and not file_ids:
+            async def err_gen():
+                yield (
+                    "data: "
+                    + json.dumps(
+                        {"type": "error", "message": "整理任务不存在或已过期"},
+                        ensure_ascii=False,
+                    )
+                    + "\n\n"
+                )
+            return StreamingResponse(
+                err_gen(), media_type="text/event-stream", headers=SSE_HEADERS
+            )
+
+    # 兼容旧直连参数
+    if not id_list and source_id is not None and file_ids:
+        sid = int(source_id)
+        id_list = [fid.strip() for fid in file_ids.split(",") if fid.strip()]
+
+    if not id_list or sid <= 0:
+        async def err_gen2():
+            yield (
+                "data: "
+                + json.dumps(
+                    {"type": "error", "message": "整理参数无效（缺少 source_id/file_ids）"},
+                    ensure_ascii=False,
+                )
+                + "\n\n"
+            )
+        return StreamingResponse(
+            err_gen2(), media_type="text/event-stream", headers=SSE_HEADERS
+        )
+
+    logger.info(
+        f"[SSE 整理] 开始拉流: job_id={job_id or '-'}, source_id={sid}, 文件数={len(id_list)}"
+    )
 
     async def event_generator():
+        # 首包立刻推送，避免网关/浏览器在首事件前判定连接失败
+        yield (
+            "data: "
+            + json.dumps(
+                {
+                    "type": "start",
+                    "message": "整理任务已连接",
+                    "source_id": sid,
+                    "total_hint": len(id_list),
+                },
+                ensure_ascii=False,
+            )
+            + "\n\n"
+        )
         service = get_share_organize_service()
         try:
             async for chunk in aiter_with_heartbeat(
-                service.organize_batch_stream(source_id, id_list)
+                service.organize_batch_stream(sid, id_list),
+                heartbeat_sec=2.0,
             ):
                 yield chunk
         except Exception as e:
-            logger.error(f"[SSE 整理] 异常: {e}")
-            err_payload = {"type": "error", "message": str(e)}
-            yield f"data: {json.dumps(err_payload, ensure_ascii=False)}\n\n"
+            logger.error(f"[SSE 整理] 异常: {e}", exc_info=True)
+            yield (
+                "data: "
+                + json.dumps(
+                    {"type": "error", "message": str(e)},
+                    ensure_ascii=False,
+                )
+                + "\n\n"
+            )
 
     return StreamingResponse(
         event_generator(),
