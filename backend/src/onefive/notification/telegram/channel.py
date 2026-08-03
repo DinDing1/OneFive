@@ -21,6 +21,7 @@ logger = get_logger(__name__)
 CFG_ENABLED = "tg_enabled"
 CFG_BOT_ENABLED = "tg_bot_enabled"
 CFG_BOT_TOKEN = "tg_bot_token"
+CFG_BOT_SESSION = "tg_bot_session"  # Bot 模式 StringSession，失效后需清掉并用 token 重建
 CFG_USER_ENABLED = "tg_user_enabled"
 CFG_API_ID = "tg_api_id"
 CFG_API_HASH = "tg_api_hash"
@@ -164,8 +165,39 @@ class TelegramChannel(NotificationChannel):
             raise
 
     @staticmethod
+    def _is_auth_key_error(exc: BaseException) -> bool:
+        """判断 Session 授权密钥是否已失效。
+
+        典型场景：同一 session 被两个 IP 同时使用，Telegram 直接作废该 auth key。
+        此类错误必须清掉本地 session，再用 bot_token 重新签发，不能当普通网络错误跳过。
+        """
+        name = type(exc).__name__.lower()
+        msg = str(exc).lower()
+        # Telethon 常见：AuthKeyDuplicatedError / AuthKeyError 等
+        if "authkey" in name or name in {"authorizationerror", "authkeyerror", "authkeyduplicatederror"}:
+            return True
+        keywords = (
+            "authorization key",
+            "auth key",
+            "authkey",
+            "two different ip",
+            "different ip addresses",
+            "can no longer be used",
+            "auth_key_duplicated",
+            "auth key unregistered",
+            "key is not registered",
+        )
+        return any(k in msg for k in keywords)
+
+    @staticmethod
     def _is_network_error(exc: BaseException) -> bool:
-        """判断是否为网络/超时类错误（此类错误不应立即二次长重试）。"""
+        """判断是否为网络/超时类错误（此类错误不应立即二次长重试）。
+
+        注意：AuthKey 作废文案里也可能含 connection，必须先排除，避免误判成网络错误
+        而跳过 token 重登。
+        """
+        if TelegramChannel._is_auth_key_error(exc):
+            return False
         if isinstance(exc, (asyncio.TimeoutError, TimeoutError, ConnectionError, OSError)):
             return True
         name = type(exc).__name__
@@ -174,8 +206,63 @@ class TelegramChannel(NotificationChannel):
             return True
         return any(k in msg for k in ("timeout", "timed out", "connection", "network", "unreachable"))
 
+    def _clear_bot_session(self, reason: str = "") -> None:
+        """清除已失效的 Bot Session，避免下次启动继续复用坏密钥。"""
+        try:
+            cfg = get_config_service()
+            old = (cfg.get(CFG_BOT_SESSION) or "").strip()
+            if not old:
+                return
+            cfg.set(CFG_BOT_SESSION, "", "Bot Session")
+            extra = f"（{reason}）" if reason else ""
+            logger.warning(f"Bot: 已清除失效 Session{extra}")
+        except Exception as e:
+            logger.warning(f"Bot: 清除 Session 失败: {e}")
+
+    async def _sign_in_bot_with_token(
+        self,
+        bot_token: str,
+        api_id: int,
+        api_hash: str,
+        proxy=None,
+    ) -> bool:
+        """用 Bot Token 重新登录并保存新 Session。
+
+        Returns:
+            True 表示连接并登录成功；False 表示失败（已清理客户端状态）。
+        """
+        self._bot_client = self._new_client("", api_id, api_hash, proxy)
+        try:
+            if not await self._safe_client_connect(self._bot_client, "Bot"):
+                self._bot_client = None
+                self._bot_connected = False
+                return False
+            await asyncio.wait_for(
+                self._bot_client.sign_in(bot_token=bot_token),
+                timeout=TG_CONNECT_WAIT,
+            )
+            self._bot_connected = True
+            session_str = self._bot_client.session.save()
+            get_config_service().set(CFG_BOT_SESSION, session_str, "Bot Session")
+            logger.info("Bot: 连接成功，Session 已保存")
+            self._register_bot_handlers()
+            return True
+        except Exception as e:
+            logger.error(f"Bot: Token 登录失败: {e}")
+            await self._quiet_disconnect(self._bot_client)
+            self._bot_client = None
+            self._bot_connected = False
+            return False
+
     async def _ensure_bot(self):
-        """确保 Bot 客户端已连接"""
+        """确保 Bot 客户端已连接。
+
+        流程：
+        1) 优先复用 tg_bot_session
+        2) AuthKey/多 IP 作废 → 清 session → bot_token 重登
+        3) 其它 session 失效 → 尝试 token 重登（并清坏 session）
+        4) 纯网络超时 → 不立刻二次 token 重试，避免启动卡住
+        """
         if self._bot_client is not None and self._bot_connected:
             return
 
@@ -189,7 +276,7 @@ class TelegramChannel(NotificationChannel):
         use_api_hash = self._cfg(CFG_API_HASH) or "344583e45741c457fe1862106095a5eb"
 
         # 优先复用已保存的 session
-        bot_session = self._cfg("tg_bot_session")
+        bot_session = self._cfg(CFG_BOT_SESSION)
         if bot_session:
             self._bot_client = self._new_client(bot_session, use_api_id, use_api_hash, proxy)
             try:
@@ -198,37 +285,26 @@ class TelegramChannel(NotificationChannel):
                     logger.info("Bot: 连接成功（Session 复用）")
                     self._register_bot_handlers()
                     return
-                # Session 可能失效，继续尝试 token 登录
+                # connect 返回 False：视为 session 不可用，清掉后走 token
+                logger.warning("Bot: Session 复用未就绪，改用 Token 重登")
+                await self._quiet_disconnect(self._bot_client)
                 self._bot_client = None
+                self._clear_bot_session("复用连接未就绪")
             except Exception as e:
                 logger.warning(f"Bot: Session 复用失败: {e}")
+                await self._quiet_disconnect(self._bot_client)
                 self._bot_client = None
-                # 网络问题时不再立即用 token 重连，避免二次长时间卡住
+                # 网络问题：不立刻 token 二次连接，避免卡住；坏 session 先保留
                 if self._is_network_error(e):
                     self._bot_connected = False
                     return
+                # AuthKey 作废或其它 session 级错误：清 session 后强制 token 重登
+                reason = "授权密钥失效/多 IP 冲突" if self._is_auth_key_error(e) else "Session 复用失败"
+                self._clear_bot_session(reason)
+                logger.info(f"Bot: 准备 Token 重登（原因: {reason}）")
 
         # 首次登录 / Session 无效后的 token 登录
-        self._bot_client = self._new_client("", use_api_id, use_api_hash, proxy)
-        try:
-            if not await self._safe_client_connect(self._bot_client, "Bot"):
-                self._bot_client = None
-                self._bot_connected = False
-                return
-            await asyncio.wait_for(
-                self._bot_client.sign_in(bot_token=bot_token),
-                timeout=TG_CONNECT_WAIT,
-            )
-            self._bot_connected = True
-            session_str = self._bot_client.session.save()
-            get_config_service().set("tg_bot_session", session_str, "Bot Session")
-            logger.info("Bot: 连接成功，Session 已保存")
-            self._register_bot_handlers()
-        except Exception as e:
-            logger.error(f"Bot: 连接失败: {e}")
-            await self._quiet_disconnect(self._bot_client)
-            self._bot_client = None
-            self._bot_connected = False
+        await self._sign_in_bot_with_token(bot_token, use_api_id, use_api_hash, proxy)
 
     async def _ensure_user(self):
         """确保 User 客户端已连接"""
@@ -632,8 +708,13 @@ class TelegramChannel(NotificationChannel):
             CFG_SESSION: "Session", CFG_PROXY_ENABLED: "代理开关", CFG_PROXY_URL: "代理地址",
             CFG_NOTIFY_CHAT: "通知目标", CFG_ADMIN_IDS: "管理员 ID",
         }
-        credential_keys = {CFG_BOT_TOKEN, CFG_API_ID, CFG_API_HASH, CFG_SESSION, CFG_PROXY_ENABLED, CFG_PROXY_URL}
+        # Bot Token / 代理 / API 变更后旧 Bot Session 可能失效，需断开并清 bot session
+        credential_keys = {
+            CFG_BOT_TOKEN, CFG_API_ID, CFG_API_HASH, CFG_SESSION,
+            CFG_PROXY_ENABLED, CFG_PROXY_URL,
+        }
         need_reconnect = False
+        clear_bot_session = False
         disabled = False
         for key, value in settings.items():
             if key in labels:
@@ -645,10 +726,15 @@ class TelegramChannel(NotificationChannel):
                         disabled = True
                     if key in credential_keys:
                         need_reconnect = True
+                    # Token 或代理出口变化时，旧 auth key 易触发双 IP/失效
+                    if key in {CFG_BOT_TOKEN, CFG_PROXY_ENABLED, CFG_PROXY_URL}:
+                        clear_bot_session = True
         if disabled:
             logger.info("Telegram 已关闭，断开现有连接")
             await self.disconnect()
         elif need_reconnect:
+            if clear_bot_session:
+                self._clear_bot_session("凭据或代理变更")
             logger.info("凭据变更，断开连接以便重连")
             await self.disconnect()
 

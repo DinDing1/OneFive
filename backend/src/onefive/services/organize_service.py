@@ -116,6 +116,9 @@ class OrganizeService:
         # 回退到另一类型时更新 mediaType
         if resolved_media_type:
             key_info["mediaType"] = resolved_media_type
+        # 文件名无年份时，用 TMDB 详情回填，供路径/结果共用
+        if tmdb_details:
+            self._resolve_media_year(key_info, tmdb_details)
 
         # 分类
         category = ""
@@ -184,6 +187,9 @@ class OrganizeService:
         # 回退到另一类型时更新 mediaType
         if resolved_media_type:
             key_info["mediaType"] = resolved_media_type
+        # 文件名无年份时，用 TMDB 详情回填，供路径/结果共用
+        if tmdb_details:
+            self._resolve_media_year(key_info, tmdb_details)
 
         # 分类
         category = ""
@@ -240,6 +246,37 @@ class OrganizeService:
         target_path = self._generate_path(tmdb_details, key_info, tech_info, is_folder=is_dir) if tmdb_details else None
         return self._build_result(file_info, key_info, tech_info, tmdb_details, category, target_path)
 
+    @staticmethod
+    def _year_from_tmdb_details(tmdb_details: Optional[Dict]) -> str:
+        """从 TMDB 详情提取首映/上映年份。
+
+        文件名经常没有年份（如 A.Good.Girls.Guide...），但 TMDB 已匹配到作品时
+        必须用 first_air_date / release_date 回填，否则目标路径会出现
+        「标题 () {tmdb=...}」空年份。
+        """
+        if not tmdb_details:
+            return ""
+        # 电视剧优先 first_air_date，电影用 release_date；兼容详情缺失时的交叉字段
+        date = (
+            tmdb_details.get("first_air_date")
+            or tmdb_details.get("release_date")
+            or ""
+        )
+        year = str(date)[:4]
+        return year if year.isdigit() and len(year) == 4 else ""
+
+    def _resolve_media_year(self, key_info: Dict[str, Any], tmdb_details: Optional[Dict]) -> str:
+        """解析最终使用的媒体年份：文件名优先，缺失则回填 TMDB。"""
+        year = str(key_info.get("year") or "").strip()
+        if year.isdigit() and len(year) == 4:
+            return year
+        tmdb_year = self._year_from_tmdb_details(tmdb_details)
+        if tmdb_year:
+            # 回写 key_info，后续路径/结果/通知共用同一年份
+            key_info["year"] = tmdb_year
+            return tmdb_year
+        return year
+
     def _generate_path(self, tmdb_details: Dict, key_info: Dict[str, Any],
                        tech_info: Dict[str, str],
                        is_folder: bool = False) -> Dict[str, str]:
@@ -253,7 +290,8 @@ class OrganizeService:
                  or tmdb_details.get("title")
                  or tmdb_details.get("name")
                  or key_info.get("title", ""))
-        year = key_info.get("year", "")
+        # 文件名无年份时，用 TMDB 首播/上映年回填，避免「标题 () {tmdb=...}」
+        year = self._resolve_media_year(key_info, tmdb_details)
         season_year = ""
         # 特别篇 season=0 合法，不能用 if key_info.get("season") 判空
         season = normalize_se_number(key_info.get("season"))
@@ -302,7 +340,8 @@ class OrganizeService:
             "title": (tmdb_details.get("title") or tmdb_details.get("name")
                       or key_info.get("title", "")) if tmdb_details
                      else key_info.get("title", ""),
-            "year": key_info.get("year"),
+            # 与路径生成一致：优先文件名年份，否则 TMDB 回填
+            "year": self._resolve_media_year(key_info, tmdb_details),
             "season": key_info.get("season"),
             "episode": key_info.get("episode"),
             "tmdb_id": tmdb_details.get("id") if tmdb_details else key_info.get("tmdbId"),
