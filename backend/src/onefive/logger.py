@@ -45,7 +45,6 @@ MODULE_NAMES = {
     "onefive.api.share_wash": "分享洗版",
     "onefive.api.strm": "STRM",
     "onefive.api.notification": "通知",
-    "onefive.api.direct_link": "直链",
     "onefive.api.offline": "离线转存",
     "onefive.api.tasks": "定时任务",
 
@@ -63,8 +62,6 @@ MODULE_NAMES = {
     "onefive.services.share_organize_service": "分享整理",
     "onefive.services.share_wash_service": "分享洗版",
     "onefive.services.strm_service": "STRM",
-    "onefive.services.direct_link_service": "直链",
-    "onefive.services.direct_link_cache_service": "直链缓存",
     "onefive.services.offline_download_service": "离线转存",
     "onefive.services.offline_link_parser": "离线解析",
     "onefive.services.p115_client_factory": "115客户端",

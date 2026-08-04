@@ -39,7 +39,7 @@ _SSE_HEADERS = {
 
 class StrmSettingsRequest(BaseModel):
     """STRM 配置请求"""
-    direct_link_base_url: str = "http://127.0.0.1:11581"
+    direct_link_base_url: str = "http://127.0.0.1:11580"
     output_path: str = ""
     cloud_output_path: str = ""
     video_extensions: str = ""

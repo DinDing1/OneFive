@@ -1,4 +1,4 @@
-﻿<template>
+<template>
   <div class="share-wash">
     <!-- ===== 工具栏 ===== -->
     <section class="toolbar glass-card">

@@ -43,7 +43,6 @@ from .api.files import router as files_router
 from .api.logs import router as logs_router
 from .api.organize import router as organize_router
 from .api.notification import router as notification_router
-from .api.direct_link import router as direct_link_router
 from .api.share import router as share_router
 from .api.strm import router as strm_router
 from .api.share_wash import router as share_wash_router
@@ -92,15 +91,6 @@ async def lifespan(app: FastAPI):
         name="scheduler-start",
     )
 
-    # 自动启动直链服务
-    try:
-        from .services.direct_link_service import get_direct_link_service
-        dl_service = get_direct_link_service()
-        if dl_service.get_settings()["enabled"]:
-            dl_service.start()
-    except Exception as e:
-        logger.warning(f"直链服务自动启动失败: {e}")
-
     logger.info("HTTP 服务就绪（通知渠道后台连接中）")
     yield
     logger.info("壹伍（OneFive）服务关闭中...")
@@ -134,13 +124,6 @@ async def lifespan(app: FastAPI):
     try:
         from .notification import get_notification_manager
         await get_notification_manager().disconnect_all()
-    except Exception:
-        pass
-
-    # 停止直链服务
-    try:
-        from .services.direct_link_service import get_direct_link_service
-        get_direct_link_service().stop()
     except Exception:
         pass
 
@@ -185,7 +168,6 @@ app.include_router(files_router)
 app.include_router(logs_router)
 app.include_router(organize_router)
 app.include_router(notification_router)
-app.include_router(direct_link_router)
 app.include_router(share_router)
 app.include_router(strm_router)
 app.include_router(share_wash_router)

@@ -394,53 +394,6 @@
       </div>
     </section>
 
-    <!-- 直链服务 -->
-    <section class="card glass-card">
-      <div class="card-head" @click="toggle('directLink')">
-        <div class="card-head-left">
-          <div class="card-icon directlink-icon">
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/></svg>
-          </div>
-          <div class="card-title">
-            <h3>直链服务</h3>
-            <p>302 重定向直链</p>
-          </div>
-        </div>
-        <svg class="chevron" :class="{ open: expanded.directLink }" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg>
-      </div>
-      <div class="card-body" v-show="expanded.directLink">
-        <div class="field field-row">
-          <label>启用直链服务</label>
-          <label class="toggle">
-            <input type="checkbox" v-model="dlEnabled" @change="saveDirectLinkSettings" />
-            <span class="slider"></span>
-          </label>
-        </div>
-        <div class="field">
-          <label>服务端口</label>
-          <input type="text" v-model.number="dlPort" placeholder="默认 11581" @change="saveDirectLinkSettings" />
-        </div>
-        <div class="field field-row">
-          <label>允许局域网访问</label>
-          <label class="toggle">
-            <input type="checkbox" v-model="dlAllowLan" @change="saveDirectLinkSettings" />
-            <span class="slider"></span>
-          </label>
-        </div>
-        <p class="strm-hint" v-if="dlAllowLan">⚠️ 开启后同局域网/公网设备可通过 IP 访问你的云盘文件，请谨慎使用。</p>
-        <div class="field field-row">
-          <label>服务状态</label>
-          <div class="dl-status">
-            <span class="status-dot" :class="dlRunning ? 'status-running' : 'status-stopped'"></span>
-            <span>{{ dlRunning ? '运行中' : '已停止' }}</span>
-          </div>
-        </div>
-        <div class="card-actions">
-          <button v-if="!dlRunning" class="btn-save" @click.stop="startDirectLink" :disabled="!dlEnabled">启动</button>
-          <button v-else class="btn-save btn-danger-outline" @click.stop="stopDirectLink">停止</button>
-        </div>
-      </div>
-    </section>
 
     <!-- STRM 文件 -->
     <section class="card glass-card">
@@ -466,8 +419,9 @@
 
         <!-- 直链基地址 -->
         <div class="field">
-          <label>直链服务基地址</label>
-          <input type="text" v-model="strmBaseUrl" placeholder="http://127.0.0.1:11581" />
+          <label>LinkJet 直链基地址</label>
+          <input type="text" v-model="strmBaseUrl" placeholder="http://127.0.0.1:11580" />
+          <p class="strm-hint">填写 LinkJet 可访问地址。STRM 将写入 {基地址}/d115/...</p>
         </div>
 
         <!-- 分享 / 云盘 STRM 存储路径（两列布局） -->
@@ -643,40 +597,37 @@ import { ref, reactive, onMounted, onUnmounted } from 'vue'
 import { filesApi } from '@/api/files'
 import { organizeApi } from '@/api/organize'
 import { notificationApi } from '@/api/notification'
-import { directLinkApi } from '@/api/directLink'
 import { strmApi, type StrmGenerateResult } from '@/api/strm'
 import { showToast } from '@/composables/useToast'
 import { handleApiError } from '@/utils/error'
 import type { FileItem } from '@/api/files'
 
 // ==================== 常量 ====================
-/** 直链服务默认端口 */
-const DEFAULT_DL_PORT = 11581
-/** 直链服务默认基地址（基于默认端口拼接） */
-const DEFAULT_DL_BASE_URL = `http://127.0.0.1:${DEFAULT_DL_PORT}`
+/** LinkJet 直链服务默认基地址(STRM 写入用) */
+const DEFAULT_DL_BASE_URL = 'http://127.0.0.1:11580'
 /** STRM 生成错误列表最大展示条数 */
 const MAX_ERROR_DISPLAY = 10
 
 /** 分类规则（电影/电视剧通用） */
 interface ClassifyRule { category: string; conditions: string }
 
-const expanded = reactive<Record<string, boolean>>({ tmdb: false, api: false, media: false, notify: false, directLink: false, strm: false })
+const expanded = reactive<Record<string, boolean>>({ tmdb: false, api: false, media: false, notify: false, strm: false })
 function toggle(key: string) { expanded[key] = !expanded[key] }
 
-const openApiEnabled = ref(false)
+
 const selectedAppId = ref('')
-const tokenValid = ref(false)
-const saving = ref(false)
+
+
 
 const tmdbApiKey = ref('')
 const tmdbApiUrl = ref('')
 const tmdbLanguage = ref('zh-CN')
-const tmdbSaving = ref(false)
 
-const showApiKey = ref(false)
-const showBotToken = ref(false)
-const showApiHash = ref(false)
-const showPassword = ref(false)
+
+
+
+
+
 
 const organizeMode = ref('move')
 const sourcePath = ref('')
@@ -685,7 +636,7 @@ const mediaLibraryPath = ref('')
 const mediaLibraryCid = ref('')
 const movieTemplate = ref('')
 const tvTemplate = ref('')
-const mediaSaving = ref(false)
+
 
 const movieRules = ref<ClassifyRule[]>([])
 const tvRules = ref<ClassifyRule[]>([])
@@ -695,34 +646,28 @@ const customGroupsList = ref<string[]>([])
 const newGroupName = ref('')
 
 // 通知配置
-const tgEnabled = ref(false)
+
 const tgBotEnabled = ref(true)
 const tgNotifyChat = ref('')
 const tgBotToken = ref('')
-const tgUserEnabled = ref(false)
+
 const tgApiId = ref('')
 const tgApiHash = ref('')
-const tgProxyEnabled = ref(false)
+
 const tgProxyUrl = ref('')
 const tgAdminIds = ref('')
 const tgPhone = ref('')
 const tgCode = ref('')
 const tgPassword = ref('')
-const codeSending = ref(false)
-const signingIn = ref(false)
-const codeSent = ref(false)
+
+
+
 const loginStatus = ref('')
-const loginStatusOk = ref(false)
+
 const tgBotName = ref('')
 const tgUserName = ref('')
-const notifySaving = ref(false)
-const tgTesting = ref(false)
 
-// 直链服务配置
-const dlEnabled = ref(false)
-const dlPort = ref(DEFAULT_DL_PORT)
-const dlAllowLan = ref(false)
-const dlRunning = ref(false)
+
 
 // STRM 配置
 const strmBaseUrl = ref(DEFAULT_DL_BASE_URL)
@@ -730,9 +675,9 @@ const strmOutputPath = ref('')
 const strmCloudOutputPath = ref('')
 const strmVideoExtensions = ref('')
 const strmAccessiblePaths = ref<string[]>([])
-const strmSaving = ref(false)
-const strmGenerating = ref(false)
-const strmCloudGenerating = ref(false)
+
+
+
 const strmResult = ref<StrmGenerateResult | null>(null)
 const strmCloudResult = ref<StrmGenerateResult | null>(null)
 const strmProgressMessage = ref('')
@@ -741,21 +686,21 @@ let strmEventSource: EventSource | null = null
 let strmCloudEventSource: EventSource | null = null
 
 // STRM 路径选择器弹窗状态（分享/云盘共用）
-const showStrmPathPicker = ref(false)
+
 const strmPickerTarget = ref<'strm' | 'cloud'>('strm')
 const strmPickerBreadcrumbs = ref<{name: string, path: string}[]>([])
 const strmPickerDirs = ref<string[]>([])
-const strmPickerLoading = ref(false)
+
 const strmPickerCurrentPath = ref('')
 
 // STRM 确认对话框（替代原生 confirm）
-const strmConfirmVisible = ref(false)
+
 const strmConfirmTitle = ref('')
 const strmConfirmMessage = ref('')
 const strmConfirmAction = ref<() => void>(() => {})
 
-const showPathPicker = ref(false)
-const pickerLoading = ref(false)
+
+
 const pickerDirs = ref<FileItem[]>([])
 const pickerBreadcrumbs = ref<{ id: string; name: string }[]>([{ id: '0', name: '根目录' }])
 const pickerCid = ref('0')
@@ -776,14 +721,6 @@ onMounted(() => {
   loadOpenApiSettings()
   loadOrganizeSettings()
   loadNotifySettings()
-  directLinkApi.getSettings().then((res: any) => {
-    if (res.code === 0 && res.data) {
-      dlEnabled.value = res.data.enabled
-      dlPort.value = res.data.port || DEFAULT_DL_PORT
-      dlAllowLan.value = res.data.allow_lan || false
-      dlRunning.value = res.data.running
-    }
-  }).catch(() => {})
   loadStrmSettings()
   loadStrmAccessiblePaths()
 })
@@ -1100,45 +1037,7 @@ async function testNotify() {
   finally { tgTesting.value = false }
 }
 
-// ==================== 直链服务 ====================
 
-async function saveDirectLinkSettings() {
-  try {
-    const res = await directLinkApi.saveSettings({ enabled: dlEnabled.value, port: dlPort.value, allow_lan: dlAllowLan.value })
-    if (res.code === 0) {
-      dlRunning.value = res.data?.running ?? dlRunning.value
-      showToast('配置已保存', 'success')
-    } else {
-      showToast(res.message || '保存失败', 'error')
-    }
-  } catch (e: any) {
-    handleApiError(e, '保存失败')
-  }
-}
-
-// 启动直链服务
-async function startDirectLink() {
-  try {
-    const res = await directLinkApi.start()
-    if (res.code === 0) {
-      dlRunning.value = true
-    }
-  } catch (e) {
-    console.error('启动直链服务失败:', e)
-  }
-}
-
-// 停止直链服务
-async function stopDirectLink() {
-  try {
-    const res = await directLinkApi.stop()
-    if (res.code === 0) {
-      dlRunning.value = false
-    }
-  } catch (e) {
-    console.error('停止直链服务失败:', e)
-  }
-}
 
 // ==================== STRM 文件 ====================
 
@@ -1410,7 +1309,6 @@ onUnmounted(() => {
 .api-icon { background: var(--success-bg); color: var(--success); }
 .media-icon { background: var(--purple-bg); color: var(--purple); }
 .notify-icon { background: var(--warning-bg); color: var(--warning); }
-.directlink-icon { background: var(--accent-bg); color: var(--accent); }
 .strm-icon { background: var(--purple-bg); color: var(--purple); }
 
 /* ==================== STRM 卡片专属样式 ==================== */
@@ -1545,41 +1443,7 @@ onUnmounted(() => {
   color: var(--danger);
 }
 
-/* 状态指示 */
-.dl-status {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  font-size: 13px;
-  color: var(--text-secondary);
-}
 
-.status-dot {
-  width: 8px;
-  height: 8px;
-  border-radius: 50%;
-  flex-shrink: 0;
-}
-
-.status-running {
-  background: var(--success);
-  box-shadow: 0 0 6px var(--success-bg);
-}
-
-.status-stopped {
-  background: var(--text-tertiary);
-}
-
-/* 危险按钮描边 */
-.btn-danger-outline {
-  background: transparent;
-  border: 1px solid var(--danger);
-  color: var(--danger);
-}
-
-.btn-danger-outline:hover {
-  background: var(--danger-bg);
-}
 
 .card-title h3 { font-size: 14px; font-weight: 600; color: var(--text-primary); margin: 0; }
 .card-title p { font-size: 11px; color: var(--text-tertiary); margin: 1px 0 0; }

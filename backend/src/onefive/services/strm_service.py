@@ -41,7 +41,7 @@ logger = get_logger(__name__)
 MAX_ERRORS = 50
 
 # ==================== 配置键 ====================
-# STRM 直链基地址，例如 http://127.0.0.1:11581
+# STRM 直链基地址，例如 http://127.0.0.1:11580（LinkJet）
 CONFIG_STRM_BASE_URL = "strm_direct_link_base_url"
 # 分享 STRM 输出根目录，必须是飞牛授权路径之一
 CONFIG_STRM_OUTPUT_PATH = "strm_output_path"
@@ -50,8 +50,8 @@ CONFIG_STRM_CLOUD_OUTPUT_PATH = "strm_cloud_output_path"
 # 视频扩展名配置（逗号分隔，如 ".mp4,.mkv,.avi"）
 CONFIG_VIDEO_EXTENSIONS = "video_extensions"
 
-# 默认直链基地址（本地默认端口 11581）
-DEFAULT_STRM_BASE_URL = "http://127.0.0.1:11581"
+# 默认直链基地址（LinkJet 默认端口 11580）
+DEFAULT_STRM_BASE_URL = "http://127.0.0.1:11580"
 # 默认视频扩展名（与 file_info_service.VIDEO_EXTENSIONS 保持一致）
 DEFAULT_VIDEO_EXTENSIONS = ".mp4,.mkv,.avi,.mov,.wmv,.flv,.webm,.m4v,.ts,.m2ts"
 

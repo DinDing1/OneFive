@@ -140,7 +140,6 @@ class Database:
         - setting: 配置变量存储（name/value/description + 时间戳）
         - share_source: 分享链接来源（含 share_code、receive_code、link_valid 等）
         - share_file: 分享文件（含目录和文件，支持整理状态追踪）
-        - direct_link_cache: 115 下载直链缓存（有效期内复用，降低风控）
 
         字段含义详见下方 CREATE TABLE 语句的行内注释。
         """
@@ -203,7 +202,7 @@ class Database:
         self._conn.execute("CREATE INDEX IF NOT EXISTS idx_share_file_category ON share_file(category)")
         # 频繁查询 organized + is_dir 的复合索引（get_organized_files 等使用）
         self._conn.execute("CREATE INDEX IF NOT EXISTS idx_share_file_organized ON share_file(organized, is_dir)")
-        # 直链服务按 share_code + file_id 查询
+        # 分享文件按 share_code + file_id 查询
         self._conn.execute("CREATE INDEX IF NOT EXISTS idx_share_file_share_code ON share_file(share_code, file_id)")
 
         # Cross-share root listing: WHERE parent_id='0' (was full table SCAN)
@@ -310,43 +309,12 @@ class Database:
         except Exception:
             pass
 
-# 直链 URL 持久化缓存：有效期内命中则不再请求 115
-        # 兼容旧表结构（早期仅 pickcode 主键），缺 cache_key 时重建
-        cols = {
-            row[1]
-            for row in self._conn.execute("PRAGMA table_info(direct_link_cache)").fetchall()
-        }
-        if cols and "cache_key" not in cols:
-            self._conn.execute("DROP TABLE IF EXISTS direct_link_cache")
-            cols = set()
-        if not cols:
-            self._conn.execute(
-                """
-                CREATE TABLE direct_link_cache (
-                    cache_key   TEXT PRIMARY KEY,
-                    pickcode    TEXT DEFAULT '',
-                    file_id     TEXT DEFAULT '',
-                    share_code  TEXT DEFAULT '',
-                    sha1        TEXT DEFAULT '',
-                    user_agent  TEXT DEFAULT '',
-                    url         TEXT NOT NULL,
-                    expires_at  REAL NOT NULL,
-                    created_at  TIMESTAMP DEFAULT (datetime('now', 'localtime')),
-                    updated_at  TIMESTAMP DEFAULT (datetime('now', 'localtime'))
-                )
-                """
-            )
+        # LinkJet 已接管直链缓存；清理本库历史 direct_link_cache 表（若存在）
+        self._conn.execute("DROP TABLE IF EXISTS direct_link_cache")
+        # 清理历史直链服务配置键（已迁移到 LinkJet）
         self._conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_dl_cache_expires ON direct_link_cache(expires_at)"
-        )
-        self._conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_dl_cache_file_id ON direct_link_cache(file_id)"
-        )
-        self._conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_dl_cache_pickcode ON direct_link_cache(pickcode)"
-        )
-        self._conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_dl_cache_share ON direct_link_cache(share_code, file_id)"
+            "DELETE FROM setting WHERE name IN (?, ?, ?)",
+            ("direct_link_enabled", "direct_link_port", "direct_link_allow_lan"),
         )
 
         self._conn.commit()

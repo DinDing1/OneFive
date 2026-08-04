@@ -1,4 +1,4 @@
-﻿"""
+"""
 文件名质量评分模块（分享洗版）
 
 100 分制，与整理重命名字段对齐（file_info_service / rename_service）：
