@@ -614,21 +614,25 @@ interface ClassifyRule { category: string; conditions: string }
 const expanded = reactive<Record<string, boolean>>({ tmdb: false, api: false, media: false, notify: false, strm: false })
 function toggle(key: string) { expanded[key] = !expanded[key] }
 
-
+// Open API 配置
+const openApiEnabled = ref(false)
 const selectedAppId = ref('')
+const tokenValid = ref(false)
+const saving = ref(false)
 
-
-
+// TMDB 配置
 const tmdbApiKey = ref('')
 const tmdbApiUrl = ref('')
 const tmdbLanguage = ref('zh-CN')
+const tmdbSaving = ref(false)
 
+// 密码/密钥显示切换
+const showApiKey = ref(false)
+const showBotToken = ref(false)
+const showApiHash = ref(false)
+const showPassword = ref(false)
 
-
-
-
-
-
+// 媒体库整理配置
 const organizeMode = ref('move')
 const sourcePath = ref('')
 const sourceCid = ref('')
@@ -636,7 +640,7 @@ const mediaLibraryPath = ref('')
 const mediaLibraryCid = ref('')
 const movieTemplate = ref('')
 const tvTemplate = ref('')
-
+const mediaSaving = ref(false)
 
 const movieRules = ref<ClassifyRule[]>([])
 const tvRules = ref<ClassifyRule[]>([])
@@ -646,38 +650,38 @@ const customGroupsList = ref<string[]>([])
 const newGroupName = ref('')
 
 // 通知配置
-
+const tgEnabled = ref(false)
 const tgBotEnabled = ref(true)
 const tgNotifyChat = ref('')
 const tgBotToken = ref('')
-
+const tgUserEnabled = ref(false)
 const tgApiId = ref('')
 const tgApiHash = ref('')
-
+const tgProxyEnabled = ref(false)
 const tgProxyUrl = ref('')
 const tgAdminIds = ref('')
 const tgPhone = ref('')
 const tgCode = ref('')
 const tgPassword = ref('')
-
-
-
+const codeSending = ref(false)
+const signingIn = ref(false)
+const codeSent = ref(false)
 const loginStatus = ref('')
-
+const loginStatusOk = ref(false)
 const tgBotName = ref('')
 const tgUserName = ref('')
+const notifySaving = ref(false)
+const tgTesting = ref(false)
 
-
-
-// STRM 配置
+// STRM 配置（直链由 LinkJet 提供，这里只保留基地址）
 const strmBaseUrl = ref(DEFAULT_DL_BASE_URL)
 const strmOutputPath = ref('')
 const strmCloudOutputPath = ref('')
 const strmVideoExtensions = ref('')
 const strmAccessiblePaths = ref<string[]>([])
-
-
-
+const strmSaving = ref(false)
+const strmGenerating = ref(false)
+const strmCloudGenerating = ref(false)
 const strmResult = ref<StrmGenerateResult | null>(null)
 const strmCloudResult = ref<StrmGenerateResult | null>(null)
 const strmProgressMessage = ref('')
@@ -686,21 +690,22 @@ let strmEventSource: EventSource | null = null
 let strmCloudEventSource: EventSource | null = null
 
 // STRM 路径选择器弹窗状态（分享/云盘共用）
-
+const showStrmPathPicker = ref(false)
 const strmPickerTarget = ref<'strm' | 'cloud'>('strm')
 const strmPickerBreadcrumbs = ref<{name: string, path: string}[]>([])
 const strmPickerDirs = ref<string[]>([])
-
+const strmPickerLoading = ref(false)
 const strmPickerCurrentPath = ref('')
 
 // STRM 确认对话框（替代原生 confirm）
-
+const strmConfirmVisible = ref(false)
 const strmConfirmTitle = ref('')
 const strmConfirmMessage = ref('')
 const strmConfirmAction = ref<() => void>(() => {})
 
-
-
+// 媒体库路径选择器
+const showPathPicker = ref(false)
+const pickerLoading = ref(false)
 const pickerDirs = ref<FileItem[]>([])
 const pickerBreadcrumbs = ref<{ id: string; name: string }[]>([{ id: '0', name: '根目录' }])
 const pickerCid = ref('0')
