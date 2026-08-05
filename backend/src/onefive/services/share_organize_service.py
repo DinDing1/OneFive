@@ -763,21 +763,11 @@ class ShareOrganizeService:
         if tmdb_details:
             tmdb_service = get_tmdb_service()
             tmdb_id = tmdb_details.get("id", tmdb_id)
-            # 标题优先级：查询标题(中文) > details.title(中文) > 翻译/别名
-            # - 查询标题含中文：保留查询标题（用户输入的简体中文最准确，如"同乐者"）
-            # - details.title 含中文：用 details.title（TMDB 主标题，优于别名，避免"电影版"等后缀干扰）
-            # - 都不含中文：用 get_chinese_title 兜底（返回翻译/别名或原始标题）
-            query_is_chinese = bool(title) and tmdb_service._contains_chinese(title)
-            if query_is_chinese:
-                pass  # 保留查询标题
-            else:
-                details_title = tmdb_details.get("title") or tmdb_details.get("name") or ""
-                if tmdb_service._contains_chinese(details_title):
-                    title = details_title
-                else:
-                    tmdb_title = tmdb_service.get_chinese_title(tmdb_details)
-                    if tmdb_title:
-                        title = tmdb_title
+            # 标题选择：复用 tmdb_service.resolve_media_title 共享逻辑
+            # （TMDB 原名优先 > query 含中文 > details.title 含中文 > get_chinese_title 兜底）
+            # 与云盘整理共用同一逻辑，避免逻辑漂移；
+            # 解决：query 繁体"燦如繁星"应替换为 TMDB 简体原名"灿如繁星"
+            title = tmdb_service.resolve_media_title(title, tmdb_details)
             release_date = tmdb_details.get("release_date") or tmdb_details.get("first_air_date") or ""
             if release_date and len(release_date) >= 4:
                 year = release_date[:4]

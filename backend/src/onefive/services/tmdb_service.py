@@ -306,6 +306,64 @@ class TMDBService:
 
         return ""
 
+    def resolve_media_title(self, query_title: str, tmdb_details: Optional[Dict]) -> str:
+        """解析最终使用的媒体标题（云盘整理与分享整理共用）。
+
+        解决以下问题：
+        - query 是繁体（如 PT 站命名"燦如繁星"）→ 应替换为 TMDB 简体原名"灿如繁星"
+        - query 是简体（如"水饺皇后"）→ 应保留，不被 TMDB 别名"阳光码头"覆盖
+        - query 不含中文（如英文文件名）→ 用 TMDB 中文翻译兜底
+
+        优先级（高 → 低）：
+        1. TMDB original_title/original_name（大陆影视的简体原名最权威）
+           - origin_country 含 CN 且 original_title 含中文时使用
+           - 解决：query="燦如繁星"(繁体) → original_name="灿如繁星"(简体)
+           - 解决：query="水饺皇后"(简体) → original_title="水饺皇后"(简体)
+        2. query title 含中文：保留 query
+           - 用户输入/文件名解析的简体中文最准确（非大陆原产影视场景）
+        3. details.title 含中文：用 TMDB 主标题
+           - 优于别名，避免"电影版"等后缀干扰
+        4. get_chinese_title 兜底
+           - 返回 zh-CN translations / CN alt / zh-TW/HK translations
+
+        Args:
+            query_title: 文件名解析或用户输入的查询标题
+            tmdb_details: TMDB 详情，为 None 时仅返回 query_title
+
+        Returns:
+            最终使用的标题字符串（无可用标题时返回空字符串）
+        """
+        query_title = str(query_title or "").strip()
+
+        # 无 TMDB 详情时，直接返回 query（如纯文件名整理）
+        if not tmdb_details:
+            return query_title
+
+        # 1. TMDB 原始标题优先（大陆影视的简体原名）
+        #    origin_country 含 CN 表示中国大陆原产，original_title 即简体原名
+        origin_countries = tmdb_details.get("origin_country") or []
+        original_title = (tmdb_details.get("original_title")
+                          or tmdb_details.get("original_name") or "")
+        if "CN" in origin_countries and self._contains_chinese(original_title):
+            return original_title
+
+        # 2. query title 含中文：保留
+        if query_title and self._contains_chinese(query_title):
+            return query_title
+
+        # 3. details.title 含中文：用 TMDB 主标题
+        details_title = tmdb_details.get("title") or tmdb_details.get("name") or ""
+        if self._contains_chinese(details_title):
+            return details_title
+
+        # 4. get_chinese_title 兜底（zh-CN translations → CN alt → zh-TW/HK）
+        tmdb_title = self.get_chinese_title(tmdb_details)
+        if tmdb_title:
+            return tmdb_title
+
+        # 5. 全部失败：返回 query title（可能为空字符串）
+        return query_title
+
     def _contains_chinese(self, text: str) -> bool:
         """判断字符串是否包含中文字符"""
         return bool(re.search(r"[\u4e00-\u9fff]", text or ""))
