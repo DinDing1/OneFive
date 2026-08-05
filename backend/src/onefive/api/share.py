@@ -16,6 +16,7 @@ from ..logger import get_logger
 from ..sseutil import (
     SSE_HEADERS,
     job_store,
+    streaming_response_from_job,
     streaming_response_from_thread,
     await_with_heartbeat,
     aiter_with_heartbeat,
@@ -261,28 +262,38 @@ async def create_delete_batch_job(req: DeleteBatchRequest):
 
 @router.get("/delete-batch-stream", summary="流式批量删除分享（SSE）")
 async def delete_batch_stream(job_id: str = Query(..., description="delete-batch-job 返回的任务 ID")):
-    """SSE 流式批量删除：绕过 axios 超时，心跳保持飞牛网关连接。"""
-    payload = job_store.pop(job_id)
-    if not payload:
-        async def err_gen():
-            yield f"data: {json.dumps({'type': 'error', 'message': '删除任务不存在或已过期'}, ensure_ascii=False)}\n\n"
-        return StreamingResponse(err_gen(), media_type="text/event-stream", headers=SSE_HEADERS)
+    """SSE 流式批量删除：绕过 axios 超时，心跳保持飞牛网关连接。
 
-    source_ids = list(payload.get("source_ids") or [])
-    logger.info(f"[SSE 删除分享] job_id={job_id}, count={len(source_ids)}")
+    使用 job claim/订阅模型：EventSource 自动重连时不会再报“任务不存在”，
+    且后台删除不会因为首个连接断开而丢失进度。
+    """
 
-    def worker(on_progress):
-        service = get_share_service()
-        result = service.delete_shares_batch(source_ids, progress=on_progress)
-        msg = f"已删除 {result['success']}/{result['total']} 个分享"
-        strm_deleted = int(result.get("strm_deleted") or 0)
-        if strm_deleted:
-            msg += f"，并清理 {strm_deleted} 个分享 STRM"
-        on_progress({"type": "done", "message": msg, **result})
+    def worker_factory(payload):
+        source_ids = [int(x) for x in (payload.get("source_ids") or []) if int(x) > 0]
 
-    return streaming_response_from_thread(
-        worker,
-        start_event={"type": "start", "total": len(source_ids), "message": "开始删除分享…"},
+        def worker(on_progress):
+            service = get_share_service()
+            result = service.delete_shares_batch(source_ids, progress=on_progress)
+            msg = f"已删除 {result['success']}/{result['total']} 个分享"
+            strm_deleted = int(result.get("strm_deleted") or 0)
+            if strm_deleted:
+                msg += f"，并清理 {strm_deleted} 个分享 STRM"
+            on_progress({"type": "done", "message": msg, **result})
+
+        return worker
+
+    # 先取 payload 仅用于 start_event 展示；真正 claim 在 streaming_response_from_job 内
+    job = job_store.get(job_id)
+    total_hint = 0
+    if job is not None:
+        total_hint = len(list((job.payload or {}).get("source_ids") or []))
+        logger.info(f"[SSE 删除分享] job_id={job_id}, count={total_hint}")
+
+    return streaming_response_from_job(
+        job_id,
+        worker_factory,
+        start_event={"type": "start", "total": total_hint, "message": "开始删除分享…"},
+        not_found_message="删除任务不存在或已过期",
         thread_name="share-delete-batch",
     )
 
@@ -477,52 +488,58 @@ async def create_manual_organize_job(req: ManualFileActionRequest):
 
 @router.get("/organize/manual-stream", summary="流式手动纠错整理（SSE）")
 async def manual_organize_stream(job_id: str = Query(..., description="manual-job 返回的任务 ID")):
-    """SSE 流式手动整理：绕过 axios 超时，心跳保持飞牛网关连接。"""
-    payload = job_store.pop(job_id)
-    if not payload:
-        async def err_gen():
-            yield f"data: {json.dumps({'type': 'error', 'message': '整理任务不存在或已过期'}, ensure_ascii=False)}\n\n"
-        return StreamingResponse(err_gen(), media_type="text/event-stream", headers=SSE_HEADERS)
+    """SSE 流式手动整理：绕过 axios 超时，心跳保持飞牛网关连接。
 
-    source_id = int(payload.get("source_id") or 0)
-    file_id = str(payload.get("file_id") or "")
-    tmdb_id = int(payload.get("tmdb_id") or 0)
-    media_type = str(payload.get("media_type") or "")
-    logger.info(
-        f"[SSE 手动整理] job_id={job_id}, source_id={source_id}, "
-        f"file_id={file_id}, tmdb_id={tmdb_id}, media_type={media_type}"
-    )
+    支持 EventSource 重连：任务只 claim 一次，后续连接重放历史并继续收进度。
+    """
 
-    def worker(on_progress):
-        on_progress({
-            "type": "progress",
-            "stage": "manual_organize",
-            "percent": 5,
-            "message": "开始手动整理…",
-        })
-        service = get_share_organize_service()
-        result = service.manual_organize_file(source_id, file_id, tmdb_id, media_type)
-        if result.get("success"):
+    def worker_factory(payload):
+        source_id = int(payload.get("source_id") or 0)
+        file_id = str(payload.get("file_id") or "")
+        tmdb_id = int(payload.get("tmdb_id") or 0)
+        media_type = str(payload.get("media_type") or "")
+
+        def worker(on_progress):
             on_progress({
-                "type": "done",
-                "message": result.get("message") or "整理完成",
-                "success": True,
-                "result": result,
+                "type": "progress",
+                "stage": "manual_organize",
+                "percent": 5,
+                "message": "开始手动整理…",
             })
-        else:
-            on_progress({
-                "type": "error",
-                "message": result.get("error") or result.get("message") or "整理失败",
-                "success": False,
-                "result": result,
-            })
+            service = get_share_organize_service()
+            result = service.manual_organize_file(source_id, file_id, tmdb_id, media_type)
+            if result.get("success"):
+                on_progress({
+                    "type": "done",
+                    "message": result.get("message") or "整理完成",
+                    "success": True,
+                    "result": result,
+                })
+            else:
+                on_progress({
+                    "type": "error",
+                    "message": result.get("error") or result.get("message") or "整理失败",
+                    "success": False,
+                    "result": result,
+                })
 
-    return streaming_response_from_thread(
-        worker,
+        return worker
+
+    job = job_store.get(job_id)
+    if job is not None:
+        p = job.payload or {}
+        logger.info(
+            f"[SSE 手动整理] job_id={job_id}, source_id={p.get('source_id')}, "
+            f"file_id={p.get('file_id')}, tmdb_id={p.get('tmdb_id')}, media_type={p.get('media_type')}"
+        )
+
+    return streaming_response_from_job(
+        job_id,
+        worker_factory,
         start_event={"type": "start", "message": "连接手动整理服务…"},
+        not_found_message="整理任务不存在或已过期",
         thread_name="share-manual-organize",
     )
-
 
 
 @router.post("/recompute-organized", summary="重算目录已整理标记（修复脏数据）")
@@ -636,95 +653,108 @@ async def organize_stream(
     """SSE 流式批量整理：连接后立即发 start，再推 progress/done；空闲时注释心跳保活。
 
     推荐流程：POST /organize-job → GET /organize-stream?job_id=...
-    事件：
-      data: {"type": "start", ...}
-      data: {"type": "progress", "index": 1, "total": 5, "name": "...", "success": true, ...}
-      data: {"type": "done", "total": 5, "success": 4, "failed": 1}
-      注释行 `: heartbeat`
+    关键：job 使用 claim/订阅，网关断开后 EventSource 重连不再报“整理任务不存在或已过期”。
     """
-    id_list: list[str] = []
-    sid = 0
-
-    if job_id:
-        payload = job_store.pop(job_id)
-        if payload:
-            sid = int(payload.get("source_id") or 0)
-            raw_ids = payload.get("file_ids") or []
-            id_list = [str(x).strip() for x in raw_ids if str(x).strip()]
-        elif source_id is None and not file_ids:
-            async def err_gen():
+    # 兼容旧直连参数（无 job_id）：仍走单连接生成器
+    if not job_id:
+        sid = int(source_id or 0)
+        id_list = [fid.strip() for fid in (file_ids or "").split(",") if fid.strip()]
+        if not id_list or sid <= 0:
+            async def err_gen2():
                 yield (
                     "data: "
                     + json.dumps(
-                        {"type": "error", "message": "整理任务不存在或已过期"},
+                        {"type": "error", "message": "整理参数无效（缺少 source_id/file_ids）"},
                         ensure_ascii=False,
                     )
                     + "\n\n"
                 )
             return StreamingResponse(
-                err_gen(), media_type="text/event-stream", headers=SSE_HEADERS
+                err_gen2(), media_type="text/event-stream", headers=SSE_HEADERS
             )
 
-    # 兼容旧直连参数
-    if not id_list and source_id is not None and file_ids:
-        sid = int(source_id)
-        id_list = [fid.strip() for fid in file_ids.split(",") if fid.strip()]
+        logger.info(f"[SSE 整理] 兼容直连: source_id={sid}, 文件数={len(id_list)}")
 
-    if not id_list or sid <= 0:
-        async def err_gen2():
+        async def legacy_generator():
             yield (
                 "data: "
                 + json.dumps(
-                    {"type": "error", "message": "整理参数无效（缺少 source_id/file_ids）"},
+                    {
+                        "type": "start",
+                        "message": "整理任务已连接",
+                        "source_id": sid,
+                        "total_hint": len(id_list),
+                    },
                     ensure_ascii=False,
                 )
                 + "\n\n"
             )
+            service = get_share_organize_service()
+            try:
+                async for chunk in aiter_with_heartbeat(
+                    service.organize_batch_stream(sid, id_list),
+                    heartbeat_sec=2.0,
+                ):
+                    yield chunk
+            except Exception as e:
+                logger.error(f"[SSE 整理] 异常: {e}", exc_info=True)
+                yield (
+                    "data: "
+                    + json.dumps({"type": "error", "message": str(e)}, ensure_ascii=False)
+                    + "\n\n"
+                )
+
         return StreamingResponse(
-            err_gen2(), media_type="text/event-stream", headers=SSE_HEADERS
+            legacy_generator(),
+            media_type="text/event-stream",
+            headers=SSE_HEADERS,
         )
 
-    logger.info(
-        f"[SSE 整理] 开始拉流: job_id={job_id or '-'}, source_id={sid}, 文件数={len(id_list)}"
-    )
+    def worker_factory(payload):
+        sid = int((payload or {}).get("source_id") or 0)
+        raw_ids = (payload or {}).get("file_ids") or []
+        id_list = [str(x).strip() for x in raw_ids if str(x).strip()]
 
-    async def event_generator():
-        # 首包立刻推送，避免网关/浏览器在首事件前判定连接失败
-        yield (
-            "data: "
-            + json.dumps(
-                {
-                    "type": "start",
-                    "message": "整理任务已连接",
-                    "source_id": sid,
-                    "total_hint": len(id_list),
-                },
-                ensure_ascii=False,
-            )
-            + "\n\n"
+        def worker(on_progress):
+            if sid <= 0 or not id_list:
+                on_progress({"type": "error", "message": "整理参数无效（缺少 source_id/file_ids）"})
+                return
+
+            service = get_share_organize_service()
+
+            # organize_batch_stream 是 async 生成器；放到独立事件循环中跑，
+            # 与 HTTP 连接解耦：连接断开/重连不影响后台整理继续。
+            async def _consume():
+                async for evt in service.organize_batch_stream(sid, id_list):
+                    if isinstance(evt, dict):
+                        on_progress(evt)
+
+            asyncio.run(_consume())
+
+        return worker
+
+    job = job_store.get(job_id)
+    total_hint = 0
+    sid_hint = 0
+    if job is not None:
+        p = job.payload or {}
+        sid_hint = int(p.get("source_id") or 0)
+        total_hint = len([str(x).strip() for x in (p.get("file_ids") or []) if str(x).strip()])
+        logger.info(
+            f"[SSE 整理] 开始拉流: job_id={job_id}, source_id={sid_hint}, 文件数={total_hint}"
         )
-        service = get_share_organize_service()
-        try:
-            async for chunk in aiter_with_heartbeat(
-                service.organize_batch_stream(sid, id_list),
-                heartbeat_sec=2.0,
-            ):
-                yield chunk
-        except Exception as e:
-            logger.error(f"[SSE 整理] 异常: {e}", exc_info=True)
-            yield (
-                "data: "
-                + json.dumps(
-                    {"type": "error", "message": str(e)},
-                    ensure_ascii=False,
-                )
-                + "\n\n"
-            )
 
-    return StreamingResponse(
-        event_generator(),
-        media_type="text/event-stream",
-        headers=SSE_HEADERS,
+    return streaming_response_from_job(
+        job_id,
+        worker_factory,
+        start_event={
+            "type": "start",
+            "message": "整理任务已连接",
+            "source_id": sid_hint,
+            "total_hint": total_hint,
+        },
+        not_found_message="整理任务不存在或已过期",
+        thread_name="share-organize-batch",
     )
 
 

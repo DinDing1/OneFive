@@ -16,7 +16,7 @@ from ..services.classify_service import DEFAULT_STRATEGY, invalidate_strategy_ca
 from ..services.file_info_service import BUILTIN_RELEASE_GROUPS, invalidate_custom_release_groups_cache
 from ..exceptions import NotLoggedInError
 from ..logger import get_logger
-from ..sseutil import job_store, streaming_response_from_thread, SSE_HEADERS
+from ..sseutil import job_store, streaming_response_from_job
 
 logger = get_logger(__name__)
 
@@ -160,71 +160,72 @@ async def create_execute_job(req: ExecuteRequest):
     return ApiResponse(code=0, message="ok", data={"job_id": job_id})
 
 
-@router.get("/execute-stream", summary="流式执行云盘整理（SSE）")
+@router.get("/execute-stream", summary="流式执行整理（SSE）")
 async def execute_organize_stream(job_id: str = Query(..., description="execute-job 返回的任务 ID")):
-    """SSE 流式执行整理：绕过 axios 30s 超时，心跳保持飞牛网关连接。"""
-    payload = job_store.pop(job_id)
-    if not payload:
-        async def err_gen():
-            yield 'data: {"type":"error","message":"整理任务不存在或已过期"}\n\n'
-        from fastapi.responses import StreamingResponse
-        return StreamingResponse(err_gen(), media_type="text/event-stream", headers=SSE_HEADERS)
-
-    logger.info(
-        f"[SSE 云盘整理] job_id={job_id}, file={payload.get('file_name')}, "
-        f"is_dir={payload.get('is_dir')}"
-    )
-
-    # 主线程保存事件循环，供整理通知使用
+    """SSE 流式执行云盘整理：支持 EventSource 重连，任务只跑一次。"""
+    # 主线程事件循环：整理通知需要从 worker 线程投递回来
     loop = asyncio.get_running_loop()
 
-    def worker(on_progress):
-        organize_service = get_organize_service()
-        organize_service._main_loop = loop
-        on_progress({
-            "type": "progress",
-            "stage": "execute",
-            "percent": 5,
-            "message": f"开始整理：{payload.get('file_name') or ''}",
-        })
-        result = organize_service.execute_organize(
-            file_id=str(payload.get("file_id") or ""),
-            file_name=str(payload.get("file_name") or ""),
-            is_dir=bool(payload.get("is_dir")),
-            target_path=payload.get("target_path") or {},
-            organize_mode=str(payload.get("organize_mode") or "move"),
-            category=str(payload.get("category") or ""),
-            target_title=str(payload.get("target_title") or ""),
-            tmdb_id=int(payload.get("tmdb_id") or 0),
-            media_info={
-                "media_type": payload.get("media_type") or "",
-                "year": payload.get("year") or "",
-                "season": payload.get("season") or 0,
-                "episode": payload.get("episode") or 0,
-                "tmdb_poster": payload.get("tmdb_poster") or "",
-                "tmdb_backdrop": payload.get("tmdb_backdrop") or "",
-                "tmdb_rating": payload.get("tmdb_rating") or 0,
-                "tech_info": payload.get("tech_info") or {},
-            },
-        )
-        if result.get("success"):
+    def worker_factory(payload):
+        def worker(on_progress):
+            organize_service = get_organize_service()
+            organize_service._main_loop = loop
             on_progress({
-                "type": "done",
-                "message": result.get("message") or "整理完成",
-                "success": True,
-                "result": result,
+                "type": "progress",
+                "stage": "execute",
+                "percent": 5,
+                "message": f"开始整理：{payload.get('file_name') or ''}",
             })
-        else:
-            on_progress({
-                "type": "error",
-                "message": result.get("message") or "整理失败",
-                "success": False,
-                "result": result,
-            })
+            result = organize_service.execute_organize(
+                file_id=str(payload.get("file_id") or ""),
+                file_name=str(payload.get("file_name") or ""),
+                is_dir=bool(payload.get("is_dir")),
+                target_path=payload.get("target_path") or {},
+                organize_mode=str(payload.get("organize_mode") or "move"),
+                category=str(payload.get("category") or ""),
+                target_title=str(payload.get("target_title") or ""),
+                tmdb_id=int(payload.get("tmdb_id") or 0),
+                media_info={
+                    "media_type": payload.get("media_type") or "",
+                    "year": payload.get("year") or "",
+                    "season": payload.get("season") or 0,
+                    "episode": payload.get("episode") or 0,
+                    "tmdb_poster": payload.get("tmdb_poster") or "",
+                    "tmdb_backdrop": payload.get("tmdb_backdrop") or "",
+                    "tmdb_rating": payload.get("tmdb_rating") or 0,
+                    "tech_info": payload.get("tech_info") or {},
+                },
+            )
+            if result.get("success"):
+                on_progress({
+                    "type": "done",
+                    "message": result.get("message") or "整理完成",
+                    "success": True,
+                    "result": result,
+                })
+            else:
+                on_progress({
+                    "type": "error",
+                    "message": result.get("message") or "整理失败",
+                    "success": False,
+                    "result": result,
+                })
 
-    return streaming_response_from_thread(
-        worker,
+        return worker
+
+    job = job_store.get(job_id)
+    if job is not None:
+        p = job.payload or {}
+        logger.info(
+            f"[SSE 云盘整理] job_id={job_id}, file={p.get('file_name')}, "
+            f"is_dir={p.get('is_dir')}"
+        )
+
+    return streaming_response_from_job(
+        job_id,
+        worker_factory,
         start_event={"type": "start", "message": "连接整理服务…"},
+        not_found_message="整理任务不存在或已过期",
         thread_name="organize-execute",
     )
 

@@ -26,11 +26,26 @@ export type SseHandlers = {
 /**
  * 监听 SSE，自动解析 JSON；返回 close 函数。
  * 忽略注释心跳（浏览器不会把 `: heartbeat` 交给 onmessage）。
+ *
+ * 飞牛网关可能中途断开长连接，浏览器 EventSource 会自动重连：
+ * - CONNECTING：重连中，不报错
+ * - 已收到业务事件后短暂 CLOSED：宽限等待重连，避免误报失败
+ * - 从未收到事件且最终 CLOSED：提示连接中断
  */
 export function listenSse(es: EventSource, handlers: SseHandlers): () => void {
   let finished = false
+  let sawEvent = false
+  let softErrorTimer: number | null = null
+
+  const clearSoftTimer = () => {
+    if (softErrorTimer != null) {
+      window.clearTimeout(softErrorTimer)
+      softErrorTimer = null
+    }
+  }
 
   const close = () => {
+    clearSoftTimer()
     try { es.close() } catch { /* ignore */ }
   }
 
@@ -41,6 +56,9 @@ export function listenSse(es: EventSource, handlers: SseHandlers): () => void {
     } catch {
       return
     }
+    sawEvent = true
+    clearSoftTimer()
+
     const t = data?.type
     if (t === 'start') {
       handlers.onStart?.(data)
@@ -68,10 +86,25 @@ export function listenSse(es: EventSource, handlers: SseHandlers): () => void {
       close()
       return
     }
+    // 浏览器自动重连中，忽略
+    if (es.readyState === EventSource.CONNECTING) {
+      return
+    }
     if (es.readyState === EventSource.CLOSED) {
-      finished = true
-      handlers.onConnectionError?.('连接中断（网关或网络），请重试')
-      close()
+      // 已有业务事件：通常是网关断开，给重连留宽限；宽限后仍无后续事件再报中断
+      // 注意：后端 claim 模型下重连可继续收进度，不要立刻 onConnectionError
+      if (softErrorTimer == null) {
+        softErrorTimer = window.setTimeout(() => {
+          if (finished) return
+          // 宽限后若仍未结束：提示可能后台仍在跑
+          finished = true
+          const msg = sawEvent
+            ? '进度连接中断（后台任务可能仍在执行，请稍后刷新查看）'
+            : '连接中断（网关或网络），请重试'
+          handlers.onConnectionError?.(msg)
+          close()
+        }, sawEvent ? 12000 : 8000)
+      }
     }
   }
 

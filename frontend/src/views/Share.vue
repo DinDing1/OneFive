@@ -2034,17 +2034,28 @@ async function executeOrganize() {
             const ok = await new Promise<boolean>((resolve) => {
               const es = shareApi.manualOrganizeStream(jobRes.data!.job_id)
               let finished = false
+              let sawEvent = false
+              let softErrorTimer: number | null = null
               const finish = (success: boolean) => {
                 if (finished) return
                 finished = true
+                if (softErrorTimer != null) {
+                  window.clearTimeout(softErrorTimer)
+                  softErrorTimer = null
+                }
                 try { es.close() } catch { /* ignore */ }
                 resolve(success)
               }
               es.onmessage = (event) => {
                 let data: any
                 try { data = JSON.parse(event.data) } catch { return }
+                sawEvent = true
+                if (softErrorTimer != null) {
+                  window.clearTimeout(softErrorTimer)
+                  softErrorTimer = null
+                }
                 const typ = data?.type
-                if (typ === 'progress') {
+                if (typ === 'start' || typ === 'progress') {
                   if (data?.message) organizeProgressName.value = String(data.message)
                   return
                 }
@@ -2058,7 +2069,20 @@ async function executeOrganize() {
               }
               es.onerror = () => {
                 if (finished) return
-                if (es.readyState === EventSource.CLOSED) finish(false)
+                // 浏览器自动重连中，先不判失败
+                if (es.readyState === EventSource.CONNECTING) return
+                if (es.readyState === EventSource.CLOSED) {
+                  // 已收到业务事件：通常是 done 后网关断开，或后台仍在继续
+                  if (sawEvent) {
+                    finish(true)
+                    return
+                  }
+                  if (softErrorTimer == null) {
+                    softErrorTimer = window.setTimeout(() => {
+                      if (!finished && !sawEvent) finish(false)
+                    }, 8000)
+                  }
+                }
               }
             })
             if (ok) successCount += 1
@@ -2074,14 +2098,25 @@ async function executeOrganize() {
       }
 
       // 批量整理：用 EventSource 监听 SSE 流式进度
+      // lastProgressIndex 用于忽略重连重放的历史进度，避免成功/失败重复累加
+      let lastProgressIndex = -1
       await runOrganizeStream(sourceId, fileIds, (evt) => {
+        if (evt.type === 'done') {
+          // 以后端汇总为准校正计数（重连重放后尤其重要）
+          if (typeof evt.total === 'number' && evt.total > 0) {
+            organizeProgressTotal.value = evt.total
+            organizeProgressIndex.value = evt.total
+          }
+          if (typeof evt.success === 'number') successCount = evt.success
+          if (typeof evt.failed === 'number') failCount = evt.failed
+          organizeProgressSuccess.value = successCount
+          organizeProgressFailed.value = failCount
+          return
+        }
         if (evt.type === 'progress') {
           // 用后端推送的 total/index（文件夹已展开为真实文件数），覆盖前端初始值
           if (typeof evt.total === 'number' && evt.total > 0) {
             organizeProgressTotal.value = evt.total
-          }
-          if (typeof evt.index === 'number') {
-            organizeProgressIndex.value = evt.index
           }
           if (evt.name) organizeProgressName.value = evt.name
           // preparing 只是连通/预统计提示，不计入成功失败
@@ -2089,6 +2124,13 @@ async function executeOrganize() {
             organizeProgressSuccess.value = successCount
             organizeProgressFailed.value = failCount
             return
+          }
+          const idx = typeof evt.index === 'number' ? evt.index : -1
+          // 重连会重放历史事件：只处理比上次更新的进度
+          if (idx >= 0) {
+            if (idx <= lastProgressIndex) return
+            lastProgressIndex = idx
+            organizeProgressIndex.value = idx
           }
           if (evt.success) successCount += 1
           else failCount += 1
@@ -2201,10 +2243,8 @@ async function runOrganizeStream(
         return
       }
       if (typ === 'done') {
-        // 用后端汇总校正成功/失败数（若有）
-        if (typeof data.success === 'number') {
-          // 交由外层 successCount 逻辑；这里只保证流正常结束
-        }
+        // 先交给外层用后端汇总校正计数，再结束 Promise
+        onProgress(data)
         finishOk()
         return
       }
