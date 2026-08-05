@@ -277,6 +277,49 @@ class OrganizeService:
             return tmdb_year
         return year
 
+    def _resolve_media_title(self, key_info: Dict[str, Any],
+                             tmdb_details: Optional[Dict]) -> str:
+        """解析最终使用的媒体标题：与分享整理一致的三段式优先级。
+
+        用于解决云盘整理命名时，原中文名被错误替换为 TMDB 中文别名的问题。
+        例如：query="水饺皇后"（含中文）应保留，而不是被台湾译名"阳光码头"覆盖。
+
+        优先级（高 → 低）：
+        1. 查询标题（key_info['title']）含中文：保留查询标题
+           - 用户输入/文件名解析的简体中文最准确，如"水饺皇后"
+        2. details.title 含中文：用 details.title
+           - TMDB 主标题优于别名，避免"电影版"等后缀干扰
+        3. 都不含中文：用 get_chinese_title 兜底
+           - 返回 TMDB 翻译/别名或原始标题
+
+        Args:
+            key_info: 文件名解析出的关键信息，含 'title' 字段
+            tmdb_details: TMDB 详情，为 None 时仅返回 query title
+
+        Returns:
+            最终使用的标题字符串（无可用标题时返回空字符串）
+        """
+        query_title = str(key_info.get("title") or "").strip()
+
+        # 1. query title 含中文：保留（最准确，无需调用 TMDB 翻译）
+        if query_title and self.tmdb_service._contains_chinese(query_title):
+            return query_title
+
+        # 2-3. 有 TMDB 详情时按优先级回退
+        if tmdb_details:
+            # 2. details.title 含中文：用 TMDB 主标题
+            details_title = tmdb_details.get("title") or tmdb_details.get("name") or ""
+            if self.tmdb_service._contains_chinese(details_title):
+                return details_title
+
+            # 3. 都不含中文：用翻译/别名兜底
+            tmdb_title = self.tmdb_service.get_chinese_title(tmdb_details)
+            if tmdb_title:
+                return tmdb_title
+
+        # 4. 全部失败：返回 query title（可能为空字符串）
+        return query_title
+
     def _generate_path(self, tmdb_details: Dict, key_info: Dict[str, Any],
                        tech_info: Dict[str, str],
                        is_folder: bool = False) -> Dict[str, str]:
@@ -286,10 +329,9 @@ class OrganizeService:
         其他：生成完整文件路径
         """
         tmdb_id = tmdb_details.get("id", "")
-        title = (self.tmdb_service.get_chinese_title(tmdb_details)
-                 or tmdb_details.get("title")
-                 or tmdb_details.get("name")
-                 or key_info.get("title", ""))
+        # 标题选择：与分享整理对齐的三段式优先级
+        # （query 含中文 > details.title 含中文 > get_chinese_title 兜底）
+        title = self._resolve_media_title(key_info, tmdb_details)
         # 文件名无年份时，用 TMDB 首播/上映年回填，避免「标题 () {tmdb=...}」
         year = self._resolve_media_year(key_info, tmdb_details)
         season_year = ""
@@ -337,9 +379,9 @@ class OrganizeService:
             "filename": file_info.get("name", ""),
             "is_dir": file_info.get("is_dir", False),
             "media_type": key_info["mediaType"],
-            "title": (tmdb_details.get("title") or tmdb_details.get("name")
-                      or key_info.get("title", "")) if tmdb_details
-                     else key_info.get("title", ""),
+            # 标题选择：与 _generate_path 一致的三段式优先级，
+            # 保证 UI 显示标题与整理后的文件名同名
+            "title": self._resolve_media_title(key_info, tmdb_details),
             # 与路径生成一致：优先文件名年份，否则 TMDB 回填
             "year": self._resolve_media_year(key_info, tmdb_details),
             "season": key_info.get("season"),
