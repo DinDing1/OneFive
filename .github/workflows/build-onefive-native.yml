@@ -394,7 +394,12 @@ jobs:
   release:
     needs: package
     runs-on: ubuntu-latest
-    if: startsWith(github.ref, 'refs/tags/onefive-v') || github.event.inputs.create_release == 'true'
+    # push main/master、匹配 tag、或手动且 create_release=true 时创建 Release
+    # 注意：push 事件没有 inputs，旧条件会导致 release 一直 skipped
+    if: |
+      startsWith(github.ref, 'refs/tags/onefive-v') ||
+      (github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')) ||
+      (github.event_name == 'workflow_dispatch' && github.event.inputs.create_release == 'true')
     permissions:
       contents: write
     steps:
@@ -436,7 +441,13 @@ jobs:
 
       - name: 创建 Release
         uses: softprops/action-gh-release@v2
+        env:
+          # softprops 默认读 GITHUB_TOKEN；显式写出避免权限继承歧义
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
+          # 没有匹配到 fpk 时直接失败，避免空 Release
+          fail_on_unmatched_files: true
+          make_latest: true
           tag_name: ${{ steps.info.outputs.tag }}
           name: "壹伍 v${{ steps.info.outputs.version }}"
           files: ./artifacts/**/*.fpk
